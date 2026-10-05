@@ -45,17 +45,110 @@ func repoFile(t *testing.T, rel string) string {
 func TestConfig_CIWorkflowSetsBothDSNNames(t *testing.T) {
 	yml := repoFile(t, ".github/workflows/ci.yml")
 
+	// ★ 必须断言「YAML **键**存在」，不能只找子串。
+	//
+	// 最初的写法是 strings.Contains(yml, "SPARK_DB_DSN")，
+	// 而 SPARK_TEST_DB_DSN 本身就**包含** SPARK_DB_DSN 这个子串 ⇒
+	// 即使 SPARK_DB_DSN 键被整行删掉，断言仍然通过。
+	// 这个弱断言在负向测试里当场被抓住（注入违规后闸门没响）。
+	//
+	// 教训：文本闸门的断言必须贴着「真正产生效果的语法形态」写，
+	// 子串包含在命名有前缀关系时几乎必然给出假阴性。
 	for _, name := range []string{"SPARK_DB_DSN", "SPARK_TEST_DB_DSN"} {
-		if !strings.Contains(yml, name) {
-			t.Errorf("CI workflow 未注入 %s —— 若消费端需要它，真库步骤会以"+
-				"「未配置连接信息」或「静默跳过」失败（见本文件顶部事故记录）", name)
+		if !hasYAMLKey(yml, name) {
+			t.Errorf("CI workflow 未以 YAML 键注入 %s —— 若消费端需要它，真库步骤会以"+
+				"「未配置连接信息」或「静默跳过」失败（见本文件顶部事故记录）。\n"+
+				"注意：仅在其变量值/注释里出现该名字**不算**注入。", name)
 		}
 	}
 
 	// 真库作业必须声明「不许跳过」，否则测试 t.Skip 会把失败掩盖成通过。
-	if !strings.Contains(yml, "SPARK_REQUIRE_DB") {
-		t.Error("CI workflow 未设 SPARK_REQUIRE_DB —— 真库测试缺 DSN 时会 skip，" +
+	if !hasYAMLKey(yml, "SPARK_REQUIRE_DB") {
+		t.Error("CI workflow 未以 YAML 键注入 SPARK_REQUIRE_DB —— 真库测试缺 DSN 时会 skip，" +
 			"CI 看起来绿了但数据面从未被验证")
+	}
+}
+
+// hasYAMLKey 判断文档里是否存在形如 `KEY:` 的 YAML 映射键
+// （允许前导空白与引号），从而把「真的注入了这个变量」与
+// 「这个名字恰好作为子串出现在别处」区分开。
+func hasYAMLKey(doc, key string) bool {
+	for _, line := range strings.Split(doc, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue // 注释不算注入
+		}
+		for _, form := range []string{key + ":", "'" + key + "':", `"` + key + `":`} {
+			if strings.HasPrefix(trimmed, form) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestHasYAMLKey_RejectsSubstringOnly 是 hasYAMLKey 的**负向自测**。
+//
+// 为什么闸门本身也要有测试：
+//   文本闸门最大的失效模式不是「漏写」，而是**写了却永远为真**。
+//   这正是本文件开头记录的那次事故的翻版 —— 只是发生在闸门层。
+//   若 hasYAMLKey 退化成 strings.Contains，下面每条 case 都会误判，
+//   而 CI 依然全绿。**只有负向用例能让闸门「证明自己会响」。**
+//
+// 核心 case：SPARK_TEST_DB_DSN 含 SPARK_DB_DSN 子串。
+//   只写测试期名、不写主名的配置，必须被判为「未注入主名」。
+func TestHasYAMLKey_RejectsSubstringOnly(t *testing.T) {
+	cases := []struct {
+		name string
+		doc  string
+		key  string
+		want bool
+	}{
+		{
+			name: "只有前缀包含关系时不算命中（事故复现）",
+			doc:  "      SPARK_TEST_DB_DSN: postgres://x/y\n",
+			key:  "SPARK_DB_DSN",
+			want: false,
+		},
+		{
+			name: "真正的 YAML 键命中",
+			doc:  "      SPARK_DB_DSN: postgres://x/y\n",
+			key:  "SPARK_DB_DSN",
+			want: true,
+		},
+		{
+			name: "注释里的名字不算注入",
+			doc:  "      # SPARK_DB_DSN: postgres://x/y\n",
+			key:  "SPARK_DB_DSN",
+			want: false,
+		},
+		{
+			name: "值里出现该名字不算注入",
+			doc:  "      SOMETHING_ELSE: SPARK_DB_DSN\n",
+			key:  "SPARK_DB_DSN",
+			want: false,
+		},
+		{
+			name: "带引号的键也算",
+			doc:  "      \"SPARK_DB_DSN\": postgres://x/y\n",
+			key:  "SPARK_DB_DSN",
+			want: true,
+		},
+		{
+			name: "零缩进的键也算",
+			doc:  "SPARK_DB_DSN: postgres://x/y\n",
+			key:  "SPARK_DB_DSN",
+			want: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasYAMLKey(tc.doc, tc.key); got != tc.want {
+				t.Errorf("hasYAMLKey(%q, %q) = %v, 期望 %v —— "+
+					"闸门在此处误判会让整个 CI 作业静默失效", tc.doc, tc.key, got, tc.want)
+			}
+		})
 	}
 }
 
