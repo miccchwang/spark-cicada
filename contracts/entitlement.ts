@@ -1,9 +1,10 @@
 /**
- * contracts/entitlement.ts —— v1.1
+ * contracts/entitlement.ts —— v1.2
  *
  * 账号授权项（D11 / D12 / D13）契约。
  *
  * 核心变化：权限**不再只来自固定角色模板**；每个账号可**逐项勾选**
+ *   - 四个勾选组（按数据用途分组）
  *   - 可访问的模块
  *   - 可访问的数据维度（含取值与下级包含）
  *   - 密级上限（逐级）
@@ -16,17 +17,21 @@
  *   - canViewBusinessValues：**D7=取消**，对 IT 角色恒为 false 且不可勾选
  *   - grantedBy：授权来源（区分管理员直接勾选 / 上级代授 / 申请获批）
  *
- * 求值（v1.1）：
+ * v1.2（三轮修订）新增：
+ *   - dataUseGroups：四个勾选组（运营数据 / 成本与利润 / 库存与预警 / 投资与回报）
+ *   - DataUseGroup / GroupScopeGrant / DATA_USE_GROUP_DEPS
+ *
+ * 求值（v1.2）：
  *   最终权限 = 模板起点
  *            ⊕ 分组授权（并集）
- *            ⊕ 逐项勾选
+ *            ⊕ 勾选组（四组）⊕ 逐项勾选
  *            ⊕ 已批准申请
  *            ⊕ 上级代授（受「可授出 ⊆ 自身权限」约束）
  *            ⊖ 显式禁用（DENY 优先）
  *            ⊕ 临时授权（时间盒）
  */
 
-export const ENTITLEMENT_VERSION = "1.1" as const;
+export const ENTITLEMENT_VERSION = "1.2" as const;
 
 export interface Entitlement {
   v: typeof ENTITLEMENT_VERSION;
@@ -37,6 +42,8 @@ export interface Entitlement {
   groups?: string[];
   /** 上级账号（D13，职权向下覆盖链上的直接上级） */
   supervisor?: string;
+  /** 四个勾选组（第三轮新增，按数据用途分组） */
+  dataUseGroups?: GroupScopeGrant[];
   /** 可访问模块（勾选） */
   modules: ModuleGrant;
   /** 可访问数据维度（勾选） */
@@ -79,6 +86,40 @@ export interface FieldOverride {
   field: string;
   allow: boolean;
 }
+
+/* ─────────────────────────────────────────────────────────────
+ * 勾选组（DataUseGroup）—— 第三轮新增
+ * 勾选树的顶层按「数据用途」分组，组内再细到维度与字段。
+ * 详见 docs/07 §5.5
+ * ───────────────────────────────────────────────────────────── */
+
+/** 四个数据用途组 */
+export type DataUseGroup =
+  | "grp.ops"            // ① 运营数据（渠道/店铺 → 实际销售 + 成本分项与合计）
+  | "grp.cost_profit"    // ② 成本与利润
+  | "grp.inventory"      // ③ 库存与库存预警
+  | "grp.roi";           // ④ 整体投资与回报（联动库存 + P&L + 时间）
+
+export interface GroupScopeGrant {
+  group: DataUseGroup;
+  /** 组内可访问的字段子集；空 = 组内全部 */
+  fields?: string[];
+  /** 组内维度限定（如运营数据限定到某渠道/店铺） */
+  scopedBy?: DimensionGrant[];
+  /** 组内显式禁用项（DENY 优先） */
+  denied?: string[];
+  maxLevel: Level;
+  /** 组依赖是否已满足（grp.roi 需 cost_profit + inventory） */
+  dependenciesMet?: boolean;
+}
+
+/** 构选组依赖表：key 依赖 value 中的组 */
+export const DATA_USE_GROUP_DEPS: Record<DataUseGroup, DataUseGroup[]> = {
+  "grp.ops": [],
+  "grp.cost_profit": [],
+  "grp.inventory": [],
+  "grp.roi": ["grp.cost_profit", "grp.inventory"],
+};
 
 export interface TempGrant {
   scope: string;

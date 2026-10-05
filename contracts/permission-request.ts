@@ -23,7 +23,8 @@ export type RequestStatus =
   | "APPROVING"      // 审批中
   | "APPROVED"       // 已通过（已开通）
   | "REJECTED"       // 已拒绝
-  | "WITHDRAWN";     // 申请人撤回
+  | "WITHDRAWN"      // 申请人撤回
+  | "BLOCKED_CROSS_DEPT"; // 跨部门：需 T1 直接授予，不可自助申请（第三轮）
 
 export interface PermissionRequest {
   v: typeof PERMISSION_REQUEST_VERSION;
@@ -45,6 +46,8 @@ export interface PermissionRequest {
 }
 
 export interface RequestDraft {
+  /** 勾选组（第三轮新增）：四个数据用途组 */
+  dataUseGroups?: import("./entitlement").GroupScopeGrant[];
   modules: string[];
   dimensions: RequestDimensionGrant[];
   maxLevel: "L1" | "L2" | "L3" | "L4";
@@ -64,6 +67,19 @@ export interface ApprovalStep {
   action: "APPROVE" | "REJECT" | "RETURN" | "PENDING";
   reason?: string;
   at?: string;
+}
+
+/**
+ * 抄送记录（第三轮新增）：+2 或 +1 的直属上级。
+ * 抄送人**知会**该申请；默认不阻断，除非配置为"会签"。
+ */
+export interface CcRecord {
+  cc: string;
+  reason: string;                   // 如 "+2" / "+1 的直属上级"
+  notifiedAt: string;
+  readAt?: string;
+  /** 若配置为会签且否决，则记录否决 */
+  vetoed?: boolean;
 }
 
 /** 申请提交前的预校验结果 */
