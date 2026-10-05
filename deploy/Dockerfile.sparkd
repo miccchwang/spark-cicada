@@ -12,6 +12,16 @@ COPY backend/ ./backend/
 RUN cd backend && CGO_ENABLED=0 go build -o /sparkd ./cmd/sparkd && \
     CGO_ENABLED=0 go build -o /spark-migrate ./cmd/spark-migrate
 
+# ── Stage 2b: 前端静态产物（M-FILTER/M-QUERY/M-RENDER 三段解耦）──
+# 只跑构建，不跑测试 —— 闸门在 CI（make gate-web）里已经拦过，不重复付费。
+FROM node:22-slim AS web
+WORKDIR /src/web
+COPY web/package.json web/package-lock.json* ./
+# esbuild 的 postinstall 在容器里可正常跑（本机 Windows 沙箱有 EBUSY 限制，见 SKILL 记录）
+RUN npm install --no-audit --no-fund
+COPY web/ ./
+RUN npm run build
+
 # ── Stage 3: 运行镜像（最小化）──
 FROM debian:stable-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
@@ -23,6 +33,9 @@ COPY --from=backend /sparkd /usr/local/bin/sparkd
 COPY --from=backend /spark-migrate /usr/local/bin/spark-migrate
 # 迁移文件（供 sparkd 启动时幂等应用；sparkd 不会自动跑迁移，需显式调用）
 COPY sql/migrations/ /opt/spark/sql/migrations/
+# 前端静态产物（由 sparkd 以静态目录方式提供）
+COPY --from=web /src/web/dist/ /opt/spark/web/
 USER spark
+ENV SPARK_WEB_DIR=/opt/spark/web
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/sparkd"]

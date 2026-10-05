@@ -9,6 +9,7 @@ SHELL := /bin/sh
 GO      ?= go
 CARGO   ?= cargo
 GO_PKG  := ./backend/...
+NODE    ?= node
 
 .PHONY: help
 help:
@@ -22,16 +23,21 @@ help:
 	@echo "make gate-sql      SQL 迁移静态闸门（append-only/D7/可空/region/无凭据/种子诚实）"
 	@echo "make gate-admin    控制面闸门（G4 解耦 / G5 传播 / G6 局部重算 / G9 挂载 / G10 审计）"
 	@echo "make gate-db       真库集成闸门（需 SPARK_TEST_DB_DSN；未设置则跳过）"
+	@echo "make gate-web      前端闸门（G1 三段解耦 / G2 默认收起 / G3 缺失不填零 / 契约镜像一致）"
 	@echo "make gate-secret   全仓密钥扫描（gitleaks）"
 	@echo "make migrate-up    应用数据库迁移"
 	@echo "make migrate-dry   迁移校验（不写库）"
 	@echo "make test          全部测试"
-	@echo "make build         构建 Go + Rust"
+	@echo "make build         构建 Go + Rust + Web"
 
 # ───────────────────────────── 构建 ─────────────────────────────
 
 .PHONY: build
-build: build-go build-rust
+build: build-go build-rust build-web
+
+.PHONY: build-web
+build-web:
+	cd web && $(NODE) scripts/build.mjs
 
 .PHONY: build-go
 build-go:
@@ -59,11 +65,15 @@ migrate-status:
 # ───────────────────────────── 测试 ─────────────────────────────
 
 .PHONY: test
-test: test-go test-rust
+test: test-go test-rust test-web
 
 .PHONY: test-go
 test-go:
 	cd backend && $(GO) test ./...
+
+.PHONY: test-web
+test-web:
+	cd web && $(NODE) --test test/*.test.mjs
 
 .PHONY: test-rust
 test-rust:
@@ -72,7 +82,7 @@ test-rust:
 # ───────────────────────────── 闸门 ─────────────────────────────
 
 .PHONY: gate
-gate: gate-fast gate-auth gate-precomp gate-plugins gate-dr gate-compute gate-sql gate-admin
+gate: gate-fast gate-auth gate-precomp gate-plugins gate-dr gate-compute gate-sql gate-admin gate-web
 	@echo "ALL GATES PASSED"
 
 # 静态闸门：G1/G4/G11（源码静态扫描 + 前缀密钥扫描）
@@ -117,6 +127,12 @@ gate-admin:
 gate-db:
 	cd backend && $(GO) test ./internal/store/ -run Integration -v
 
+# 前端闸门：G1 三段解耦静态扫描 + G2/G3 渲染语义 + 契约镜像一致
+.PHONY: gate-web
+gate-web:
+	cd web && $(NODE) scripts/layering-gate.mjs
+	cd web && $(NODE) --test test/*.test.mjs
+
 # 计算内核自检（缺失语义 / 覆盖率门控 / 银行家舍入）
 .PHONY: gate-compute
 gate-compute:
@@ -135,3 +151,4 @@ gate-secret:
 clean:
 	cd backend && $(GO) clean ./...
 	cd compute && $(CARGO) clean
+	rm -rf web/dist web/.test-build

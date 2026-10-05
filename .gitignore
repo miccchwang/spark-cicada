@@ -5,6 +5,11 @@ backend/sparkd.exe
 spark-compute
 spark-compute.exe
 
+# 前端构建产物与依赖（web/package.json + package-lock.json 入库）
+web/node_modules/
+web/dist/
+web/.test-build/
+
 # 本地环境
 .env
 *.local

@@ -1,0 +1,69 @@
+/* spark-cicada · 基础样式（遵循明暗双主题，不依赖框架） */
+
+:root {
+  --bg: #ffffff;
+  --fg: #1a1a1a;
+  --muted: #6b7280;
+  --line: #e5e7eb;
+  --accent: #2563eb;
+  --danger-bg: #fef2f2;
+  --danger-fg: #b91c1c;
+  --missing: #9ca3af;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115;
+    --fg: #e5e7eb;
+    --muted: #9ca3af;
+    --line: #262b36;
+    --accent: #60a5fa;
+    --danger-bg: #3b1414;
+    --danger-fg: #fca5a5;
+    --missing: #6b7280;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.55 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+#app { padding: 16px 20px 48px; max-width: 1400px; margin: 0 auto; }
+
+.bar { display: flex; align-items: center; gap: 8px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+.bar .sep { color: var(--muted); }
+
+.tabs { display: flex; gap: 6px; margin: 14px 0; flex-wrap: wrap; }
+.tab {
+  border: 1px solid var(--line); background: transparent; color: var(--fg);
+  padding: 5px 12px; border-radius: 6px; cursor: pointer; font-size: 13px;
+}
+.tab.active { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+
+.hint { color: var(--muted); padding: 8px 0; }
+.hint.small { font-size: 12px; }
+
+.error {
+  background: var(--danger-bg); color: var(--danger-fg);
+  border: 1px solid var(--danger-fg); border-radius: 8px;
+  padding: 10px 14px; margin: 12px 0;
+}
+.error .detail { margin-top: 4px; font-size: 12px; opacity: .85; word-break: break-all; }
+
+.levels { margin: 12px 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.level { display: flex; justify-content: space-between; padding: 7px 12px; border-bottom: 1px solid var(--line); }
+.level:last-child { border-bottom: 0; }
+.level .meta { color: var(--muted); font-size: 12px; }
+
+table.grid { width: 100%; border-collapse: collapse; margin-top: 12px; font-variant-numeric: tabular-nums; }
+table.grid th, table.grid td { padding: 7px 10px; border-bottom: 1px solid var(--line); text-align: left; }
+table.grid th.right, table.grid td.right { text-align: right; }
+table.grid th { color: var(--muted); font-weight: 600; font-size: 12px; }
+td.missing { color: var(--missing); font-style: italic; }
+
+.gaps { margin-top: 14px; padding: 10px 14px; border: 1px dashed var(--line); border-radius: 8px; color: var(--muted); font-size: 12px; }
