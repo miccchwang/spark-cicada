@@ -4,39 +4,68 @@
  * 备份与容灾契约（第三轮拍板新增）。
  *
  * 落地：
- *   - B1 双云主备（主：阿里云·新加坡；备：AWS·美国）+ 跨云异步同步
- *   - B2 备份云保留 180 天数据回滚能力
- *   - B3 云数据可本地备份 + 下载；每月 1 号自动备份上一个月；每月限 1 次下载
+ *   - B1 **双地域 × 每地域主备**：新加坡（东南亚）/ 美国（美区）各一套「阿里云主 + AWS 备」
+ *        + **地域内异步同步**（非跨洋主备）
+ *   - B2 **分地域**保留 180 天数据回滚能力
+ *   - B3 云数据可本地备份 + 下载；每月 1 号自动备份上一个月；每月限 1 次下载（分地域计数）
  *
  * 详见 docs/04-运维方案.md §6
  */
 
 export const BACKUP_QUOTA_VERSION = "1.0" as const;
 
-/* ───────────────────── 双云主备（B1） ───────────────────── */
+/* ───────────────────── 双地域 × 每地域主备（B1） ───────────────────── */
 
 export type SiteRole = "PRIMARY" | "STANDBY";
 
+/** 地域：新加坡（东南亚业务）/ 美国（美区业务） */
+export type Region = "ap-southeast-1" | "us-east-1";
+
 export interface CloudSite {
+  /** 地域 */
+  region: Region;
+  /** 该地域服务的业务范围 */
+  businessScope: string;        // 如 "东南亚" / "美区"
   role: SiteRole;
-  /** 云厂商：aliyun / aws */
+  /** 云厂商：aliyun / aws（每地域：阿里云主 + AWS 备） */
   provider: "aliyun" | "aws";
-  /** 区域，如 ap-southeast-1 / us-east-1 */
-  region: string;
   /** 该站点的组件 */
   components: ("app" | "compute" | "db" | "cache" | "web")[];
 }
 
+/**
+ * 部署拓扑：两个地域，每个地域内部各一套主备。
+ * 地域之间业务分区、互不互为实时备（仅汇总视图 / 灾备归档）。
+ */
+export interface DeploymentTopology {
+  v: typeof BACKUP_QUOTA_VERSION;
+  regions: {
+    region: Region;
+    business: "东南亚" | "美区";
+    primary: CloudSite;         // 阿里云（该地域）
+    standby: CloudSite;         // AWS（同地域）
+    /** 该地域承接的渠道/店铺（按业务分区） */
+    channels: string[];
+  }[];
+  /** 地域间关系：业务分区（非主备） */
+  interRegionMode: "BUSINESS_PARTITION";
+  /** 是否允许跨地域写同一行 */
+  allowCrossRegionWrite: false;
+}
+
+/** 同步配置：地域内（主→备）异步 */
 export interface ReplicationConfig {
+  /** 同步范围：同地域内 */
+  scope: "INTRA_REGION";
   /** 同步方式：异步（本项目默认） */
   mode: "ASYNC" | "SYNC";
   /** 机制：WAL 流式 / 逻辑复制 / 定期快照 */
   mechanism: ("wal_stream" | "logical" | "snapshot")[];
-  /** 传输通道：加密隧道 */
-  channel: "wireguard" | "cloud_direct";
-  /** 同步延迟告警阈值（秒） */
+  /** 传输通道：同地域内网加密 */
+  channel: "intra_region_encrypted" | "wireguard" | "cloud_direct";
+  /** 同步延迟告警阈值（秒）——同地域可更低 */
   lagAlertSeconds: number;
-  /** 预期 RPO 描述（异步 ⇒ 秒级~分钟） */
+  /** 预期 RPO 描述（同地域异步 ⇒ 秒级） */
   rpo: string;
 }
 
@@ -45,6 +74,8 @@ export interface ReplicationConfig {
 export interface RollbackPolicy {
   /** 回滚窗口（天） */
   windowDays: number;
+  /** 范围：各地域独立（不跨地域回滚） */
+  scope: "PER_REGION";
   /** 回滚粒度：按天 */
   granularity: "day";
   /** 谁能发起：仅 T1 */
@@ -59,6 +90,7 @@ export interface RollbackPolicy {
 
 export const DEFAULT_ROLLBACK_POLICY: RollbackPolicy = {
   windowDays: 180,
+  scope: "PER_REGION",
   granularity: "day",
   initiatorTier: "T1",
   requireSecondConfirm: true,
@@ -70,6 +102,8 @@ export const DEFAULT_ROLLBACK_POLICY: RollbackPolicy = {
 
 export interface BackupArchive {
   id: string;
+  /** 所属地域 */
+  region: Region;
   /** 数据月份，如 2026-09 */
   dataMonth: string;
   /** 生成时间（每月 1 号自动生成上月归档） */
@@ -88,6 +122,8 @@ export interface BackupDownloadQuota {
   account: string;
   /** 自然月（YYYY-MM） */
   period: string;
+  /** 地域（配额按地域分别计数） */
+  region?: Region;
   /** 本月已用下载次数 */
   used: number;
   /** 本月上限（默认 1） */
