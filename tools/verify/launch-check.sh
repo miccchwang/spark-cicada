@@ -126,7 +126,17 @@ for cand in "$ROOT/compute/target/release/spark-compute" "$ROOT/compute/target/r
 done
 if [ -z "$COMPUTE_BIN" ] && [ -n "$CARGOEXE" ]; then
   printf '  · 未找到 compute 内核，尝试构建（cargo build --release）…\n'
-  ( cd compute && "$CARGOEXE" build --release --locked --quiet >/dev/null 2>&1 )
+  # ★ 构建输出**不要**丢进 /dev/null：CI 上内核缺货是硬失败，
+  #   而失败原因（锁定文件不一致 / 缓存损坏 / 编译错误）只在日志里。
+  #   这里留档并在必要时转成 annotation。
+  ( cd compute && "$CARGOEXE" build --release --locked >/tmp/spark-cargo-build.log 2>&1 )
+  CARGO_RC=$?
+  if [ "$CARGO_RC" -ne 0 ]; then
+    printf '      内核构建失败（exit %d）：\n' "$CARGO_RC"
+    tail -15 /tmp/spark-cargo-build.log
+    [ -n "${GITHUB_ACTIONS:-}" ] && printf '::error::compute 内核构建失败：%s\n' \
+      "$(tail -3 /tmp/spark-cargo-build.log | tr '\n' ' ')"
+  fi
   for cand in "$ROOT/compute/target/release/spark-compute" "$ROOT/compute/target/release/spark-compute.exe"; do
     [ -x "$cand" ] && COMPUTE_BIN="$cand" && break
   done
@@ -317,7 +327,11 @@ if [ -n "$COMPUTE_BIN" ] && [ -d web/dist ] && [ -f web/dist/index.html ]; then
         ok "未注册桶被拒（HTTP $CODE，未泄露数据）"
       fi
     else
-      bad "sparkd 未启动成功"; tail -20 /tmp/sparkd.log
+      bad "sparkd 未启动成功"
+      tail -20 /tmp/sparkd.log
+      [ -n "${GITHUB_ACTIONS:-}" ] && printf '::error::sparkd 启动失败，日志尾部：%s\n' \
+        "$(tail -5 /tmp/sparkd.log | tr '\n' ' ')"
+      true
     fi
     kill "$SRV_PID" 2>/dev/null
     wait "$SRV_PID" 2>/dev/null
@@ -331,6 +345,28 @@ fi
 # ───────────────────────── 汇总 ─────────────────────────
 printf '\n\033[1m════════ 汇总 ════════\033[0m\n'
 printf '  通过 %d  失败 %d  跳过 %d\n' "$PASS" "$FAIL" "$SKIP"
+
+# ★ 在 GitHub Actions 上把「哪几条断言失败」写成 annotation。
+#
+#   动机：job 日志接口需要管理员权限才能下载（403），
+#   于是 CI 红了你却看不到失败原因，只能靠猜或反复推提交。
+#   annotation 走 check-runs API，**无需管理员**即可读取，
+#   让 CI 失败自带诊断信息，而不是一个黑盒。
+if [ -n "${GITHUB_ACTIONS:-}" ] && [ "$FAIL" -gt 0 ]; then
+  printf '::error::launch-check 失败 %d 条（通过 %d / 跳过 %d）\n' "$FAIL" "$PASS" "$SKIP"
+  # FAILED_NAMES 以换行分隔，逐条转成 annotation
+  printf '%s\n' "$FAILED_NAMES" | while IFS= read -r line; do
+    [ -n "$line" ] && printf '::error::%s\n' "$line"
+  done
+fi
+
+# 环境快照：无论成败都写一条 notice，便于跨平台差异排障
+# （CI 上日志需管理员权限下载，annotation 不需要）
+if [ -n "${GITHUB_ACTIONS:-}" ]; then
+  printf '::notice::launch-check 通过=%d 失败=%d 跳过=%d | go=%s node=%s cargo=%s | compute=%s\n' \
+    "$PASS" "$FAIL" "$SKIP" "${GOEXE:-无}" "${NODEEXE:-无}" "${CARGOEXE:-无}" "${COMPUTE_BIN:-无}"
+fi
+
 if [ "$FAIL" -gt 0 ]; then
   printf '\n\033[31m失败项：%b\033[0m\n' "$FAILED_NAMES"
   printf '\n\033[31m结论：未达可上线标准。\033[0m\n'

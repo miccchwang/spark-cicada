@@ -218,6 +218,14 @@ jobs:
         working-directory: backend
         run: go run ./cmd/spark-migrate -dir ../sql/migrations -up
 
+      # 显式构建 Rust 计算内核（release）。
+      # 不依赖 launch-check 里的「自动构建」兜底：sparkd 是 fail-closed 的，
+      # 内核缺货会让 §4b/§8 直接失败；在这里单独一步构建，失败原因更清晰，
+      # 也避免多段逻辑共享一个隐式缓存状态。
+      - name: 构建计算内核（release）
+        working-directory: compute
+        run: cargo build --release --locked
+
       # 脚本里的托管绝对路径在 Linux 上不存在，会回退到 PATH —— 此处显式清空以免误用。
       - name: 上线前证据链
         run: |
