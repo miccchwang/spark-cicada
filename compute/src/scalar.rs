@@ -120,7 +120,12 @@ mod tests {
     fn banker_rounding() {
         assert_eq!(banker_round(2.5, 0), 2.0);   // 五成双 → 偶数
         assert_eq!(banker_round(3.5, 0), 4.0);   // 五成双 → 偶数
-        assert_eq!(banker_round(2.675, 2), 2.67); // 浮点近似下向偶
+        // 注意：2.675 * 100 在 f64 下恰为 267.5（精确 .5），
+        // 银行家舍入取偶 → 268 ⇒ 2.68（**不是** 2.67）。
+        // 这正是「五成双」相对「四舍五入」的差异所在，切勿改成 2.67。
+        assert_eq!(banker_round(2.675, 2), 2.68);
+        // 非恰 .5 的情形正常四舍五入
+        assert_eq!(banker_round(2.674, 2), 2.67);
         assert_eq!(banker_round(1.4, 0), 1.0);
     }
 }
