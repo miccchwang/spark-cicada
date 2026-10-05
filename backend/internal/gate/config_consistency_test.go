@@ -200,3 +200,98 @@ func TestConfig_DocsMentionBothDSNNames(t *testing.T) {
 			"运维会漏配真库测试用的连接串")
 	}
 }
+
+// TestConfig_LaunchCheckGuardsWindowsToolchain 断言 launch-check 只在
+// **确实用托管工具链**时才注入 Windows 专属的 GOROOT/GOPATH/GOCACHE/GOTMPDIR。
+//
+// ★ 真实事故（CI 第三次红）：
+//   脚本原先无条件写
+//     export GOROOT="${GOROOT:-C:/Users/.../go1.27.1}"
+//   本机跑没问题（托管的 go.exe 就在那儿）。但 CI 是 Linux：
+//     - GOEXE 已按 PATH 回退成 /usr/bin/go（第 57 行那层回退是对的）
+//     - GOROOT 却仍被强制指到一个 **Windows 路径**
+//   Go 于是找不到自己的标准库，`go version` 失败 ⇒ 步骤 0 判「go 不可用」
+//   ⇒ 脚本当场 exit 1。CI 摘要里只见「launch-check 在步骤 0 中途退出」，
+//   真正的跨平台路径污染被完全掩盖。
+//
+//   修复：把四行 export 包进 `if [ "$GOEXE" = "$MANAGED_GO" ]; then ... fi`。
+//
+// 这条闸门守的就是「那个 if 还在，且 MANAGED_GO 与 GOEXE 的默认值同源」——
+// 后者尤其重要：两处硬编码路径一旦漂移，守卫就恒为假，GOROOT 永不注入，
+// 本机反而会坏。**守卫本身也需要被守卫。**
+func TestConfig_LaunchCheckGuardsWindowsToolchain(t *testing.T) {
+	sh := repoFile(t, "tools/verify/launch-check.sh")
+
+	// 1) 必须先把托管路径抽成变量，作为守卫的判据。
+	if !strings.Contains(sh, "MANAGED_GO=") {
+		t.Fatal("launch-check 未定义 MANAGED_GO —— 没有判据变量，就无法把 Windows " +
+			"专属环境变量的注入限制在托管工具链上（详见本函数注释里的事故记录）")
+	}
+
+	// 2) 四个 export 必须都在守卫体内。
+	//
+	//    用「守卫到 fi 之间的片段」做区间断言，而不是全文找 export ——
+	//    否则把 export 挪到 if 外面（也就是把 bug 改回去）闸门依然会通过。
+	guardStart := strings.Index(sh, `if [ "$GOEXE" = "$MANAGED_GO" ]; then`)
+	if guardStart < 0 {
+		t.Fatal("launch-check 缺少 `if [ \"$GOEXE\" = \"$MANAGED_GO\" ]; then` 守卫 —— " +
+			"Win/Linux 双平台上必然有一边坏掉")
+	}
+	guardEnd := strings.Index(sh[guardStart:], "\nfi")
+	if guardEnd < 0 {
+		t.Fatal("launch-check 的托管工具链守卫没有闭合的 fi —— 脚本会被截断执行")
+	}
+	guardBody := sh[guardStart : guardStart+guardEnd]
+
+	for _, v := range []string{"GOROOT", "GOPATH", "GOCACHE", "GOTMPDIR"} {
+		if !strings.Contains(guardBody, "export "+v+"=") {
+			t.Errorf("launch-check 的托管守卫体内缺少 export %s —— "+
+				"要么它被挪到了守卫之外（Windows 路径会污染 Linux CI），"+
+				"要么被误删（本机托管工具链会找不到标准库）", v)
+		}
+	}
+
+	// 3) 守卫判据必须与 GOEXE 默认值指向同一个 bin 路径（防漂移）。
+	//
+	//    两条路径分别在脚本里硬编码了两次，任何一次被改都会让守卫失效。
+	//    这里断言两处字符串一致，把这种漂移钉死在测试里。
+	goexeLine := ""
+	for _, line := range strings.Split(sh, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "GOEXE=") {
+			goexeLine = line
+			break
+		}
+	}
+	if goexeLine == "" {
+		t.Fatal("launch-check 未定义 GOEXE")
+	}
+	// 从 `GOEXE="${GOEXE:-<path>}"` 里取出 <path>。
+	const prefix = `${GOEXE:-`
+	i := strings.Index(goexeLine, prefix)
+	if i < 0 {
+		t.Fatalf("GOEXE 的默认值写法变了（期望形如 ${GOEXE:-<path>}）：%s\n"+
+			"本闸门依赖这个形态来提取路径，请同步更新测试。", goexeLine)
+	}
+	rest := goexeLine[i+len(prefix):]
+	j := strings.IndexAny(rest, "}\"")
+	if j < 0 {
+		t.Fatalf("无法从 GOEXE 默认值里解析出路径：%s", goexeLine)
+	}
+	goexeDefault := rest[:j]
+
+	managedLine := ""
+	for _, line := range strings.Split(sh, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "MANAGED_GO=") {
+			managedLine = line
+			break
+		}
+	}
+	managed := strings.Trim(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(managedLine), "MANAGED_GO=")), `"`)
+
+	if managed != goexeDefault {
+		t.Errorf("MANAGED_GO 与 GOEXE 默认值不一致，守卫将恒为假：\n"+
+			"  MANAGED_GO = %q\n  GOEXE 默认 = %q\n"+
+			"两处路径已漂移 —— 后果是 GOROOT/GOPATH/GOCACHE/GOTMPDIR 永不注入，"+
+			"本机托管工具链会因找不到标准库而失败。", managed, goexeDefault)
+	}
+}

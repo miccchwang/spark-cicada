@@ -58,10 +58,24 @@ command -v "$GOEXE" >/dev/null 2>&1 || GOEXE="$(command -v go || true)"
 command -v "$NODEEXE" >/dev/null 2>&1 || NODEEXE="$(command -v node || true)"
 command -v "$CARGOEXE" >/dev/null 2>&1 || CARGOEXE="$(command -v cargo || true)"
 
-export GOROOT="${GOROOT:-C:/Users/Konvy-1098/.workbuddy-ai/binaries/go/versions/go1.27.1}"
-export GOPATH="${GOPATH:-C:/Users/Konvy-1098/.workbuddy-ai/binaries/go/gopath}"
-export GOCACHE="${GOCACHE:-C:/Users/Konvy-1098/.workbuddy-ai/binaries/go/cache}"
-export GOTMPDIR="${GOTMPDIR:-C:/Users/Konvy-1098/.workbuddy-ai/binaries/go/tmp}"
+# ★ 只在「确实用的是托管工具链」时才注入这些 Windows 专属路径。
+#
+#   真实事故：原先无条件
+#     export GOROOT="${GOROOT:-C:/Users/.../go1.27.1}"
+#   CI（Linux）上 GOEXE 已按 PATH 回退成 /usr/bin/go，
+#   但 GOROOT 仍被强制指到一个 **Windows 路径** —— Go 找不到自己的标准库，
+#   `go version` 直接失败 ⇒ 步骤 0 判「go 不可用」⇒ 脚本当场退出。
+#   表现是「launch-check 在步骤 0 中途退出」，而真正原因
+#   （跨平台路径污染）在报错里完全看不出来。
+#
+#   判据：只有当 GOEXE 仍是我们自己那个托管绝对路径时，才设置其配套环境变量。
+MANAGED_GO="C:/Users/Konvy-1098/.workbuddy-ai/binaries/go/versions/go1.27.1/bin/go.exe"
+if [ "$GOEXE" = "$MANAGED_GO" ]; then
+  export GOROOT="${GOROOT:-C:/Users/Konvy-1098/.workbuddy-ai/binaries/go/versions/go1.27.1}"
+  export GOPATH="${GOPATH:-C:/Users/Konvy-1098/.workbuddy-ai/binaries/go/gopath}"
+  export GOCACHE="${GOCACHE:-C:/Users/Konvy-1098/.workbuddy-ai/binaries/go/cache}"
+  export GOTMPDIR="${GOTMPDIR:-C:/Users/Konvy-1098/.workbuddy-ai/binaries/go/tmp}"
+fi
 
 PASS=0
 FAIL=0
@@ -92,7 +106,15 @@ if [ -n "$GOEXE" ] && "$GOEXE" version >/dev/null 2>&1; then ok "go: $("$GOEXE" 
 if [ -n "$NODEEXE" ] && "$NODEEXE" --version >/dev/null 2>&1; then ok "node: $("$NODEEXE" --version)"; else bad "node 不可用"; fi
 if [ -n "$CARGOEXE" ] && "$CARGOEXE" --version >/dev/null 2>&1; then ok "cargo: $("$CARGOEXE" --version)"; else skip "cargo 不可用（Rust 段将跳过）"; fi
 
-[ "$FAIL" -gt 0 ] && { echo "工具链缺失，无法继续"; exit 1; }
+# ★ 写成显式 if：原先的 `[ "$FAIL" -gt 0 ] && { ...; exit 1; }`
+#   在 FAIL=0 时整条语句返回 1 —— 作为该段的**最后一条命令**，
+#   它的非零状态会顺着往下传染；配合 trap 就表现为
+#   「在步骤 0 中途退出」，完全看不出真正原因（实测在 CI 上就是这样红的）。
+#   「A && B」作语句结尾是 shell 里经典的退出码陷阱，这里一律改显式 if。
+if [ "$FAIL" -gt 0 ]; then
+  echo "工具链缺失，无法继续"
+  exit 1
+fi
 
 # ───────────────────────── 1. Go 构建 / vet ─────────────────────────
 step "1. Go 构建与静态检查"
