@@ -41,6 +41,7 @@ jobs:
       # ★ 两个名字都设：运行期组件（sparkd/spark-migrate）读 SPARK_DB_DSN，
       #   真库集成测试读 SPARK_TEST_DB_DSN。曾因只设后者而让迁移步骤
       #   「未配置连接信息」秒退、其后所有真库闸门全部 skip。
+      SPARK_DB_DSN: postgres://spark:spark_ci_only@localhost:5432/spark_cicada?sslmode=disable
       SPARK_TEST_DB_DSN: postgres://spark:spark_ci_only@localhost:5432/spark_cicada?sslmode=disable
       SPARK_REQUIRE_DB: "1"
     steps:
@@ -186,6 +187,7 @@ jobs:
           --health-retries 10
     env:
       # ★ 两个名字都设（同 go 作业，理由见上）。
+      SPARK_DB_DSN: postgres://spark:spark_ci_only@localhost:5432/spark_cicada?sslmode=disable
       SPARK_TEST_DB_DSN: postgres://spark:spark_ci_only@localhost:5432/spark_cicada?sslmode=disable
       SPARK_REQUIRE_DB: "1"
     steps:

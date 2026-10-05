@@ -66,8 +66,19 @@ SPARK_COMPUTE_BIN=./spark-compute SPARK_DB_DSN="$SPARK_DB_DSN" ./sparkd -addr :8
 
 ## 数据库
 
-连接串来源（按优先级）：`SPARK_DB_DSN`，或 `SPARK_PG_HOST` / `SPARK_PG_USER` /
-`SPARK_PG_PASSWORD` / `SPARK_PG_DB` / `SPARK_PG_PORT` / `SPARK_PG_SSLMODE`。
+连接串来源（按优先级）：
+
+1. `SPARK_DB_DSN` —— **运行期主名**（`sparkd` / `spark-migrate` 部署用）
+2. `SPARK_TEST_DB_DSN` —— **测试期名**（真库集成测试用；CI 真库作业会设它）
+3. `SPARK_PG_HOST` / `SPARK_PG_USER` / `SPARK_PG_PASSWORD` / `SPARK_PG_DB` /
+   `SPARK_PG_PORT` / `SPARK_PG_SSLMODE` —— 分字段组装
+
+> ★ **为什么解析器要同时认前两个名字**（真实事故）：
+> 迁移器原本只读 `SPARK_DB_DSN`，而 CI workflow 只设了 `SPARK_TEST_DB_DSN`，
+> 于是真库步骤以「未配置连接信息」秒退、其后所有真库闸门被连环 skip。
+> **两侧单看都自洽**，只有合排进同一个作业才暴露 —— 因此现在由
+> `db.DSNFromEnv()` 统一解析，单一事实来源，并由
+> `internal/gate/config_consistency_test.go` 静态钉住契约。
 
 **口令永不回显**：所有日志与错误信息统一走 `db.RedactDSN`（G11）。
 
