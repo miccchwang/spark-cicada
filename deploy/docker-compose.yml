@@ -1,0 +1,79 @@
+# spark-cicada · 本地/单机编排（docker compose）
+#
+# 纪律（docs/04 §1）：**双地域 × 每地域主备**。
+# 本文件只做**单地域**的可运行演示（开发/CI 用），生产拓扑见 docs/04 §6。
+#
+# 说明：
+#   * postgres 模拟「本地域主库」；pg-standby 模拟「同域备库（只读）」。
+#   * sparkd 是 Go 编排层；spark-compute 由 sparkd 以子进程方式调用（见 kernel.go）。
+#   * 不做跨地域：跨地域写同一行会被业务层拒绝（闸门 G12）。
+
+services:
+  # ── 本地域主库 ──
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: spark
+      POSTGRES_PASSWORD: spark_local_dev
+      POSTGRES_DB: spark_cicada
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_primary:/var/lib/postgresql/data
+      - ./sql/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spark -d spark_cicada"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # 主库：允许复制
+    command: >
+      postgres
+      -c wal_level=replica
+      -c max_wal_senders=5
+      -c hot_standby=on
+
+  # ── 本地域备库（只读；地域内异步同步）──
+  # 备库写入必须失败（闸门 G12「备库只读」）——hot_standby 已保证只读。
+  pg-standby:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: spark
+      POSTGRES_PASSWORD: spark_local_dev
+      PGDATA: /var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_standby:/var/lib/postgresql/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      bash -c "
+        until pg_basebackup -h postgres -U spark -D /var/lib/postgresql/data -Fp -Xs -R -P; do sleep 2; done;
+        postgres -c hot_standby=on -c hot_standby_feedback=on
+      "
+
+  # ── Go 编排层 ──
+  sparkd:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.sparkd
+    environment:
+      SPARK_COMPUTE_BIN: /usr/local/bin/spark-compute
+      SPARK_DB_DSN: postgres://spark:spark_local_dev@postgres:5432/spark_cicada?sslmode=disable
+      SPARK_REGION: ap-southeast-1   # 每地域部署一个实例；美区为 us-east-1
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/sparkd", "-selftest"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pg_primary:
+  pg_standby:

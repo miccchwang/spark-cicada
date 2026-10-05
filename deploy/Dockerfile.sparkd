@@ -1,0 +1,24 @@
+# ── Stage 1: Rust 计算内核 ──
+FROM rust:1.99-slim AS compute
+WORKDIR /src
+COPY compute/ ./compute/
+RUN cd compute && cargo build --release && \
+    cp target/release/spark-compute /spark-compute
+
+# ── Stage 2: Go 编排层 ──
+FROM golang:1.27-slim AS backend
+WORKDIR /src
+COPY backend/ ./backend/
+RUN cd backend && CGO_ENABLED=0 go build -o /sparkd ./cmd/sparkd
+
+# ── Stage 3: 运行镜像（最小化）──
+FROM debian:stable-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+# 非 root 运行
+RUN useradd -r -u 10001 spark
+COPY --from=compute /spark-compute /usr/local/bin/spark-compute
+COPY --from=backend /sparkd /usr/local/bin/sparkd
+USER spark
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/sparkd"]

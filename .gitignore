@@ -1,38 +1,18 @@
-# --- 环境与密钥 ---
+# 构建产物
+compute/target/
+backend/sparkd
+backend/sparkd.exe
+spark-compute
+spark-compute.exe
+
+# 本地环境
 .env
-.env.*
-!.env.example
-*.pem
-*.key
-secrets/
-credentials*
-*_secret*
-config.local.json
+*.local
 
-# --- 构建产物 ---
-dist/
-build/
-target/
-node_modules/
-*.wasm
-
-# --- 数据（不入库） ---
-data/
-*.sqlite3
-*.db
-_src/
-.tmp/
-
-# --- 日志与临时 ---
-*.log
-.tmp/
-coverage/
-
-# --- 编辑器 ---
-.vscode/
+# 编辑器
 .idea/
-.DS_Store
+.vscode/
+*.swp
 
-# --- 本地协作状态（钉钉回执轮询状态，不入库） ---
-.workbuddy-ai/state/
-.workbuddy-ai/memory/
+# WorkBuddy 本地记忆/状态（不入库）
+.workbuddy-ai/

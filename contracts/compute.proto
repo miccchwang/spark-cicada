@@ -1,0 +1,146 @@
+// compute.proto —— Go（编排） ↔ Rust（计算） 的 gRPC 边界契约。
+//
+// 纪律（docs/01 §4.1）：
+//   * Go 只传递「算法 ID + 数据槽内容 + 参数」；**永不实现公式**。
+//   * Rust 只计算并返回「结果 + AlgoTrace」；**不碰 HTTP 编排/鉴权**。
+//
+// 版本：破坏性变更必须升 version，并同步 backend/internal/compute 与 compute/src。
+
+syntax = "proto3";
+
+package spark.compute.v1;
+
+option go_package = "github.com/miccchwang/spark-cicada/backend/internal/compute/pb";
+
+// ───────────────────────── 计算服务 ─────────────────────────
+
+service Compute {
+  // EvalAlgo 执行单个算法（给定输入行与槽数据）。
+  rpc EvalAlgo(EvalAlgoRequest) returns (EvalAlgoResponse);
+
+  // EvalBatch 批量执行（预计算主力路径）。
+  rpc EvalBatch(EvalBatchRequest) returns (EvalBatchResponse);
+
+  // CheckCoverage 校验数据槽覆盖率是否达门限（fail-closed 判定）。
+  rpc CheckCoverage(CoverageRequest) returns (CoverageResponse);
+
+  // EvalRule 求值规则集（费率/口径），按作用域与生效时间选版本。
+  rpc EvalRule(EvalRuleRequest) returns (EvalRuleResponse);
+
+  // Health 探活（含内核版本，供 M-ADMIN 集成控制面展示）。
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// ───────────────────────── 通用 ─────────────────────────
+
+// Scalar 可空标量：set=false 表示缺失（不得当作 0）。
+message Scalar {
+  bool set = 1;
+  double value = 2;
+}
+
+message SlotData {
+  string slot_id = 1;
+  // 槽在当前作用域下的实测覆盖率；用于 coverage_gate 判定。
+  double coverage = 2;
+  // ACTIVE / MISSING / DEGRADED / DISABLED
+  string status = 3;
+}
+
+// ───────────────────────── EvalAlgo ─────────────────────────
+
+message EvalAlgoRequest {
+  string algo_id = 1;
+  int32 algo_version = 2;
+  // 纯公式（由调用方从注册表读出；Rust 逐条解析，不查库）
+  string formula = 3;
+  string missing_policy = 4; // skip | null | error
+  // 依赖槽的当前状态
+  repeated SlotData slots = 5;
+  // 输入行：字段名 → 可空标量
+  map<string, Scalar> inputs = 6;
+}
+
+message EvalAlgoResponse {
+  // 结果：null 表示被跳过（缺失），前端渲染「待接入」
+  Scalar result = 1;
+  bool skipped = 2;
+  string skip_reason = 3;
+  repeated string used_slots = 4;
+  string kernel_version = 5;
+}
+
+// ───────────────────────── EvalBatch ─────────────────────────
+
+message EvalBatchRequest {
+  string algo_id = 1;
+  int32 algo_version = 2;
+  string formula = 3;
+  string missing_policy = 4;
+  repeated SlotData slots = 5;
+  repeated EvalRow rows = 6;
+}
+
+message EvalRow {
+  string row_key = 1;
+  map<string, Scalar> inputs = 2;
+}
+
+message EvalBatchResponse {
+  repeated EvalAlgoResponse results = 1;
+  string kernel_version = 2;
+}
+
+// ───────────────────────── Coverage ─────────────────────────
+
+message CoverageRequest {
+  string slot_id = 1;
+  double measured = 2;
+  double gate = 3;
+}
+
+message CoverageResponse {
+  // true = 达门限，可用；false = 不可用（依赖它的算法须 skip）
+  bool passed = 1;
+  double coverage = 2;
+  double gate = 3;
+  string reason = 4;
+}
+
+// ───────────────────────── EvalRule ─────────────────────────
+
+message RuleItem {
+  string id = 1;
+  string name = 2;
+  Scalar rate = 3;
+  Scalar flat_per_order = 4;
+  bool vat_included = 5;
+  // 生效起始（RFC3339 日期）；空 = 始终生效
+  string effective_from = 6;
+  string effective_to = 7;
+}
+
+message EvalRuleRequest {
+  string rule_id = 1;
+  int32 rule_version = 2;
+  // 作用域：platform / country / brand / channel
+  map<string, string> scope = 3;
+  // 求值基准日期（用于多版本生效选择）
+  string as_of = 4;
+  repeated RuleItem items = 5;
+}
+
+message EvalRuleResponse {
+  // 命中的具体规则项（生效时间过滤后）
+  repeated RuleItem active_items = 1;
+  repeated string dropped_items = 2;
+  string chosen_version = 3;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string kernel_version = 1;
+  string rustc = 2;
+  bool ready = 3;
+}
