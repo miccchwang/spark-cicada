@@ -1,0 +1,212 @@
+name: ci
+
+# 验收闸门（docs/05）在 CI 上强制执行。
+#
+# ★ 设计要点：**真库闸门不允许 skip**。
+#   本地没有 docker/psql 时，internal/store 的 6 条集成测试会 skip；
+#   如果 CI 也 skip，那 M1 数据面就从未被真正验证过 —— 闸门形同虚设。
+#   因此 CI 起一个真 Postgres service，并设 SPARK_REQUIRE_DB=1：
+#   未设 DSN 时测试**直接失败**，而不是静默跳过。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  GO_VERSION: "1.27"
+  NODE_VERSION: "22"
+
+jobs:
+  # ───────────────────────── Go：构建 + 全部闸门 + 真库集成 ─────────────────────────
+  go:
+    name: Go 闸门（含真 Postgres）
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: spark
+          POSTGRES_PASSWORD: spark_ci_only
+          POSTGRES_DB: spark_cicada
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U spark -d spark_cicada"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      # 仅 CI 用的临时口令；不是任何真实环境的口令（G11：不入库、不入镜像）。
+      SPARK_TEST_DB_DSN: postgres://spark:spark_ci_only@localhost:5432/spark_cicada?sslmode=disable
+      SPARK_REQUIRE_DB: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: backend/go.sum
+
+      - name: 构建
+        working-directory: backend
+        run: go build ./...
+
+      - name: go vet
+        working-directory: backend
+        run: go vet ./...
+
+      # 迁移必须先把库建起来 —— 真库测试依赖 schema。
+      - name: 应用迁移（真库，幂等）
+        working-directory: backend
+        run: go run ./cmd/spark-migrate -dir ../sql/migrations -up
+
+      - name: 迁移可重复执行（幂等性）
+        working-directory: backend
+        run: go run ./cmd/spark-migrate -dir ../sql/migrations -up
+
+      - name: 迁移状态
+        working-directory: backend
+        run: go run ./cmd/spark-migrate -dir ../sql/migrations -status
+
+      - name: 全部 Go 测试
+        working-directory: backend
+        run: go test ./... -count=1
+
+      - name: SQL 静态闸门
+        working-directory: backend
+        run: go test ./internal/gate/ -run 'TestSQL' -count=1 -v
+
+      - name: 控制面闸门
+        working-directory: backend
+        run: go test ./internal/admin/ -count=1 -v
+
+      - name: ★ 真库集成闸门（必须真跑，不得 skip）
+        working-directory: backend
+        run: go test ./internal/store/ -run Integration -count=1 -v
+
+  # ───────────────────────── Rust：计算内核 ─────────────────────────
+  rust:
+    name: Rust 计算内核
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compute
+      - name: cargo test
+        working-directory: compute
+        run: cargo test --locked
+      - name: 内核自检
+        working-directory: compute
+        run: cargo run --quiet --locked -- --selftest
+
+  # ───────────────────────── 前端：分层闸门 ─────────────────────────
+  web:
+    name: 前端闸门（三段解耦）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 安装依赖
+        working-directory: web
+        run: npm install --no-audit --no-fund
+
+      - name: 分层闸门（G1-a/b/c/d + G3）
+        working-directory: web
+        run: node scripts/layering-gate.mjs
+
+      - name: 类型检查
+        working-directory: web
+        run: npx tsc --noEmit
+
+      - name: 测试（G2/G3 + 契约镜像 + fail-closed）
+        working-directory: web
+        run: node --test test/*.test.mjs
+
+      - name: 构建
+        working-directory: web
+        run: node scripts/build.mjs
+
+      # G11b：前端产物不得含 secret 形态
+      - name: 产物密钥扫描
+        working-directory: web
+        run: |
+          if grep -rEn '(client_secret|api_key|access_token|BEGIN [A-Z ]*PRIVATE KEY|user:pass@)' dist/; then
+            echo "::error::前端产物中发现疑似密钥（G11b）"
+            exit 1
+          fi
+          echo "产物密钥扫描通过"
+
+  # ───────────────────────── 密钥扫描（G11a）─────────────────────────
+  secret-scan:
+    name: 全仓密钥扫描
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ───────────────────────── 上线前证据链（真起进程）─────────────────────────
+  launch-check:
+    name: 上线前证据链
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: spark
+          POSTGRES_PASSWORD: spark_ci_only
+          POSTGRES_DB: spark_cicada
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U spark -d spark_cicada"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      SPARK_TEST_DB_DSN: postgres://spark:spark_ci_only@localhost:5432/spark_cicada?sslmode=disable
+      SPARK_REQUIRE_DB: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: backend/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compute
+
+      - name: 安装前端依赖
+        working-directory: web
+        run: npm install --no-audit --no-fund
+
+      # 脚本里的托管绝对路径在 Linux 上不存在，会回退到 PATH —— 此处显式清空以免误用。
+      - name: 上线前证据链
+        run: |
+          unset GOEXE NODEEXE CARGOEXE GOROOT GOPATH GOCACHE GOTMPDIR
+          bash tools/verify/launch-check.sh
+
+  # ───────────────────────── 汇总（分支保护只需勾这一个）─────────────────────────
+  gate:
+    name: 全部闸门通过
+    runs-on: ubuntu-latest
+    needs: [go, rust, web, secret-scan, launch-check]
+    steps:
+      - run: echo "ALL GATES PASSED"

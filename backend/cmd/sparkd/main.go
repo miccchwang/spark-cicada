@@ -2,7 +2,7 @@
 //
 // 职责（docs/02）：
 //   * 装配 M-QUERY / M-AUTH / M-REQ / M-PRECOMP；
-//   * 暴露 HTTP（/api/query、/api/me、/healthz）；
+//   * 暴露 HTTP（/api/query、/api/me、/healthz）+ 前端静态托管（SPARK_WEB_DIR）；
 //   * 启动时执行**启动自检**（闸门 G6：桶版本 vs 注册表版本）。
 //
 // **边界纪律**：本进程不做任何业务公式计算，一切数值经 compute 内核（Rust）。
@@ -133,6 +133,17 @@ func main() {
 			"db":     dp.dbReady, // 显式暴露数据面状态（降级时可观测）
 		})
 	})
+	// ── 前端静态托管（兜底路由，必须最后注册）──
+	// 单进程交付整个平台：/api/* 与 /healthz 优先，其余交给前端产物 + SPA fallback。
+	webDir := envOr("SPARK_WEB_DIR", "")
+	static := staticHandler(webDir)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if isAPIPath(r.URL.Path) {
+			http.NotFound(w, r)
+			return
+		}
+		static.ServeHTTP(w, r)
+	})
 
 	httpSrv := &http.Server{
 		Addr:              *addr,
@@ -150,7 +161,7 @@ func main() {
 		_ = httpSrv.Shutdown(ctx)
 	}()
 
-	log.Printf("sparkd listening on %s (compute kernel: %s, db: %v)", *addr, *computeBin, dp.dbReady)
+	log.Printf("sparkd listening on %s (compute kernel: %s, db: %v, web: %q)", *addr, *computeBin, dp.dbReady, webDir)
 	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http server: %v", err)
 	}

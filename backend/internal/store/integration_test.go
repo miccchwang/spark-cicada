@@ -5,8 +5,13 @@
 //	SPARK_TEST_DB_DSN='postgres://user:pass@host:5432/spark_test?sslmode=disable' \
 //	  go test ./internal/store/ -run Integration -v
 //
-// 未配置 DSN 时**跳过**（t.Skip）——绝不伪造通过。
-// CI 中由 deploy/docker-compose.yml 起 Postgres 后设置该变量。
+// ★ 跳过 vs 失败的纪律（这是本文件最重要的设计）：
+//   - 本地开发（无 docker/psql）未设 DSN ⇒ **跳过**（t.Skip），避免阻塞日常开发。
+//   - CI 设 SPARK_REQUIRE_DB=1 ⇒ 未设 DSN 时**直接失败**（t.Fatal），绝不跳过。
+//
+// 为什么必须这样：如果 CI 也静默 skip，这 6 条真库断言就**从未被执行过**，
+// 而 CI 依然全绿 —— M1 数据面（幂等迁移 / NULL 不补 0 / 审计 append-only）
+// 就成了「没人验证过却显示通过」的假绿。宁可红，不可假绿。
 package store
 
 import (
@@ -21,12 +26,18 @@ import (
 	"github.com/miccchwang/spark-cicada/backend/internal/db"
 )
 
-// openTestDB 连接测试库并应用迁移；无 DSN 则跳过。
+// openTestDB 连接测试库并应用迁移。
+//
+// 无 DSN 时：本地跳过；CI（SPARK_REQUIRE_DB=1）失败。
 func openTestDB(t *testing.T) (*db.Migrator, func()) {
 	t.Helper()
 	dsn := strings.TrimSpace(os.Getenv("SPARK_TEST_DB_DSN"))
 	if dsn == "" {
-		t.Skip("未配置 SPARK_TEST_DB_DSN —— 跳过真库集成测试（CI 中会设置）")
+		if requireDB() {
+			t.Fatal("★ 真库集成测试被要求必须运行（SPARK_REQUIRE_DB=1），但未设置 SPARK_TEST_DB_DSN。" +
+				"闸门不允许静默跳过 —— 请起 Postgres 并注入 DSN，否则移除 SPARK_REQUIRE_DB。")
+		}
+		t.Skip("未配置 SPARK_TEST_DB_DSN —— 跳过真库集成测试（本地开发；CI 会设置）")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -46,6 +57,24 @@ func openTestDB(t *testing.T) (*db.Migrator, func()) {
 		t.Fatalf("应用迁移失败：%v", err)
 	}
 	return m, m.Close
+}
+
+// requireDB 报告当前是否处于「真库必须运行」模式（CI）。
+func requireDB() bool {
+	v := strings.TrimSpace(os.Getenv("SPARK_REQUIRE_DB"))
+	return v == "1" || strings.EqualFold(v, "true")
+}
+
+// TestIntegration_SuiteIsNotSilentlySkipped 自检：防止整包被静默跳过。
+//
+// 若在「允许跳过」的环境下运行，本测试会明确告知「真库断言本次未执行」，
+// 使 `go test ./...` 的输出不会让人误以为数据面已被验证。
+func TestIntegration_SuiteIsNotSilentlySkipped(t *testing.T) {
+	if strings.TrimSpace(os.Getenv("SPARK_TEST_DB_DSN")) == "" && !requireDB() {
+		t.Log("⚠ 本轮未执行真库集成断言（无 DSN）。数据面的真库行为**尚未被验证**。")
+		return
+	}
+	t.Log("真库集成断言已启用")
 }
 
 // TestIntegration_MigrationsIdempotent 迁移可重复执行（第二次全部跳过）。

@@ -25,6 +25,7 @@ help:
 	@echo "make gate-db       真库集成闸门（需 SPARK_TEST_DB_DSN；未设置则跳过）"
 	@echo "make gate-web      前端闸门（G1 三段解耦 / G2 默认收起 / G3 缺失不填零 / 契约镜像一致）"
 	@echo "make gate-secret   全仓密钥扫描（gitleaks）"
+	@echo "make launch-check  ★ 上线前证据链（构建+迁移+闸门+真库+内核+前端+真进程冒烟）"
 	@echo "make migrate-up    应用数据库迁移"
 	@echo "make migrate-dry   迁移校验（不写库）"
 	@echo "make test          全部测试"
@@ -132,6 +133,12 @@ gate-db:
 gate-web:
 	cd web && $(NODE) scripts/layering-gate.mjs
 	cd web && $(NODE) --test test/*.test.mjs
+
+# ★ 上线前证据链：一条命令给出「能否上线」的可复现结论。
+#   设 SPARK_TEST_DB_DSN 则连真库；设 SPARK_REQUIRE_DB=1 则真库段必须通过（CI 用）。
+.PHONY: launch-check
+launch-check:
+	bash tools/verify/launch-check.sh
 
 # 计算内核自检（缺失语义 / 覆盖率门控 / 银行家舍入）
 .PHONY: gate-compute
