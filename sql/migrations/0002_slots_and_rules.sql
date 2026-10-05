@@ -55,13 +55,29 @@ CREATE TABLE IF NOT EXISTS registry_algorithm (
 );
 
 -- ───────────────────────────── 规则集（费率/口径） ─────────────────────────────
+-- ★ 主键必须是 **(id, version) 复合键**，不能是 (id) 单列。
+--
+--   真实事故（CI 真库首次抓出，第 3 个）：
+--   这里原先写的是 `id text PRIMARY KEY` **外加** `UNIQUE (id, version)`。
+--   两者并存时，(id) 单列主键已经决定了「同一个 id 只能有一行」，
+--   于是 0004 的种子
+--       INSERT ... ('rule.tk.fee', 1, ...), ('rule.tk.fee', 2, ...)
+--   直接撞 `registry_rule_set_pkey` 重复键 → 整条 0004 回滚、迁移链断。
+--
+--   而这个表**在设计上就是版本化的**（费率随生效期多版本并存，
+--   桶的 rule_versions 还要按版本选费率），所以「一个 id 一行」从根上就是错的。
+--   那对冗余的 UNIQUE (id, version) 正是这个笔误的痕迹 —— 意图对、主键写错。
+--
+--   教训：**冗余的唯一约束常常是主键写错的化石**。看到 PRIMARY KEY (a)
+--   与 UNIQUE (a, b) 并存，基本可以断定作者想要的是 PRIMARY KEY (a, b)。
 CREATE TABLE IF NOT EXISTS registry_rule_set (
-    id          text        PRIMARY KEY,            -- rule.tk.fee
+    id          text        NOT NULL,               -- rule.tk.fee
     version     integer     NOT NULL,
     scope       jsonb       NOT NULL DEFAULT '{}',  -- {platform, country, brand, channel}
     items       jsonb       NOT NULL DEFAULT '[]',  -- [{id,name,rate,flat_per_order,effective_from,...}]
     updated_at  timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT uq_registry_rule_set_spark_cicada_id_ver UNIQUE (id, version)
+    -- 版本化的规则集：同一 id 可有多版本并存（按生效期选取）
+    PRIMARY KEY (id, version)
 );
 
 -- ───────────────────────────── 预计算桶注册 ─────────────────────────────

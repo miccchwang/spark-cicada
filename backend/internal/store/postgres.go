@@ -32,11 +32,18 @@ func New(pool *pgxpool.Pool) *Postgres { return &Postgres{pool: pool} }
 //
 // 纪律：**度量列清单在此显式声明**，不反射读表结构 —— 避免「新加列悄悄泄漏」。
 type bucketSpec struct {
-	table       string
-	grain       []string // 维度键列
-	metrics     []string // 派生度量列（可为 NULL）
-	covCols     []string // 覆盖率列
-	skippedCol  string   // 跳过字段数组列
+	table   string
+	grain   []string // 维度键列
+	metrics []string // 派生度量列（可为 NULL）
+	covCols []string // 覆盖率列
+	// grainExpr 覆盖个别 grain 列的**选择表达式**（如 date 列需 ::text）。
+	// 未列出的列按原列名选择。
+	//
+	// 存在的理由：grain 一律按 *string 扫描（对外契约是 map[string]string），
+	// 但 DDL 里的维度列可能是 date/timestamptz/numeric 等非文本类型。
+	// pgx 的强类型扫描会拒绝从 date 扫进 *string。
+	grainExpr   map[string]string
+	skippedCol  string // 跳过字段数组列
 	hasAlgoVers bool
 	hasRuleVers bool
 }
@@ -48,6 +55,13 @@ var specs = map[string]bucketSpec{
 		grain:   []string{"month", "channel_code", "shop_id", "brand"},
 		metrics: []string{"rev", "cogs", "gp", "gmp", "net_contrib"},
 		covCols: []string{"cov_cogs", "cov_affiliate"},
+		// ★ month 在 DDL 里是 date，而 grain 一律按 *string 扫描
+		//   （对外的 Key 契约是 map[string]string，前端直接展示）。
+		//   必须显式 ::text 转换，否则 pgx 报：
+		//     cannot scan date (OID 1082) in binary format into *string
+		//   真实事故：这条断言在本机一直 skip（无库），CI 起了真 Postgres
+		//   才第一次跑到 —— 说明「跳过」会长期掩盖 SQL 与 Go 的类型不匹配。
+		grainExpr: map[string]string{"month": "month::text"},
 		// skipped_fields / algo_versions / rule_versions 显式读取
 		skippedCol:  "skipped_fields",
 		hasAlgoVers: true,
@@ -68,7 +82,16 @@ func (p *Postgres) SelectBucket(ctx context.Context, bucket string, q contracts.
 	}
 
 	cols := make([]string, 0, len(spec.grain)+len(spec.metrics)+len(spec.covCols)+4)
-	cols = append(cols, spec.grain...)
+	// grain 列：按 grainExpr 覆盖（date → ::text 等），否则用原列名。
+	// ★ 选择表达式必须与下方「扫描目标按 spec.grain 顺序建 *string」严格对齐 ——
+	//   顺序错位会把 date 扫进错误的列，且**不会报错**（都是文本）⇒ 静默错值。
+	for _, g := range spec.grain {
+		if expr, ok := spec.grainExpr[g]; ok {
+			cols = append(cols, expr+" AS "+g)
+			continue
+		}
+		cols = append(cols, g)
+	}
 	cols = append(cols, spec.metrics...)
 	cols = append(cols, spec.covCols...)
 	if spec.skippedCol != "" {
@@ -113,33 +136,48 @@ func (p *Postgres) SelectBucket(ctx context.Context, bucket string, q contracts.
 	}
 	defer rows.Close()
 
-	// 扫描目标：grain → *string，metrics/cov → *float64，versions → map
+	// 扫描目标：grain → **string（可空维度），metrics/cov → **float64，versions → map
+	//
+	// ★ 必须用「指针的指针」接收，不能复用 *float64 再手工置 nil。
+	//
+	//   真实事故（CI 真库首次抓出的第 5 个 bug）：
+	//   原实现对每个可空列分配 new(float64)，把该 *float64 放进 dest，
+	//   然后在每行开始前把 metricPtrs[i] = nil 「重置」——
+	//   但 dest 里存的仍是**同一个 *float64 值**（拷贝），
+	//   于是 pgx 拿到的是有效指针、扫到 NULL 时却报
+	//       cannot scan NULL into *float64
+	//   （而当次重置若生效，dest 里就是 nil，pgx 更会直接拒绝）。
+	//
+	//   正确做法：dest 里放 `**float64`。pgx 扫到 NULL 时把内层指针设为 nil，
+	//   扫到值时为内层分配 —— 这样「NULL ⇒ nil」是驱动层原生语义，
+	//   **不依赖我们手工重置**，也就不可能因为忘记重置而把上一行的值留下来。
+	//
+	//   G3（NULL 绝不当 0）在这里是**由类型系统保证**的：
+	//   *float64 能表达 nil，float64 不能；换成 float64 会静默把 NULL 变 0。
 	grainPtrs := make([]*string, len(spec.grain))
+	grainDest := make([]any, len(spec.grain))
 	for i := range grainPtrs {
-		grainPtrs[i] = new(string)
+		grainDest[i] = &grainPtrs[i]
 	}
 	metricPtrs := make([]*float64, len(spec.metrics))
+	metricDest := make([]any, len(spec.metrics))
 	for i := range metricPtrs {
-		metricPtrs[i] = new(float64)
+		metricDest[i] = &metricPtrs[i]
 	}
 	covPtrs := make([]*float64, len(spec.covCols))
+	covDest := make([]any, len(spec.covCols))
 	for i := range covPtrs {
-		covPtrs[i] = new(float64)
+		covDest[i] = &covPtrs[i]
 	}
+
 	var skipped []string
 	algoVers := map[string]int{}
 	ruleVers := map[string]int{}
 
 	dest := make([]any, 0, len(cols))
-	for i := range grainPtrs {
-		dest = append(dest, grainPtrs[i])
-	}
-	for i := range metricPtrs {
-		dest = append(dest, metricPtrs[i])
-	}
-	for i := range covPtrs {
-		dest = append(dest, covPtrs[i])
-	}
+	dest = append(dest, grainDest...)
+	dest = append(dest, metricDest...)
+	dest = append(dest, covDest...)
 	if spec.skippedCol != "" {
 		dest = append(dest, &skipped)
 	}
@@ -152,16 +190,11 @@ func (p *Postgres) SelectBucket(ctx context.Context, bucket string, q contracts.
 
 	var out []query.BucketRow
 	for rows.Next() {
-		// pgx 会为被扫描的指针分配；复用前先清 nil 标记
-		for i := range grainPtrs {
-			grainPtrs[i] = nil
-		}
-		for i := range metricPtrs {
-			metricPtrs[i] = nil
-		}
-		for i := range covPtrs {
-			covPtrs[i] = nil
-		}
+		// ★ 每个可空列由 pgx 经「指针的指针」逐行写入：
+		//   SQL NULL ⇒ 内层指针被置为 nil；有值 ⇒ 内层指针被分配。
+		//   因此**不需要**（也**不应该**）手工重置 —— 手工重置曾是第 5 个
+		//   真库 bug 的来源（dest 里放的是指针拷贝，重置无效）。
+		//   这里保留 skipped/versions 的重置，因为它们用值类型接收。
 		skipped = nil
 		algoVers = map[string]int{}
 		ruleVers = map[string]int{}

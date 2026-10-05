@@ -34,6 +34,16 @@ type dataPlane struct {
 	ents     func(string) (*authz.Entitlement, []*authz.Entitlement)
 	// dbReady 表示真库已就绪（迁移已应用、注册表已加载）。
 	dbReady bool
+	// dbDegradeReason 在 dbReady=false 时说明**为什么**降级。
+	//
+	// ★ 必要性（真实事故）：原先只暴露 `db:false`，无法区分两种截然不同的状态：
+	//   ① 压根没配 DSN（正常降级，符合预期）
+	//   ② 配了 DSN，但迁移目录路径写错/连不上库（**部署事故**）
+	//   两者 healthz 长得一模一样。事故现场是一个路径
+	//   `../sql/migrations` 相对 cwd 解析失败 —— sparkd 只打了一行 [warn]
+	//   就「成功地」以降级模式跑起来，看起来一切正常。
+	//   「静默降级」比「启动失败」危险：它把一个坏的部署伪装成好的部署。
+	dbDegradeReason string
 }
 
 // buildDataPlane 尝试连接 DB；失败时**降级**到内置夹具（不阻断启动）。
@@ -53,12 +63,14 @@ func buildDataPlane(ctx context.Context) *dataPlane {
 
 	dsn, err := db.DSNFromEnv()
 	if err != nil {
+		p.dbDegradeReason = "未配置数据库连接串（" + err.Error() + "）"
 		log.Printf("[warn] 未配置数据库（%v）—— 数据面降级：/api/query 将 fail-closed", err)
 		return p
 	}
 
 	m, err := db.NewMigrator(ctx, dsn)
 	if err != nil {
+		p.dbDegradeReason = "已配置 DSN 但数据库连接失败：" + err.Error()
 		log.Printf("[warn] 数据库连接失败（%s）：%v —— 降级运行",
 			db.RedactDSN(dsn), err)
 		return p
@@ -70,11 +82,19 @@ func buildDataPlane(ctx context.Context) *dataPlane {
 	migDir := envOr("SPARK_MIGRATIONS_DIR", "../sql/migrations")
 	migs, err := db.LoadMigrations(migDir)
 	if err != nil {
+		// ★ 这是最隐蔽的一种：DSN 配好了、库也连上了，仅仅因为迁移目录
+		//   是相对路径且 cwd 不对，就整体降级。必须把路径与 cwd 一起报出来。
+		cwd, _ := os.Getwd()
+		p.dbDegradeReason = fmt.Sprintf(
+			"已配置 DSN 且已连上库，但加载迁移目录失败：dir=%q cwd=%q err=%v"+
+				"（提示：该目录按**相对 cwd** 解析，请设 SPARK_MIGRATIONS_DIR 为绝对路径）",
+			migDir, cwd, err)
 		log.Printf("[warn] 加载迁移失败（%s）：%v —— 降级运行", migDir, err)
 		return p
 	}
 	res, err := m.Up(ctx, migs)
 	if err != nil {
+		p.dbDegradeReason = "已配置 DSN 且已连上库，但应用迁移失败：" + err.Error()
 		log.Printf("[warn] 应用迁移失败：%v —— 降级运行", err)
 		return p
 	}

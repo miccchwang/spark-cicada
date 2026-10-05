@@ -131,6 +131,9 @@ func main() {
 			"ok":     true,
 			"kernel": v,
 			"db":     dp.dbReady, // 显式暴露数据面状态（降级时可观测）
+			// ★ 降级时必须说明原因，否则「没配库」与「配了但坏了」
+			//   在 healthz 上无法区分 —— 后者是部署事故，应被立刻发现。
+			"dbDegradeReason": dp.dbDegradeReason,
 		})
 	})
 	// ── 前端静态托管（兜底路由，必须最后注册）──

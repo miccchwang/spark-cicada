@@ -6,6 +6,9 @@
 package store
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/miccchwang/spark-cicada/backend/internal/contracts"
@@ -117,4 +120,163 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+// TestBucketSpec_NonTextGrainColumnsAreCast 断言：
+// 凡是 grain 中类型不是 text 的列，必须在 grainExpr 里给出显式转型。
+//
+// ★ 真实事故（CI 真库首次抓出的第 4 个 bug）：
+//   bucket_pnl_month.month 在 DDL 里是 `date`，而 grain 一律按 *string 扫描，
+//   pgx 直接拒绝：cannot scan date (OID 1082) in binary format into *string。
+//   整条 bucket 查询在真库上 500。
+//
+//   为什么长期没被发现：这条路径的测试在本机**一直 skip**（无 Postgres）。
+//   「跳过」把 SQL 类型与 Go 扫描类型的错配藏了很久。
+//
+// 本测试不连库，靠**DDL 与 spec 对照**把契约钉住：
+// 从 0003 迁移里读出 bucket 表的列类型，凡是非文本的 grain 列，
+// 都要求 spec 声明了转型表达式。
+func TestBucketSpec_NonTextGrainColumnsAreCast(t *testing.T) {
+	for name, spec := range specs {
+		for _, g := range spec.grain {
+			typ := ddlColumnType(t, spec.table, g)
+			isTextual := typ == "" || // 无法判定时不误报
+				strings.HasPrefix(typ, "text") ||
+				strings.HasPrefix(typ, "varchar") ||
+				strings.HasPrefix(typ, "character")
+			if isTextual {
+				continue
+			}
+			if _, ok := spec.grainExpr[g]; !ok {
+				t.Errorf("桶 %s 的 grain 列 %s 在 DDL 中是 %q（非文本），"+
+					"但 spec.grainExpr 未声明转型 —— 真库上会报 "+
+					"cannot scan %s into *string", name, g, typ, typ)
+			}
+		}
+	}
+}
+
+// ddlColumnType 从迁移 SQL 里读出某表某列的类型（粗粒度）。
+// 只服务于上面的契约断言，不追求完整解析。
+func ddlColumnType(t *testing.T, table, col string) string {
+	t.Helper()
+	files := []string{
+		"0001_core.sql", "0002_slots_and_rules.sql",
+		"0003_precompute.sql", "0004_registry_seed.sql",
+	}
+	for _, f := range files {
+		p := filepath.Join("..", "..", "..", "sql", "migrations", f)
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		for _, tbl := range splitTables(string(b)) {
+			if !strings.EqualFold(tbl.name, table) {
+				continue
+			}
+			for _, clause := range splitTop(strings.Trim(tbl.body, "()"), ',') {
+				fields := strings.Fields(strings.TrimSpace(clause))
+				if len(fields) < 2 {
+					continue
+				}
+				if !strings.EqualFold(fields[0], col) {
+					continue
+				}
+				return strings.ToLower(fields[1])
+			}
+		}
+	}
+	return "" // 找不到就不判定（避免误报）
+}
+
+// ── 迁移 DDL 的极简切分工具（只服务于 grain 类型契约断言）──
+
+type ddlTable struct{ name, body string }
+
+// splitTables 切出每个 CREATE TABLE 的表名与表体（括号配平，跳过引号内）。
+func splitTables(sql string) []ddlTable {
+	var out []ddlTable
+	low := strings.ToLower(sql)
+	idx := 0
+	for {
+		i := strings.Index(low[idx:], "create table")
+		if i < 0 {
+			break
+		}
+		start := idx + i
+		rest := sql[start:]
+		open := strings.Index(rest, "(")
+		if open < 0 {
+			break
+		}
+		fields := strings.Fields(rest[:open])
+		name := ""
+		for j := len(fields) - 1; j >= 0; j-- {
+			f := strings.TrimSpace(fields[j])
+			switch strings.ToUpper(f) {
+			case "", "EXISTS", "NOT", "IF", "TABLE", "CREATE":
+				continue
+			}
+			name = f
+			break
+		}
+		depth, inQuote, end := 0, false, -1
+		for k := open; k < len(rest); k++ {
+			switch rest[k] {
+			case '\'':
+				inQuote = !inQuote
+			case '(':
+				if !inQuote {
+					depth++
+				}
+			case ')':
+				if !inQuote {
+					depth--
+					if depth == 0 {
+						end = k
+					}
+				}
+			}
+			if end >= 0 {
+				break
+			}
+		}
+		if end < 0 {
+			break
+		}
+		out = append(out, ddlTable{name: name, body: rest[open : end+1]})
+		idx = start + end
+	}
+	return out
+}
+
+// splitTop 按顶层分隔符切分（跳过括号与引号内）。
+func splitTop(s string, sep rune) []string {
+	var out []string
+	var cur strings.Builder
+	depth, inQuote := 0, false
+	for _, r := range s {
+		switch {
+		case r == '\'':
+			inQuote = !inQuote
+			cur.WriteRune(r)
+		case inQuote:
+			cur.WriteRune(r)
+		case r == '(' || r == '[':
+			depth++
+			cur.WriteRune(r)
+		case r == ')' || r == ']':
+			depth--
+			cur.WriteRune(r)
+		case r == sep && depth == 0:
+			out = append(out, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	if t := strings.TrimSpace(cur.String()); t != "" {
+		out = append(out, t)
+	}
+	return out
 }

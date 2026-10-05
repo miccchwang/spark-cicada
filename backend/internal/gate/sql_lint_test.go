@@ -411,3 +411,322 @@ func TestSQL_PlpgsqlBodyUsesColumnZeroBegin(t *testing.T) {
 		t.Error("0001 缺失 audit_log_immutable —— G10 审计 append-only 失去实现载体")
 	}
 }
+
+// TestSQL_VersionedTablesNotSingleColumnPK 断言「版本化表」的主键含 version 列。
+//
+// ★ 真实事故（CI 真库首次抓出的第 3 个 bug）：
+//   registry_rule_set 写成 `id text PRIMARY KEY` **外加** `UNIQUE (id, version)`，
+//   而 0004 种子要插同一 id 的两个版本（rule.tk.fee@1 / @2）
+//   ⇒ 撞单列主键重复键，整条迁移回滚。
+//
+//   识别特征很稳定：**PRIMARY KEY (a) 与 UNIQUE (a, b) 并存**，
+//   基本就是「想要 PRIMARY KEY (a, b) 但写漏了」的化石。
+//   这个形态纯文本可判，不需要连库，因此适合放进静态闸门。
+//
+// 纪律：一张表若带 version 列且需要多版本并存，主键必须包含 version。
+func TestSQL_VersionedTablesNotSingleColumnPK(t *testing.T) {
+	names := []string{
+		"0001_core.sql", "0002_slots_and_rules.sql",
+		"0003_precompute.sql", "0004_registry_seed.sql",
+	}
+	// 允许「单列主键 + version 列」的白名单（**必须写明理由**）。
+	//
+	// registry_algorithm：算法只有**一个当前版本**，version 是「当前版本号」
+	// 这个属性，而非多版本并存的历史维度。0004 种子里 @algo.rev 的 ON CONFLICT
+	// 用的是 (id) DO UPDATE SET version = EXCLUDED.version —— 即「升级版本号」
+	// 而非「新增一行」。这与 registry_rule_set 的语义**不同**：
+	// 费率要按生效期回溯多个历史版本，所以必须是 (id, version)。
+	//
+	// 判据不是「表里有没有 version 列」，而是「**同一 id 是否需要多行并存**」。
+	// 需要 → 主键含 version；不需要 → 单列主键 + version 作属性，进白名单。
+	allow := map[string]string{
+		"0002_slots_and_rules.sql:registry_algorithm": "算法只保留一个当前版本；version 是属性而非历史维度（见 0004 的 ON CONFLICT (id) DO UPDATE SET version）",
+	}
+
+	for _, name := range names {
+		sql := stripSQLComments(readMigration(t, name))
+		// 抓取每张 CREATE TABLE 的表体
+		for _, tbl := range splitCreateTables(sql) {
+			// ★ 必须判「有没有 version 这个**列**」，不能判「表体里出现过 version 子串」。
+			//
+			//   第一版用 strings.Contains(body, "version")，于是 registry_bucket
+			//   仅因为带 algo_versions / rule_versions 两个 jsonb 列就被误判成
+			//   「版本化表」，连带 bucket_pnl_month、precomp_build_log 一起报红。
+			//   误报会把真问题淹没（这四行里只有一条是真的）。
+			if !hasColumn(tbl.body, "version") {
+				continue
+			}
+			pkCols := extractPKColumns(tbl.body)
+			if len(pkCols) == 0 {
+				continue // 没声明主键（可能用 UNIQUE 表达）——不在此闸门职责内
+			}
+			hasVersion := false
+			for _, c := range pkCols {
+				if c == "version" {
+					hasVersion = true
+				}
+			}
+			if hasVersion {
+				continue
+			}
+			key := name + ":" + tbl.name
+			if _, ok := allow[key]; ok {
+				continue
+			}
+			t.Errorf("表 %s（迁移 %s）带 version 列，但主键 %v 不含 version。\n"+
+				"若该表需多版本并存，插入第二个版本会撞主键重复键；"+
+				"若确实只要单版本，请在本测试的 allow 白名单中写明理由。",
+				tbl.name, name, pkCols)
+		}
+	}
+}
+
+type createTable struct{ name, body string }
+
+// splitCreateTables 粗粒度切出每个 `CREATE TABLE ... ( ... );` 的
+// 表名与表体（括号配平，跳过单引号字面量）。只服务于静态断言，不是 SQL 解析器。
+func splitCreateTables(sql string) []createTable {
+	var out []createTable
+	low := strings.ToLower(sql)
+	idx := 0
+	for {
+		i := strings.Index(low[idx:], "create table")
+		if i < 0 {
+			break
+		}
+		start := idx + i
+		// 读表名：create table [if not exists] <name> (
+		rest := sql[start:]
+		open := strings.Index(rest, "(")
+		if open < 0 {
+			break
+		}
+		head := rest[:open]
+		fields := strings.Fields(head)
+		name := ""
+		for j := len(fields) - 1; j >= 0; j-- {
+			f := strings.TrimSpace(fields[j])
+			if f == "" || strings.EqualFold(f, "exists") || strings.EqualFold(f, "not") ||
+				strings.EqualFold(f, "if") || strings.EqualFold(f, "table") ||
+				strings.EqualFold(f, "create") {
+				continue
+			}
+			name = f
+			break
+		}
+		// 括号配平找表体结束
+		depth, inQuote := 0, false
+		end := -1
+		for k := open; k < len(rest); k++ {
+			switch rest[k] {
+			case '\'':
+				inQuote = !inQuote
+			case '(':
+				if !inQuote {
+					depth++
+				}
+			case ')':
+				if !inQuote {
+					depth--
+					if depth == 0 {
+						end = k
+					}
+				}
+			}
+			if end >= 0 {
+				break
+			}
+		}
+		if end < 0 {
+			break
+		}
+		out = append(out, createTable{name: name, body: rest[open : end+1]})
+		idx = start + end
+	}
+	return out
+}
+
+// extractPKColumns 从表体中抽取主键列名。
+//
+// ★ 实现要点（第一版写错了，这是第二版）：
+//   必须**先按顶层逗号把表体切成子句**，再逐个判断该子句是不是主键子句。
+//   第一版直接用 strings.Index(body, "(") 找主键后的左括号，
+//   结果在多约束表上抓到了**别的**约束的括号：
+//     permission text NOT NULL CHECK (permission IN ('L1','L2','L3','L4')),
+//     ...
+//     PRIMARY KEY (id)
+//   解析出主键列 = ["permission in ('l1' 'l2' 'l3' 'l4"]，完全是垃圾。
+//   而它**没有报错、只是给出错误答案** —— 这正是静态闸门最危险的失败模式：
+//   闸门看起来在工作，实际判据已经烂了。
+//
+// 支持的写法：
+//   - 表级：`PRIMARY KEY (a, b)` / `CONSTRAINT x PRIMARY KEY (a, b)`
+//   - 行内：`id text PRIMARY KEY`
+func extractPKColumns(body string) []string {
+	inner := strings.TrimSpace(body)
+	if strings.HasPrefix(inner, "(") && strings.HasSuffix(inner, ")") {
+		inner = inner[1 : len(inner)-1]
+	}
+
+	var cols []string
+	for _, clause := range splitTopLevel(inner, ',') {
+		c := strings.TrimSpace(clause)
+		if c == "" {
+			continue
+		}
+		up := strings.ToUpper(c)
+		if i := strings.Index(up, "PRIMARY KEY"); i >= 0 {
+			after := c[i+len("PRIMARY KEY"):]
+			if op := strings.Index(after, "("); op >= 0 {
+				if cl := strings.Index(after[op:], ")"); cl >= 0 {
+					for _, part := range strings.Split(after[op+1:op+cl], ",") {
+						col := strings.ToLower(strings.Trim(strings.TrimSpace(part), "\""))
+						if col != "" {
+							cols = append(cols, col)
+						}
+					}
+				}
+				continue
+			}
+			// 行内形态：该子句的**第一个词**是列名
+			if f := strings.Fields(c); len(f) > 0 {
+				cols = append(cols, strings.ToLower(strings.Trim(f[0], "\",")))
+			}
+		}
+	}
+	return cols
+}
+
+// splitTopLevel 按顶层分隔符切分（跳过括号内与单引号字面量内的分隔符）。
+func splitTopLevel(s string, sep rune) []string {
+	var out []string
+	var cur strings.Builder
+	depth, inQuote := 0, false
+	for _, r := range s {
+		switch {
+		case r == '\'':
+			inQuote = !inQuote
+			cur.WriteRune(r)
+		case inQuote:
+			cur.WriteRune(r)
+		case r == '(' || r == '[':
+			depth++
+			cur.WriteRune(r)
+		case r == ')' || r == ']':
+			depth--
+			cur.WriteRune(r)
+		case r == sep && depth == 0:
+			out = append(out, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	if s := strings.TrimSpace(cur.String()); s != "" {
+		out = append(out, s)
+	}
+	return out
+}
+
+// TestExtractPKColumns 是上面那个解析器的自测。
+//
+// 为什么必须单独测：第一版输出了垃圾但**没有失败**，
+// 换成错误答案的闸门比崩溃的闸门危险得多。
+func TestExtractPKColumns(t *testing.T) {
+	cases := []struct {
+		name, body string
+		want       []string
+	}{
+		{
+			name: "表级复合主键",
+			body: "(\n id text NOT NULL,\n version integer NOT NULL,\n PRIMARY KEY (id, version)\n)",
+			want: []string{"id", "version"},
+		},
+		{
+			name: "行内单列主键",
+			body: "(\n id text PRIMARY KEY,\n name text NOT NULL\n)",
+			want: []string{"id"},
+		},
+		{
+			name: "★ 行内主键 + 后续 CHECK 含括号（第一版在此输出垃圾）",
+			body: "(\n id text PRIMARY KEY,\n permission text NOT NULL CHECK (permission IN ('L1','L2','L3','L4')),\n version integer NOT NULL\n)",
+			want: []string{"id"},
+		},
+		{
+			name: "命名约束主键",
+			body: "(\n id text NOT NULL,\n version int NOT NULL,\n CONSTRAINT pk_x PRIMARY KEY (id, version)\n)",
+			want: []string{"id", "version"},
+		},
+		{
+			name: "CHECK 里的逗号不能切错子句",
+			body: "(\n state text CHECK (state IN ('A','B','C')),\n id text,\n PRIMARY KEY (id)\n)",
+			want: []string{"id"},
+		},
+		{
+			name: "无主键",
+			body: "(\n id text,\n name text\n)",
+			want: nil,
+		},
+	}
+	for _, c := range cases {
+		got := extractPKColumns(c.body)
+		if len(got) != len(c.want) {
+			t.Errorf("%s：期望 %v，实际 %v", c.name, c.want, got)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("%s：期望 %v，实际 %v", c.name, c.want, got)
+				break
+			}
+		}
+	}
+}
+
+// hasColumn 判断表体里是否存在名为 col 的**列定义**
+// （列名必须是某个顶层子句的第一个词），而不是「文本里出现过这个词」。
+func hasColumn(body, col string) bool {
+	inner := strings.TrimSpace(body)
+	if strings.HasPrefix(inner, "(") && strings.HasSuffix(inner, ")") {
+		inner = inner[1 : len(inner)-1]
+	}
+	for _, clause := range splitTopLevel(inner, ',') {
+		f := strings.Fields(strings.TrimSpace(clause))
+		if len(f) == 0 {
+			continue
+		}
+		// 跳过表级约束子句（CONSTRAINT / PRIMARY / UNIQUE / CHECK / FOREIGN / EXCLUDE）
+		first := strings.ToUpper(strings.Trim(f[0], "\""))
+		switch first {
+		case "CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK", "FOREIGN", "EXCLUDE":
+			continue
+		}
+		if strings.EqualFold(strings.Trim(f[0], "\""), col) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestHasColumn 自测 hasColumn：它决定了版本化闸门的**判据范围**，
+// 判宽了会误报（真问题被淹没），判窄了会漏报（闸门形同不存在）。
+func TestHasColumn(t *testing.T) {
+	cases := []struct {
+		name, body, col string
+		want            bool
+	}{
+		{"有 version 列", "(\n id text,\n version integer NOT NULL\n)", "version", true},
+		{"只有 algo_versions 不算 version 列",
+			"(\n id text PRIMARY KEY,\n algo_versions jsonb NOT NULL\n)", "version", false},
+		{"只有 rule_versions 不算 version 列",
+			"(\n id text,\n rule_versions jsonb DEFAULT '{}'\n)", "version", false},
+		{"带引号的列名", "(\n id text,\n \"version\" integer NOT NULL\n)", "version", true},
+		{"约束子句里的 version 不算",
+			"(\n id text,\n UNIQUE (id, version)\n)", "version", false},
+	}
+	for _, c := range cases {
+		if got := hasColumn(c.body, c.col); got != c.want {
+			t.Errorf("%s：期望 %v，实际 %v", c.name, c.want, got)
+		}
+	}
+}

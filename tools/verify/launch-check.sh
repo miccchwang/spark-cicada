@@ -161,6 +161,14 @@ if [ -n "${SPARK_TEST_DB_DSN:-}" ] || [ -n "${SPARK_DB_DSN:-}" ]; then
     ( cd backend && "$GOEXE" build -o /tmp/sparkd-db ./cmd/sparkd ) || \
       "$GOEXE" build -o /tmp/sparkd-db ./backend/cmd/sparkd
     if [ -x /tmp/sparkd-db ]; then
+      # ★ 必须显式给绝对路径的迁移目录。
+      #
+      #   sparkd 的 SPARK_MIGRATIONS_DIR 默认是相对路径 `../sql/migrations`，
+      #   按**进程 cwd** 解析。冒烟进程从仓库根启动，于是该路径指向不存在的位置，
+      #   sparkd 静默降级 —— 表现为「配了 DSN 却 db=false」，
+      #   极易被误判成「接库代码坏了」，实际只是路径没对上。
+      #   这也正是本段当初抓到的问题（见 wiring.go 的 dbDegradeReason 注释）。
+      SPARK_MIGRATIONS_DIR="$ROOT/sql/migrations" \
       SPARK_COMPUTE_BIN="$COMPUTE_BIN" SPARK_WEB_DIR="$ROOT/web/dist" \
         SPARK_DB_DSN="${SPARK_DB_DSN:-${SPARK_TEST_DB_DSN:-}}" \
         /tmp/sparkd-db -addr 127.0.0.1:18098 >/tmp/sparkd-db.log 2>&1 &
@@ -172,7 +180,10 @@ if [ -n "${SPARK_TEST_DB_DSN:-}" ] || [ -n "${SPARK_DB_DSN:-}" ]; then
         if echo "$HZ" | grep -q '"db":true'; then
           ok "healthz db=true（迁移后的 schema 已真正连通）"
         else
+          # 把降级原因一起打出来：否则「路径错」与「代码错」无法区分
+          REASON=$(echo "$HZ" | sed -n 's/.*"dbDegradeReason":"\([^"]*\)".*/\1/p')
           bad "有 DSN 但 healthz db≠true：接库未生效 → $HZ"
+          [ -n "$REASON" ] && printf '      降级原因：%s\n' "$REASON"
         fi
 
         # /api/query 有库时不应再报 store not configured
