@@ -27,6 +27,23 @@
 
 set -u
 
+# ★ 早退也要留下证据。
+#
+#   事故现场：CI 上 launch-check 红，但**自定义 annotation 一条都没出现** ——
+#   说明脚本在跑到末尾汇总之前就退出了（例如某个命令失败触发 abort）。
+#   而我们恰恰要靠那些 annotation 才知道失败原因，于是成了死循环。
+#   加 trap 后，任何中途退出都会把「退到哪一步」写进 annotation，
+#   让下一次的失败自带定位信息。
+_LC_STEP="（尚未进入任何步骤）"
+_on_exit() {
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ -n "${GITHUB_ACTIONS:-}" ]; then
+    printf '::error::launch-check 中途退出（exit %d），最后进入的步骤：%s\n' "$rc" "$_LC_STEP"
+  fi
+  return 0
+}
+trap '_on_exit' EXIT
+
 # ── 定位仓库根（脚本在 tools/verify/ 下）──
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT" || exit 1
@@ -51,10 +68,23 @@ FAIL=0
 SKIP=0
 FAILED_NAMES=""
 
-step()  { printf '\n\033[1m── %s ──\033[0m\n' "$*"; }
+step()  { _LC_STEP="$*"; printf '\n\033[1m── %s ──\033[0m\n' "$*"; }
 ok()    { PASS=$((PASS+1)); printf '  \033[32m✓ %s\033[0m\n' "$*"; }
 bad()   { FAIL=$((FAIL+1)); FAILED_NAMES="$FAILED_NAMES\n  - $*"; printf '  \033[31m✗ %s\033[0m\n' "$*"; }
 skip()  { SKIP=$((SKIP+1)); printf '  \033[33m⊘ %s\033[0m\n' "$*"; }
+
+# build_sparkd 编译 sparkd 到指定路径。
+#
+# ★ 必须在 backend/ 目录下执行（Go 模块根）。
+#   原先写成 `( cd backend && go build ./cmd/sparkd ) || go build ./backend/cmd/sparkd`，
+#   回退分支从**仓库根**执行 —— 那里没有 go.mod，必然报
+#     go: cannot find main module, but found .git/config
+#   在 Linux CI 上这段回退既无用又掩盖首个失败原因。
+#   现在只保留一种正确调用方式，失败即明确报错。
+build_sparkd() {
+  out="$1"
+  ( cd "$ROOT/backend" && "$GOEXE" build -o "$out" ./cmd/sparkd )
+}
 
 # ───────────────────────── 0. 工具链 ─────────────────────────
 step "0. 工具链"
@@ -168,8 +198,7 @@ if [ -n "${SPARK_TEST_DB_DSN:-}" ] || [ -n "${SPARK_DB_DSN:-}" ]; then
 
   # 4b-2 起 sparkd（**带 DSN**）并断言它真读到了库
   if [ -n "$COMPUTE_BIN" ] && [ -x "$COMPUTE_BIN" ]; then
-    ( cd backend && "$GOEXE" build -o /tmp/sparkd-db ./cmd/sparkd ) || \
-      "$GOEXE" build -o /tmp/sparkd-db ./backend/cmd/sparkd
+    build_sparkd /tmp/sparkd-db
     if [ -x /tmp/sparkd-db ]; then
       # ★ 必须显式给绝对路径的迁移目录。
       #
@@ -280,8 +309,7 @@ if [ -n "$COMPUTE_BIN" ] && [ -d web/dist ] && [ -f web/dist/index.html ]; then
   #   而 launch-check 作业并没有跑迁移 ⇒ 连到一个空 schema 库，
   #   8c 断言 db=false 会莫名失败，且报错指向 healthz 而非「环境串味了」。
   #   显式隔离比隐式假设可靠。
-  ( cd backend && "$GOEXE" build -o /tmp/sparkd ./cmd/sparkd ) || \
-    "$GOEXE" build -o /tmp/sparkd ./backend/cmd/sparkd
+  build_sparkd /tmp/sparkd
   if [ -x /tmp/sparkd ]; then
     env -u SPARK_DB_DSN -u SPARK_TEST_DB_DSN -u SPARK_PG_HOST -u SPARK_PG_USER \
       SPARK_COMPUTE_BIN="$COMPUTE_BIN" SPARK_WEB_DIR="$ROOT/web/dist" \
