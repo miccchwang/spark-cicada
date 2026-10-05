@@ -232,12 +232,65 @@ func (m *Migrator) applyOne(ctx context.Context, mg Migration) error {
 	return nil
 }
 
-// txEdgeRe 匹配文件首尾的裸 BEGIN;/COMMIT;（大小写不敏感）。
-var txEdgeRe = regexp.MustCompile(`(?im)^\s*(BEGIN|COMMIT)\s*;?\s*$`)
+// txEdgeRe 匹配「行首」的裸 BEGIN;/BEGIN 或 COMMIT;/COMMIT（大小写不敏感）。
+//
+// ★ 只用于**行首**判定，不能用于全文替换：plpgsql 函数体内的 BEGIN/END 也顶格，
+//   全文替换会把函数体打断（audit_log_immutable 就是这种）。
+//   见 stripOuterTx 的逐行实现。
+var txBeginRe = regexp.MustCompile(`(?i)^\s*BEGIN\s*;?\s*$`)
+var txCommitRe = regexp.MustCompile(`(?i)^\s*COMMIT\s*;?\s*$`)
 
-// stripOuterTx 移除迁移文件最外层的 BEGIN/COMMIT，交由 Migrator 统一管理事务。
+// stripOuterTx 移除迁移文件**最外层**的 BEGIN/COMMIT，交由 Migrator 统一管理事务。
+//
+// 必要性：文件自带 BEGIN/COMMIT 会与外层事务嵌套（Postgres 会对
+// 「事务中 BEGIN」发 warning、对「事务中 COMMIT」直接报错）。
+//
+// ★ 安全边界（这是本函数最容易写错的地方）：
+//   只删「连续块中第一个 BEGIN」与「最后一个 COMMIT」，且二者必须包住整个文件。
+//   plpgsql 的 `CREATE FUNCTION ... AS $$ BEGIN ... END; $$` 里的 BEGIN
+//   虽然在行首，但它**不在**首尾，因此不会被删除。
+//
+//   历史 bug：早期实现用正则对全文做 ReplaceAll，把 audit_log_immutable()
+//   函数体里的 BEGIN 一并删掉 → 函数体残缺 → 迁移在真库上失败
+//   （本地因为无库而全程 skip，直到 CI 起真 Postgres 才暴露）。
 func stripOuterTx(sql string) string {
-	return txEdgeRe.ReplaceAllString(sql, "")
+	lines := strings.Split(sql, "\n")
+
+	// 找第一个非空、非注释行：必须是 BEGIN 才认为有外层事务。
+	firstIdx := -1
+	for i, l := range lines {
+		t := strings.TrimSpace(l)
+		if t == "" || strings.HasPrefix(t, "--") {
+			continue
+		}
+		firstIdx = i
+		break
+	}
+	// 找最后一个非空、非注释行：必须是 COMMIT。
+	lastIdx := -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		t := strings.TrimSpace(lines[i])
+		if t == "" || strings.HasPrefix(t, "--") {
+			continue
+		}
+		lastIdx = i
+		break
+	}
+
+	if firstIdx < 0 || lastIdx <= firstIdx {
+		return sql
+	}
+	if !txBeginRe.MatchString(lines[firstIdx]) || !txCommitRe.MatchString(lines[lastIdx]) {
+		// 没有成对的外层事务包裹 ⇒ 原样返回，不做任何删改（保守优先）。
+		return sql
+	}
+
+	// 只清空这两行（保留行占位，便于报错时行号仍然对得上）。
+	out := make([]string, len(lines))
+	copy(out, lines)
+	out[firstIdx] = ""
+	out[lastIdx] = ""
+	return strings.Join(out, "\n")
 }
 
 // DSNFromEnv 从环境变量取连接串。
