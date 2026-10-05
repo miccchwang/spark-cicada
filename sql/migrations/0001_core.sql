@@ -10,7 +10,17 @@
 
 BEGIN;
 
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+-- 说明（重要）：此处**不再** CREATE EXTENSION "pgcrypto"。
+--
+-- 原因：整套迁移没有任何语句使用 pgcrypto 的函数（无 gen_random_uuid/digest/crypt），
+-- 而 CREATE EXTENSION 在多数托管 Postgres 上需要**超级用户**权限。
+-- 应用账号 spark 是普通账号 ⇒ 该语句会以
+--   ERROR: permission denied to create extension "pgcrypto"
+-- 失败，导致整个 0001 回滚、迁移链断在第一环。
+--
+-- 纪律：**不要申请用不到的权限**。将来真正需要时再新增一个独立迁移，
+-- 并在其中显式说明所需的权限前提（而非默认假设超级用户）。
+-- 主键一律用 bigserial/text，不依赖 pgcrypto 的随机 UUID。
 
 -- ───────────────────────────── 组织维表（F9=A 单主属 / F10=C 混合） ─────────────────────────────
 -- 每人唯一 primaryDept + 唯一 supervisor；虚线上级仅抄送（dotted_line_supervisors）。

@@ -222,3 +222,192 @@ func splitFields(tuple string) []string {
 	}
 	return out
 }
+
+// TestSQL_NoUnnecessaryPrivilegeRequests 断言迁移不申请用不到的权限。
+//
+// ★ 真实事故（由 CI 真库首次抓出）：
+//   0001 曾写 `CREATE EXTENSION IF NOT EXISTS "pgcrypto"`，但整套迁移
+//   **没有任何语句使用 pgcrypto 的函数**（无 gen_random_uuid/digest/crypt）。
+//   而 CREATE EXTENSION 在托管 Postgres 上通常需要**超级用户**——
+//   应用账号 spark 是普通账号 ⇒ 整条 0001 以
+//     ERROR: permission denied to create extension "pgcrypto"
+//   回滚，迁移链断在第一环。本地无库全程 skip，故从未暴露。
+//
+// 纪律：**不申请用不到的权限**。需要扩展时另开迁移并写明权限前提。
+func TestSQL_NoUnnecessaryPrivilegeRequests(t *testing.T) {
+	// 需要超级用户（或受限）权限的语句形态
+	privileged := []struct{ pat, why string }{
+		{"create extension", "CREATE EXTENSION 在托管 Postgres 上通常需超级用户"},
+		{"create role", "CREATE ROLE 需超级用户"},
+		{"alter system", "ALTER SYSTEM 需超级用户"},
+		{"create user", "CREATE USER 需超级用户"},
+		{"pg_read_file", "pg_read_file 需超级用户"},
+		{"lo_import", "lo_import 需超级用户"},
+	}
+
+	names := []string{
+		"0001_core.sql", "0002_slots_and_rules.sql",
+		"0003_precompute.sql", "0004_registry_seed.sql",
+	}
+
+	for _, name := range names {
+		// ★ 必须先剥掉注释再匹配。
+		//
+		// 本闸门第一次上线时是「直接对整份文件 strings.Contains」，
+		// 结果被**自己写下的修复说明注释**判红：
+		//   0001 里那句 "曾写 CREATE EXTENSION …已移除" 的注释
+		//   命中了 "create extension" 子串。
+		//
+		// 一个会对「解释规则的文字」开火的闸门 = 误报发生器：
+		// 它逼着后来人删掉解释、或加白名单把闸门掏空，
+		// 最终闸门还在、约束却没了。所以这里做注释剥离，
+		// 让断言只针对**真正会执行的 SQL**。
+		sql := stripSQLComments(readMigration(t, name))
+		low := strings.ToLower(sql)
+		for _, p := range privileged {
+			if strings.Contains(low, p.pat) {
+				t.Errorf("迁移 %s 含特权语句 %q：%s。\n"+
+					"若确实必要，请另开独立迁移并显式注明所需权限前提，"+
+					"同时在此处加白名单说明原因（不要默认假设超级用户）。",
+					name, p.pat, p.why)
+			}
+		}
+	}
+}
+
+// stripSQLComments 去掉 SQL 中的 `--` 行注释与 `/* */` 块注释，
+// 但**保留字符串字面量内的内容**（否则 'pgcrypto -- 注释' 之类会被误剥）。
+//
+// 只服务于「静态文本闸门」：目标是让断言面对的是真正会送去执行的语句文本，
+// 而不是文档。它不是 SQL 解析器，也不需要是。
+func stripSQLComments(in string) string {
+	var out strings.Builder
+	lines := strings.Split(in, "\n")
+	inBlock := false
+	for _, line := range lines {
+		var kept strings.Builder
+		inQuote := false
+		i := 0
+		for i < len(line) {
+			// 块注释：整段跳过（可跨行）
+			if inBlock {
+				if j := strings.Index(line[i:], "*/"); j >= 0 {
+					i += j + 2
+					inBlock = false
+					continue
+				}
+				i = len(line)
+				continue
+			}
+			// 单引号字符串字面量：原样保留，内部的 -- /* 不算注释
+			if line[i] == '\'' {
+				inQuote = !inQuote
+				kept.WriteByte(line[i])
+				i++
+				continue
+			}
+			if !inQuote {
+				if strings.HasPrefix(line[i:], "--") {
+					break // 行注释：本行余下全部丢弃
+				}
+				if strings.HasPrefix(line[i:], "/*") {
+					inBlock = true
+					i += 2
+					continue
+				}
+			}
+			kept.WriteByte(line[i])
+			i++
+		}
+		out.WriteString(kept.String())
+		out.WriteString("\n")
+	}
+	return out.String()
+}
+
+// TestStripSQLComments 是上面那个剥离器的**自测**。
+//
+// 它存在的理由与 stripOuterTx 的回归测试一致：剥离逻辑一旦写错，
+// 特权闸门就会静默变松（把真语句也剥没了）或静默变紧（误报）。
+// 两种失败都不会有人发现，除非单独测它。
+func TestStripSQLComments(t *testing.T) {
+	cases := []struct {
+		name, in string
+		mustHave []string // 剥离后**必须仍在**
+		mustNot  []string // 剥离后**必须消失**
+	}{
+		{
+			name:     "行注释被剥掉",
+			in:       "-- CREATE EXTENSION pgcrypto 已移除\nSELECT 1;",
+			mustHave: []string{"select 1"},
+			mustNot:  []string{"create extension"},
+		},
+		{
+			name:     "块注释被剥掉（含跨行）",
+			in:       "/* CREATE ROLE evil\n   仍然在注释里 */\nSELECT 1;",
+			mustHave: []string{"select 1"},
+			mustNot:  []string{"create role"},
+		},
+		{
+			name:     "真语句不被剥掉",
+			in:       "CREATE EXTENSION pgcrypto;\nSELECT 1;",
+			mustHave: []string{"create extension", "select 1"},
+			mustNot:  nil,
+		},
+		{
+			name:     "字符串字面量内的注释符号不误剥",
+			in:       "INSERT INTO t VALUES ('a -- b');\nSELECT 1;",
+			mustHave: []string{"'a -- b'", "select 1"},
+			mustNot:  nil,
+		},
+		{
+			name:     "行尾注释被剥，行内代码保留",
+			in:       "SELECT 1; -- CREATE USER bob\nSELECT 2;",
+			mustHave: []string{"select 1", "select 2"},
+			mustNot:  []string{"create user"},
+		},
+		{
+			name:     "块注释后同行的代码保留",
+			in:       "/* c */ SELECT 1;",
+			mustHave: []string{"select 1"},
+			mustNot:  nil,
+		},
+	}
+	for _, c := range cases {
+		got := strings.ToLower(stripSQLComments(c.in))
+		for _, w := range c.mustHave {
+			if !strings.Contains(got, w) {
+				t.Errorf("%s：剥离后丢失了 %q\n输入:\n%s\n输出:\n%s", c.name, w, c.in, got)
+			}
+		}
+		for _, w := range c.mustNot {
+			if strings.Contains(got, w) {
+				t.Errorf("%s：剥离后仍残留 %q（闸门会被误触发）\n输入:\n%s\n输出:\n%s",
+					c.name, w, c.in, got)
+			}
+		}
+	}
+}
+
+// TestSQL_NoPairedOuterTransactionGuard 断言迁移文件**可以**自带 BEGIN/COMMIT，
+// 但重申：Migrator 会剥离最外层事务，且**不得**误伤 plpgsql 函数体的 BEGIN。
+//
+// 本测试锁定「函数体顶格 BEGIN」这一形态仍然存在——它是 stripOuterTx
+// 回归 bug 的触发条件；若有人把函数体缩进改掉，回归测试就失去对象，
+// 这里会提醒。
+func TestSQL_PlpgsqlBodyUsesColumnZeroBegin(t *testing.T) {
+	sql := readMigration(t, "0001_core.sql")
+	if !strings.Contains(sql, "AS $$") {
+		t.Fatal("0001 未包含 plpgsql 函数体（预期有 audit_log_immutable）")
+	}
+	// 函数体 BEGIN 必须顶格（这是 stripOuterTx 最容易被误伤的场景，
+	// 也是回归测试 db_test.go 的覆盖对象）。
+	if !strings.Contains(sql, "$$\nBEGIN\n") {
+		t.Error("plpgsql 函数体的 BEGIN 不再顶格 —— " +
+			"stripOuterTx 的回归测试将失去覆盖对象，请确认这是有意改动")
+	}
+	// 审计防篡改函数必须仍在（G10 的实现载体）
+	if !strings.Contains(sql, "audit_log_immutable") {
+		t.Error("0001 缺失 audit_log_immutable —— G10 审计 append-only 失去实现载体")
+	}
+}
