@@ -28,20 +28,28 @@ description: spark-cicada 经营数据平台的项目级口径与架构纪律。
 4. **每个值可追溯**：任何非空值必须能沿 `AlgoTrace` 回溯到「哪条算法 + 哪些真实数据槽」。
 5. **预计算优先**：能被 DB 预先算好的，绝不在请求时重算。新指标先问「落哪个桶」。
 6. **所有可收起表格默认收起**：`DEFAULT_EXPANDED = {L0:true, L1..L4:false}`，任何折叠组件初始 `open=false`。
-7. **IT 管数分离**：IT 可管理全部 MCP/API 授权与状态、账号启用，但**默认不可见任何业务数值**。
+7. **IT 管数分离（D7 已调整为受控可见）**：IT 可管理全部 MCP/API 授权与状态、账号启用；
+   业务数值**默认不可见**，需 T1 显式勾选 `canViewBusinessValues` + 留痕；L3/L4 默认不可见。
+8. **权限可逐项勾选（D11）**：账号权限 = 模板起点 ⊕ 逐项勾选（模块/维度/密级/字段）⊖ DENY(优先) ⊕ 临时授权；
+   角色模板只是预设套餐，**最终以勾选结果为准**。求值见 `contracts/entitlement.ts` 与 `docs/07`。
 
-## 模块与语言选型（固定）
+## 模块与语言选型（D4 已拍板：Go + Rust 混合）
 
 | 模块 | 语言 | 关键产出 |
 |---|---|---|
-| `M-FILTER` | TypeScript | `QueryState` |
-| `M-QUERY` | Go | `ResultSet` |
-| `M-ALGO` / `M-PRECOMP` / `M-RULE` | Rust | 法则库 / 预计算桶 / 规则集 |
-| `M-RENDER` / `M-REPORT` / `M-PNL` / `M-TEMPLATE` | TypeScript | 渲染 / 五层阅览 / 损益 / 模板 |
+| `M-FILTER` | TypeScript + Solid | `QueryState` |
+| `M-QUERY` | **Go**（编排） | `ResultSet` |
+| `M-ADMIN` / `M-SLOT` / `M-AUTH` / `M-AUDIT` / `M-COLLECT` | **Go** | 控制面 / 插槽 / 权限 / 审计 / 采集 |
+| `M-ALGO` / `M-PRECOMP` / `M-RULE` | **Rust** | 法则库 / 预计算桶 / 规则集 |
+| `M-RENDER` / `M-REPORT` / `M-PNL` / `M-TEMPLATE` | TypeScript + Solid | 渲染 / 五层阅览 / 损益 / 模板 |
 | `M-STRATEGY` | Rust + TS | 策略方案 |
-| `M-ADMIN` / `M-SLOT` / `M-COLLECT` / `M-AUTH` / `M-AUDIT` | Go | 控制面 / 插槽 / 采集 / 权限 / 审计 |
 
-**选型判据**：热点在运算（→Rust），编排在服务（→Go），交互在前端（→TS）。不搞单一语言教条。
+**分工纪律**：Go **只编排、不写数值公式**；Rust **只计算、不碰 HTTP 编排/鉴权**。
+Go↔Rust 通过 gRPC/FFI 通信，禁止两处实现同一公式。
+
+**已拍板技术栈（D1–D11）**：云部署 · Solid · PostgreSQL · Go+Rust 混合 · Docker Compose ·
+内网+VPN · 策略实验室仅管理层 · IT 可见业务数值(非默认) · TikTok∥Shopee 并行 · 报表分模块口径 ·
+**账号权限可勾选模块与维度**。
 
 ## 核心契约（改动须升版本号）
 
@@ -51,6 +59,7 @@ description: spark-cicada 经营数据平台的项目级口径与架构纪律。
 | `DataContract` v1.0 | `contracts/data-contract.ts` | 查询模块 → 渲染模块 |
 | `StrategyChoice` v1.0 | `contracts/strategy-choice.ts` | 策略选型决策项 |
 | `ViewTemplate` v1.0 | `contracts/view-template.ts` | 视图模板 |
+| `Entitlement` v1.0 | `contracts/entitlement.ts` | 账号授权项（勾选模块/维度/密级） |
 | `SlotManifest` v1.0 | `contracts/slot-manifest.yaml` | 模块注册 |
 | `algorithm` / `data-slot` / `rule-set` / `precompute-bucket` v1.0 | `contracts/*.yaml` | 算法层 |
 

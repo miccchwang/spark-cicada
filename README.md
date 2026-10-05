@@ -29,17 +29,32 @@ M-FILTER ──QueryState──► M-QUERY ──DataContract──► M-RENDER
 | [`docs/03-算法数据槽规则参考.md`](docs/03-算法数据槽规则参考.md) | 算法/数据槽/规则字典与值输出保证 |
 | [`docs/04-运维方案.md`](docs/04-运维方案.md) | 部署、预计算运维、集成控制面、发布 |
 | [`docs/05-验收闸门.md`](docs/05-验收闸门.md) | 十条 CI 闸门 |
+| [`docs/06-决策清单.md`](docs/06-决策清单.md) | D1–D11 已拍板结果 |
+| [`docs/07-账号权限勾选设计.md`](docs/07-账号权限勾选设计.md) | 逐项勾选模块/维度/密级（D11） |
+
+## 技术选型（D1–D11 已拍板）
+
+| 项 | 决策 |
+|---|---|
+| 部署 | **云** + Docker Compose + 纯内网/VPN |
+| 前端 | **Solid** |
+| 数据库 | **PostgreSQL 15+** |
+| 计算 | **Go 业务编排 + Rust 核心计算/高性能模块**（混合） |
+| 首接平台 | **TikTok + Shopee 并行** |
+| 报表口径 | **分模块各自默认**（经营=运营，P&L=财务） |
+| 账号权限 | **可勾选模块 + 数据维度**（非固定模板） |
+| IT 业务数值 | **可见但非默认**（显式勾选 + T1 批准 + 留痕） |
 
 ## 目录
 
 ```
-contracts/    层间契约（query-state / data-contract / strategy-choice / view-template / slot-manifest）
+contracts/    层间契约（query-state / data-contract / strategy-choice / view-template / entitlement / slot-manifest）
 algorithms/   算法定义（只写公式 + 依赖槽）
 slots/        数据槽定义（只写数据来源）
 rules/        规则集（费率/口径/阈值，唯一事实源）
 buckets/      预计算桶定义
 skills/       项目级 skill
-docs/         开发 / 运维 / 闸门文档
+docs/         开发 / 运维 / 闸门 / 决策 / 权限 文档
 ```
 
 ## 核心纪律
