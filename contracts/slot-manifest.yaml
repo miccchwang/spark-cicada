@@ -1,0 +1,94 @@
+# contracts/slot-manifest.yaml —— v1.0
+# 插槽架构：模块注册与能力声明。
+# 新功能模块通过本清单自注册；主机**零改代码**即可挂载。
+
+manifestVersion: "1.0"
+
+# 主机支持的挂载槽位（UI/UX 预留）
+layoutSlots:
+  - id: header.actions
+    desc: 顶栏操作区
+  - id: header.status
+    desc: 顶栏状态区
+  - id: main.content
+    desc: 主内容区
+  - id: main.side
+    desc: 侧边区
+  - id: settings.panel
+    desc: 设置页分区
+
+# 已注册模块
+modules:
+  - id: module.filter
+    name: 筛选与时间
+    version: 1.0.0
+    kind: panel
+    lang: typescript
+    slot: main.side
+    permissions: [L1, L2, L3, L4]
+    data_slots: []
+    produces: [QueryState]
+    upgrade: { minHostVersion: "1.0.0" }
+
+  - id: module.report
+    name: 经营报表
+    version: 1.0.0
+    kind: page
+    lang: typescript
+    slot: main.content
+    nav: { group: 经营分析, order: 10, icon: chart }
+    permissions: [L2, L3]
+    data_slots: [slot.revenue, slot.qty, slot.stock]
+    produces: [DataContract]
+
+  - id: module.pnl
+    name: P&L 损益
+    version: 1.0.0
+    kind: page
+    lang: typescript
+    slot: main.content
+    nav: { group: 经营分析, order: 20, icon: coins }
+    permissions: [L3, L4]
+    data_slots: [slot.revenue, slot.cogs, slot.platform_fee, slot.ad_spend]
+    produces: [DataContract]
+
+  - id: module.strategy
+    name: 策略实验室
+    version: 1.0.0
+    kind: page
+    lang: rust+typescript
+    slot: main.content
+    nav: { group: 决策, order: 30, icon: flask }
+    permissions: [L3, L4]
+    data_slots: []
+    produces: [StrategyChoice]
+
+  - id: module.template
+    name: 模板中心
+    version: 1.0.0
+    kind: page
+    lang: typescript
+    slot: main.content
+    nav: { group: 我的, order: 40, icon: bookmark }
+    permissions: [L1]
+    data_slots: []
+    produces: [ViewTemplate]
+
+  - id: module.admin
+    name: IT 控制台
+    version: 1.0.0
+    kind: page
+    lang: go+typescript
+    slot: main.content
+    nav: { group: 管理, order: 90, icon: shield }
+    permissions: [L0]          # IT 只见元数据，不见业务数值
+    data_slots: []
+    produces: [IntegrationStatus]
+
+# 能力协商规则
+negotiation:
+  onMissingDataSlot: degrade      # degrade | hide | error
+  onMissingPermission: hide
+  onVersionMismatch: block
+  moduleIsolation: true           # 模块故障不拖垮主机
+  independentlyDisableable: true  # IT 可单独停用

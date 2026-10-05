@@ -1,2 +1,58 @@
 # spark-cicada
-Omni Channel Automatic
+
+Omni Channel Automatic · 经营数据平台 · 模块化架构（v2.0）
+
+## 这是什么
+
+一个围绕 **DB 预计算** 构建的经营数据平台：
+筛选模块只产出状态、渲染模块只消费数据、算法与数据来源彻底分离，
+并内置 IT 集成控制面（MCP/API 授权与状态）与自迭代策略实验室。
+
+## 架构一句话
+
+```
+M-FILTER ──QueryState──► M-QUERY ──DataContract──► M-RENDER
+                             │
+                        M-ALGO / M-RULE / M-PRECOMP（预计算优先）
+                             │
+                        DB（事实表 + 维表 + 预计算桶）
+                             │
+                        M-COLLECT ◄── M-ADMIN（MCP/API 授权与状态）
+```
+
+## 文档
+
+| 文件 | 内容 |
+|---|---|
+| [`docs/01-开发文档.md`](docs/01-开发文档.md) | 总体架构、模块划分、七项核心设计 |
+| [`docs/02-模块规格说明书.md`](docs/02-模块规格说明书.md) | 逐模块输入/输出/契约/验收 |
+| [`docs/03-算法数据槽规则参考.md`](docs/03-算法数据槽规则参考.md) | 算法/数据槽/规则字典与值输出保证 |
+| [`docs/04-运维方案.md`](docs/04-运维方案.md) | 部署、预计算运维、集成控制面、发布 |
+| [`docs/05-验收闸门.md`](docs/05-验收闸门.md) | 十条 CI 闸门 |
+
+## 目录
+
+```
+contracts/    层间契约（query-state / data-contract / strategy-choice / view-template / slot-manifest）
+algorithms/   算法定义（只写公式 + 依赖槽）
+slots/        数据槽定义（只写数据来源）
+rules/        规则集（费率/口径/阈值，唯一事实源）
+buckets/      预计算桶定义
+skills/       项目级 skill
+docs/         开发 / 运维 / 闸门文档
+```
+
+## 核心纪律
+
+1. **三段式解耦**：筛选只出状态、查询只翻译、渲染只消费。
+2. **算法与数据源分离**：换源改槽、改口径改规则、改算法改公式。
+3. **缺失必跳过**：不补 0、不取均值、不摊分、不造数，显示「待接入」。
+4. **可追溯**：每个值都能回溯到算法与数据槽。
+5. **预计算优先**：能在 DB 预算好的，绝不在请求时重算。
+6. **默认可收起**：所有可折叠表格默认收起（L0 总览除外）。
+7. **IT 管数分离**：IT 可管授权与状态，不可见业务数值。
+
+## 状态
+
+架构 v2.0 已定稿；代码按 `docs/02` 的模块逐层实现。
+参考基线 `miccchwang/Trading-Strategy-and-Management-`（复用能力与经验，不复制结构）。

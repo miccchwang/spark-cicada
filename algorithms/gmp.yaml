@@ -1,0 +1,15 @@
+# algorithms/gmp.yaml —— 毛利率
+id: algo.gmp
+name: 毛利率
+version: 3
+formula: "rev == 0 ? null : gp / rev"
+unit: percent
+permission: L3
+depends_on_slots:
+  - slot.revenue
+  - slot.gp
+writes_bucket: pnl_sku_month
+missing_policy: skip
+trace: true
+notes: |
+  分母为 0 时返回 null（不返回 0，以免被误读为"零毛利"）。

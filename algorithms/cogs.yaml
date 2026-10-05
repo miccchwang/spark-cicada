@@ -1,0 +1,16 @@
+# algorithms/cogs.yaml —— 成本额 COGS
+id: algo.cogs
+name: 成本额
+version: 3
+formula: "sum(qty * cost_unit)"
+unit: THB
+permission: L4
+depends_on_slots:
+  - slot.qty
+  - slot.cost_unit
+writes_bucket: pnl_sku_month
+missing_policy: skip
+trace: true
+notes: |
+  成本单价取自成本主数据（固定列位解析）。
+  未命中 SKU 保留空值，禁止用 0 或均价替代。

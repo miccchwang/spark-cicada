@@ -1,0 +1,13 @@
+# slots/slot.affiliate.yaml —— 达人佣金数据槽
+id: slot.affiliate
+name: 达人佣金
+source_kind: api
+source_ref: influencer.commission
+key_strategy: spu
+coverage_gate: 0.80
+freshness: 1d
+permission: L4
+status: MISSING        # 当前无权威来源
+notes: |
+  当前不可用 → 依赖它的算法（如 algo.net_contrib）会被跳过，
+  页面显示「待接入」。禁止估算或按比例摊分。

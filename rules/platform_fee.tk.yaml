@@ -1,0 +1,27 @@
+# rules/platform_fee.tk.yaml —— TikTok SHOP 平台费率规则
+# 规则集是费率/口径的唯一事实源；改变只改这里，全域生效，且带版本号可追溯。
+id: rule.tk.fee
+version: 6
+scope: { platform: TK, country: TH }
+items:
+  - id: payment_gateway
+    name: 支付通道费
+    rate: 0.03
+  - id: platform_commission
+    name: 平台佣金
+    rate: 0.10
+    effective_from: 2026-07-01
+  - id: commerce_growth_fee
+    name: 商业增长费
+    rate: 0.075
+    vat_included: true
+    effective_from: 2026-05-01
+  - id: platform_infrastructure
+    name: 平台基础设施费
+    flat_per_order: 1        # THB
+  - id: live_special_commission
+    name: 直播特殊佣金
+    rate: 0.0428
+  - id: pick_pack
+    name: 拣货包装费
+    flat_per_order: 12       # THB

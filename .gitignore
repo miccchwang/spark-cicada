@@ -1,0 +1,31 @@
+# --- 环境与密钥 ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# --- 构建产物 ---
+dist/
+build/
+target/
+node_modules/
+*.wasm
+
+# --- 数据（不入库） ---
+data/
+*.sqlite3
+*.db
+_src/
+.tmp/
+
+# --- 日志与临时 ---
+*.log
+.tmp/
+coverage/
+
+# --- 编辑器 ---
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,22 @@
+# buckets/pnl_month.yaml —— 月度损益预计算桶
+# 预计算桶：把法则落在 DB 物化，请求时只读不算。
+id: pnl_month
+grain: [month, channel_code, shop_id, brand]
+produced_by:
+  - algo.rev
+  - algo.cogs
+  - algo.gp
+  - algo.gmp
+  - algo.net_rev
+  - algo.platform_fee
+  - algo.net_contrib
+refresh: monthly_incremental
+algo_versions:
+  algo.gp: 3
+  algo.gmp: 3
+  algo.net_contrib: 1
+indexes:
+  - [month]
+  - [channel_code, month]
+  - [shop_id, month]
+  - [brand, month]

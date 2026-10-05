@@ -1,0 +1,14 @@
+# algorithms/gp.yaml —— 毛利
+# 注意：算法只声明「公式」与「依赖的数据槽」；数据来源由 slots/*.yaml 定义，两者分离。
+id: algo.gp
+name: 毛利
+version: 3
+formula: "rev - cogs"
+unit: THB
+permission: L3
+depends_on_slots:
+  - slot.revenue
+  - slot.cogs
+writes_bucket: pnl_sku_month
+missing_policy: skip      # 任一依赖槽不可用 → 跳过，不补 0
+trace: true

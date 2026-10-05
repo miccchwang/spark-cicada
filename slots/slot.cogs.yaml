@@ -1,0 +1,13 @@
+# slots/slot.cogs.yaml —— 成本额数据槽
+# 数据槽只回答「数据从哪来」；算法只回答「怎么算」。
+id: slot.cogs
+name: 成本额
+source_kind: master_table
+source_ref: cost_master.v2
+key_strategy: barcode_then_sku   # 完整条码精确匹配优先，无条码用品牌+精确归一化 SKU 名
+coverage_gate: 0.80              # 低于此覆盖率视为不可用
+freshness: 7d
+permission: L4
+notes: |
+  成本主数据按固定列位解析；表头变化须显式失败，不做模糊匹配。
+  未命中保留空值（显示 —），禁止用 0 或均价替代。

@@ -1,0 +1,17 @@
+# algorithms/net_contrib.yaml —— 净贡献
+id: algo.net_contrib
+name: 净贡献
+version: 1
+formula: "cm2 - overhead_alloc"
+unit: THB
+permission: L3
+depends_on_slots:
+  - slot.platform_fee
+  - slot.ad_spend
+  - slot.affiliate
+writes_bucket: pnl_month
+missing_policy: skip
+trace: true
+notes: |
+  依赖 slot.affiliate（达人佣金）当前为 MISSING，故多数粒度会被跳过。
+  这是预期行为（fail-closed），不得用 0 补齐导致净贡献虚高。
