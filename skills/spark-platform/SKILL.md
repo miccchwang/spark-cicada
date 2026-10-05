@@ -28,10 +28,15 @@ description: spark-cicada 经营数据平台的项目级口径与架构纪律。
 4. **每个值可追溯**：任何非空值必须能沿 `AlgoTrace` 回溯到「哪条算法 + 哪些真实数据槽」。
 5. **预计算优先**：能被 DB 预先算好的，绝不在请求时重算。新指标先问「落哪个桶」。
 6. **所有可收起表格默认收起**：`DEFAULT_EXPANDED = {L0:true, L1..L4:false}`，任何折叠组件初始 `open=false`。
-7. **IT 管数分离（D7 已调整为受控可见）**：IT 可管理全部 MCP/API 授权与状态、账号启用；
-   业务数值**默认不可见**，需 T1 显式勾选 `canViewBusinessValues` + 留痕；L3/L4 默认不可见。
-8. **权限可逐项勾选（D11）**：账号权限 = 模板起点 ⊕ 逐项勾选（模块/维度/密级/字段）⊖ DENY(优先) ⊕ 临时授权；
-   角色模板只是预设套餐，**最终以勾选结果为准**。求值见 `contracts/entitlement.ts` 与 `docs/07`。
+7. **IT 管数分离（D7=取消，第二轮修订）**：IT 可管理全部 MCP/API 授权与状态、账号启用、
+   用户分组、权限审批；**恒不可见任何业务数值**，`canViewBusinessValues` 对 IT 恒 false 且不可勾选。
+8. **权限可逐项勾选（D11）**：账号权限 = 模板(预设) ⊕ 分组授权(D12) ⊕ 逐项勾选（模块/维度/密级/字段）
+   ⊕ 已批准申请(D14) ⊕ 上级代授(D13) ⊖ DENY(优先) ⊕ 临时授权；
+   角色模板只是预设套餐，**最终以勾选结果为准**。求值见 `contracts/entitlement.ts` 与 `docs/07`、`docs/08`。
+9. **职权向下覆盖（D13）**：`可授出集合(账号 A) ⊆ 账号 A 自身权限集合`；上级管下级、同级互不可见；
+   代授不得溢出自身范围。
+10. **凭据零暴露（S1）**：URL 不含账号密码；密钥不入 Git、不入前端产物、不入镜像；
+    日志与 IT 页面只显示掩码。见 `docs/09-凭据防泄漏章程.md`。
 
 ## 模块与语言选型（D4 已拍板：Go + Rust 混合）
 
@@ -39,7 +44,7 @@ description: spark-cicada 经营数据平台的项目级口径与架构纪律。
 |---|---|---|
 | `M-FILTER` | TypeScript + Solid | `QueryState` |
 | `M-QUERY` | **Go**（编排） | `ResultSet` |
-| `M-ADMIN` / `M-SLOT` / `M-AUTH` / `M-AUDIT` / `M-COLLECT` | **Go** | 控制面 / 插槽 / 权限 / 审计 / 采集 |
+| `M-ADMIN` / `M-SLOT` / `M-AUTH` / `M-AUDIT` / `M-COLLECT` / `M-GROUP` / `M-REQ` | **Go** | 控制面 / 插槽 / 权限 / 审计 / 采集 / 分组 / 申请流 |
 | `M-ALGO` / `M-PRECOMP` / `M-RULE` | **Rust** | 法则库 / 预计算桶 / 规则集 |
 | `M-RENDER` / `M-REPORT` / `M-PNL` / `M-TEMPLATE` | TypeScript + Solid | 渲染 / 五层阅览 / 损益 / 模板 |
 | `M-STRATEGY` | Rust + TS | 策略方案 |
@@ -47,9 +52,10 @@ description: spark-cicada 经营数据平台的项目级口径与架构纪律。
 **分工纪律**：Go **只编排、不写数值公式**；Rust **只计算、不碰 HTTP 编排/鉴权**。
 Go↔Rust 通过 gRPC/FFI 通信，禁止两处实现同一公式。
 
-**已拍板技术栈（D1–D11）**：云部署 · Solid · PostgreSQL · Go+Rust 混合 · Docker Compose ·
-内网+VPN · 策略实验室仅管理层 · IT 可见业务数值(非默认) · TikTok∥Shopee 并行 · 报表分模块口径 ·
-**账号权限可勾选模块与维度**。
+**已拍板技术栈（D1–D14）**：**阿里云 + AWS（新加坡/美国）** · Solid · PostgreSQL · Go+Rust 混合 ·
+Docker Compose · 内网+VPN · 策略实验室仅管理层 · **IT 恒不可见业务数值（D7 取消）** ·
+TikTok∥Shopee 并行（Shopee 费率暂缓）· 报表分模块口径 · **账号权限可勾选模块与维度** ·
+**用户分组（D12）· 职权向下覆盖（D13）· 权限申请流（D14）** · **凭据零暴露（S1）**。
 
 ## 核心契约（改动须升版本号）
 
@@ -59,7 +65,9 @@ Go↔Rust 通过 gRPC/FFI 通信，禁止两处实现同一公式。
 | `DataContract` v1.0 | `contracts/data-contract.ts` | 查询模块 → 渲染模块 |
 | `StrategyChoice` v1.0 | `contracts/strategy-choice.ts` | 策略选型决策项 |
 | `ViewTemplate` v1.0 | `contracts/view-template.ts` | 视图模板 |
-| `Entitlement` v1.0 | `contracts/entitlement.ts` | 账号授权项（勾选模块/维度/密级） |
+| `Entitlement` v1.1 | `contracts/entitlement.ts` | 账号授权项（勾选模块/维度/密级 + 分组 + 上级） |
+| `UserGroup` v1.0 | `contracts/user-group.ts` | 用户分组与成员关系（D12） |
+| `PermissionRequest` v1.0 | `contracts/permission-request.ts` | 权限申请单（D14） |
 | `SlotManifest` v1.0 | `contracts/slot-manifest.yaml` | 模块注册 |
 | `algorithm` / `data-slot` / `rule-set` / `precompute-bucket` v1.0 | `contracts/*.yaml` | 算法层 |
 
@@ -104,9 +112,25 @@ TTI < 1000ms；筛选 P95 命中预计算 < 100ms、未命中 < 500ms；首屏 g
 
 ## 验收闸门
 
-十条闸门见 `docs/05-验收闸门.md`（分层依赖 / 默认收起 / 缺失值 / 算法与槽分离 /
-覆盖率门控 / 预计算一致性 / 权限 / 性能 / 插槽 / 策略审计）。任一失败阻断合并。
+十一条闸门见 `docs/05-验收闸门.md`（分层依赖 / 默认收起 / 缺失值 / 算法与槽分离 /
+覆盖率门控 / 预计算一致性 / 权限 / 性能 / 插槽 / 策略审计 / **密钥扫描 G11**）。任一失败阻断合并。
 新增约束必须**先写文档、再加闸门、最后实现**。
+
+## 协作与续跑纪律（DingTalk）
+
+- 需要用户决策时，发**简短单行**钉钉到用户本人（`+dm --to "CN-Michael-黄基煜"`），
+  消息末尾带 **回执编号**（`R-YYYYMMDD-NN`）+ 待决项 + 超时时间。
+- 回复读取：`+chat-messages --open-dingtalk-id DEkTtguVm54R2VYm7ly23x3z0XCiiP0xiS0`。
+- 定时轮询任务会自动读回复并续跑（见 `docs/10-钉钉协作与续跑机制.md`）。
+- **禁止**用 `--content "$(cat 长文件)"` 发长消息（会超时 SIGTERM）；长内容只发摘要 + 仓库路径。
+
+## 凭据安全纪律（S1）
+
+- **URL 不含账号密码**：禁止 `scheme://user:pass@host`；身份走 HttpOnly Cookie / ticket。
+- **前端产物零密钥**：`public/`、`dist/` 只允许公开配置；secret 只在服务端，由后端代理。
+- **密钥不入 Git、不入镜像**：`.env*` 等强制 git-ignore；CI 闸门 G11 扫描兜底。
+- **日志/页面只显示掩码**：`sk-****abcd`，明文永不回显。
+- 详见 `docs/09-凭据防泄漏章程.md`。
 
 ## 复用 KODP 的清单
 

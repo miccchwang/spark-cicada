@@ -5,6 +5,9 @@
 *.pem
 *.key
 secrets/
+credentials*
+*_secret*
+config.local.json
 
 # --- 构建产物 ---
 dist/
@@ -29,3 +32,7 @@ coverage/
 .vscode/
 .idea/
 .DS_Store
+
+# --- 本地协作状态（钉钉回执轮询状态，不入库） ---
+.workbuddy-ai/state/
+.workbuddy-ai/memory/
