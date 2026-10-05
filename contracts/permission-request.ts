@@ -21,6 +21,7 @@ export type RequestStatus =
   | "DRAFT"          // 草稿
   | "SUBMITTED"      // 已提交，待路由
   | "APPROVING"      // 审批中
+  | "COSIGN_PENDING" // 待会签（F8：高风险场景需抄送人会签）
   | "APPROVED"       // 已通过（已开通）
   | "REJECTED"       // 已拒绝
   | "WITHDRAWN"      // 申请人撤回
@@ -71,15 +72,39 @@ export interface ApprovalStep {
 
 /**
  * 抄送记录（第三轮新增）：+2 或 +1 的直属上级。
- * 抄送人**知会**该申请；默认不阻断，除非配置为"会签"。
+ *
+ * 两种模式（F8）：
+ *   - notify（知会，默认）：可见该申请，**无决定权**，不阻断
+ *   - cosign（会签，条件触发）：有**否决权**，否决即驳回
+ * 触发会签的条件：L4 / 跨部门 / 有效期>90天 / 含 grp.roi·grp.cost_profit / 批量≥10。
  */
 export interface CcRecord {
   cc: string;
   reason: string;                   // 如 "+2" / "+1 的直属上级"
+  /** 模式：知会 / 会签 */
+  mode: "notify" | "cosign";
   notifiedAt: string;
   readAt?: string;
-  /** 若配置为会签且否决，则记录否决 */
+  /** 会签模式下：是否否决 */
   vetoed?: boolean;
+  /** 会签模式的决策时间 */
+  decidedAt?: string;
+}
+
+/** 抄送策略配置（F8） */
+export interface CcPolicy {
+  /** 默认模式 */
+  defaultMode: "notify" | "cosign";
+  /** 升级为会签的触发条件（任一命中即会签） */
+  cosignTriggers: {
+    level?: "L4";
+    crossDept?: boolean;
+    expiryDaysGt?: number;
+    dataUseGroups?: string[];
+    grantScopeAccountsGte?: number;
+  };
+  /** +2 不存在时的行为 */
+  emptyCcBehavior: "notify" | "skip";
 }
 
 /** 申请提交前的预校验结果 */
