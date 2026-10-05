@@ -160,3 +160,77 @@ func TestLoadMigrations_RealDir(t *testing.T) {
 		}
 	}
 }
+
+// TestDSNFromEnv_AcceptsBothNames 锁定「两个 DSN 变量名都必须认」。
+//
+// ★ 这是 CI 真库步骤第二次失败的根因回归测试：
+//   迁移器只认 SPARK_DB_DSN，CI 只设 SPARK_TEST_DB_DSN
+//   ⇒ 真库迁移死于「未配置连接信息」，其后所有真库闸门全部 skip。
+//
+// 危险之处在于**沉默**：两侧各自看都自洽，谁也没报错到「配置名不一致」上，
+// 只有在同一个 CI 作业里合排才炸。故这里把契约钉死。
+func TestDSNFromEnv_AcceptsBothNames(t *testing.T) {
+	// 三个都清干净，避免宿主机环境污染
+	clearDSNEnv := func() {
+		for _, k := range []string{
+			"SPARK_DB_DSN", "SPARK_TEST_DB_DSN",
+			"SPARK_PG_HOST", "SPARK_PG_USER",
+		} {
+			t.Setenv(k, "")
+		}
+	}
+
+	t.Run("主名 SPARK_DB_DSN 生效", func(t *testing.T) {
+		clearDSNEnv()
+		t.Setenv("SPARK_DB_DSN", "postgres://u:p@h:5432/main?sslmode=disable")
+		got, err := DSNFromEnv()
+		if err != nil {
+			t.Fatalf("期望成功，实际报错：%v", err)
+		}
+		if !strings.Contains(got, "/main") {
+			t.Errorf("取到的不是主名 DSN：%s", RedactDSN(got))
+		}
+	})
+
+	t.Run("测试期名 SPARK_TEST_DB_DSN 也生效（CI 只设这个）", func(t *testing.T) {
+		clearDSNEnv()
+		t.Setenv("SPARK_TEST_DB_DSN", "postgres://u:p@h:5432/citest?sslmode=disable")
+		got, err := DSNFromEnv()
+		if err != nil {
+			t.Fatalf("★ 未识别 SPARK_TEST_DB_DSN —— CI 真库迁移会死于「未配置连接信息」：%v", err)
+		}
+		if !strings.Contains(got, "/citest") {
+			t.Errorf("取到的不是测试期 DSN：%s", RedactDSN(got))
+		}
+	})
+
+	t.Run("主名优先于测试期名", func(t *testing.T) {
+		clearDSNEnv()
+		t.Setenv("SPARK_DB_DSN", "postgres://u:p@h:5432/primary?sslmode=disable")
+		t.Setenv("SPARK_TEST_DB_DSN", "postgres://u:p@h:5432/secondary?sslmode=disable")
+		got, _ := DSNFromEnv()
+		if !strings.Contains(got, "/primary") {
+			t.Errorf("主名应优先，实际取到：%s", RedactDSN(got))
+		}
+	})
+
+	t.Run("全空时报错（不静默返回空串）", func(t *testing.T) {
+		clearDSNEnv()
+		if got, err := DSNFromEnv(); err == nil {
+			t.Fatalf("全空时应报错，实际返回 %q —— 空串会被当成有效配置往下走", got)
+		}
+	})
+
+	t.Run("报错信息提到两个变量名，便于排障", func(t *testing.T) {
+		clearDSNEnv()
+		_, err := DSNFromEnv()
+		if err == nil {
+			t.Fatal("期望报错")
+		}
+		for _, want := range []string{"SPARK_DB_DSN", "SPARK_TEST_DB_DSN"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("报错未提及 %s，运维会找不到该设哪个：%v", want, err)
+			}
+		}
+	})
+}

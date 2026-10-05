@@ -7,14 +7,16 @@
 #   任何人（或 CI、或部署机）都能重复跑出同样的结论。
 #
 # 覆盖的断言（每条都必须真跑，不允许 skip 冒充通过）：
-#   1. 工具链就位（go / node）
-#   2. Go 构建 + vet
-#   3. 迁移集可加载且校验通过（dry-run，不需要库）
-#   4. 全部 Go 测试（含 G1–G12 闸门）
+#   0. 工具链就位（go / node / cargo）
+#   1. Go 构建 + vet
+#   2. 迁移集可加载且校验通过（dry-run）
+#   3. 全部 Go 测试（含 G1–G12 闸门）
+#   4. 真库集成测试（迁移幂等 / NULL≠0 / 审计 append-only / D7）
+#   4b. ★ 真库数据面端到端：迁移 → sparkd 带 DSN → healthz db=true → /api/query 真读库
 #   5. Rust 内核测试 + selftest
 #   6. 前端分层闸门 + 测试 + 类型检查 + 构建
 #   7. ★ 前端产物密钥扫描（G11b）
-#   8. ★ sparkd 真起进程 + 静态托管 + API 降级语义（真 HTTP，不靠 mock）
+#   8. ★ sparkd 真起进程 + 静态托管 + **无库降级**语义（真 HTTP，不靠 mock）
 #
 # 用法：
 #   bash tools/verify/launch-check.sh              # 全量（无库时跳过真库段并明示）
@@ -114,6 +116,87 @@ else
   skip "未设 SPARK_TEST_DB_DSN：真库断言**本轮未执行**（数据面真库行为尚未验证）"
 fi
 
+# ── compute 内核定位（§4b 与 §8 都要用；缺失时先构建）──
+# sparkd 是 fail-closed 的：拿不到内核就拒绝启动。因此真库段和 HTTP 冒烟段
+# 都必须先有这个二进制，否则会以「sparkd 起不来」的表象失败，
+# 误导成接线 bug，而真实原因是内核不在。
+COMPUTE_BIN=""
+for cand in "$ROOT/compute/target/release/spark-compute" "$ROOT/compute/target/release/spark-compute.exe" "$ROOT/spark-compute" "$ROOT/spark-compute.exe"; do
+  [ -x "$cand" ] && COMPUTE_BIN="$cand" && break
+done
+if [ -z "$COMPUTE_BIN" ] && [ -n "$CARGOEXE" ]; then
+  printf '  · 未找到 compute 内核，尝试构建（cargo build --release）…\n'
+  ( cd compute && "$CARGOEXE" build --release --locked --quiet >/dev/null 2>&1 )
+  for cand in "$ROOT/compute/target/release/spark-compute" "$ROOT/compute/target/release/spark-compute.exe"; do
+    [ -x "$cand" ] && COMPUTE_BIN="$cand" && break
+  done
+fi
+
+# ───────────── 4b. ★ 真库数据面：迁移 + 记账幂等 + 真实 HTTP 查询 ─────────────
+# 4 段验证的是 store 包内部逻辑；这一段验证的是**整条链路**：
+# 迁移真的把 schema 建起来了 → sparkd 真的连上 → API 真的从库里读出数据。
+# 二者不能互相替代：store 测试过不代表 sparkd 的接线对。
+if [ -n "${SPARK_TEST_DB_DSN:-}" ] || [ -n "${SPARK_DB_DSN:-}" ]; then
+  step "4b. 真库数据面端到端（迁移 → sparkd → /api/query 真读库）"
+
+  # 4b-1 应用迁移（幂等）：连跑两次，第二次必须全部「已应用」而非重复执行
+  if ( cd backend && "$GOEXE" run ./cmd/spark-migrate -dir ../sql/migrations -up >/tmp/spark-mig1.log 2>&1 ); then
+    ok "迁移首次应用成功"
+  else
+    bad "迁移首次应用失败"; tail -20 /tmp/spark-mig1.log
+  fi
+  if ( cd backend && "$GOEXE" run ./cmd/spark-migrate -dir ../sql/migrations -up >/tmp/spark-mig2.log 2>&1 ); then
+    # 第二次应全部跳过（幂等）；若又“应用”了，说明记账失效
+    if grep -qE '本次应用 0 个' /tmp/spark-mig2.log; then
+      ok "迁移幂等：二次执行应用 0 个（记账生效）"
+    else
+      bad "迁移不幂等：二次执行并非 0 应用"; grep -E '完成。本次' /tmp/spark-mig2.log
+    fi
+  else
+    bad "迁移二次执行失败（幂等性被破坏）"; tail -20 /tmp/spark-mig2.log
+  fi
+
+  # 4b-2 起 sparkd（**带 DSN**）并断言它真读到了库
+  if [ -n "$COMPUTE_BIN" ] && [ -x "$COMPUTE_BIN" ]; then
+    ( cd backend && "$GOEXE" build -o /tmp/sparkd-db ./cmd/sparkd ) || \
+      "$GOEXE" build -o /tmp/sparkd-db ./backend/cmd/sparkd
+    if [ -x /tmp/sparkd-db ]; then
+      SPARK_COMPUTE_BIN="$COMPUTE_BIN" SPARK_WEB_DIR="$ROOT/web/dist" \
+        SPARK_DB_DSN="${SPARK_DB_DSN:-${SPARK_TEST_DB_DSN:-}}" \
+        /tmp/sparkd-db -addr 127.0.0.1:18098 >/tmp/sparkd-db.log 2>&1 &
+      DB_PID=$!
+      sleep 3
+      if kill -0 "$DB_PID" 2>/dev/null; then
+        HZ=$(curl -s http://127.0.0.1:18098/healthz 2>/dev/null || echo '{}')
+        # ★ 有库时必须 db=true —— 这是「接线真的通了」的最短判据
+        if echo "$HZ" | grep -q '"db":true'; then
+          ok "healthz db=true（迁移后的 schema 已真正连通）"
+        else
+          bad "有 DSN 但 healthz db≠true：接库未生效 → $HZ"
+        fi
+
+        # /api/query 有库时不应再报 store not configured
+        QCODE=$(curl -s -o /tmp/q-db.json -w '%{http_code}' -X POST http://127.0.0.1:18098/api/query \
+          -H 'X-Spark-Account: lead.sea' -H 'Content-Type: application/json' \
+          -d '{"v":"1.0","time":{"mode":"preset","preset":"mtd","grain":"month","timezone":"Asia/Bangkok"},"filters":[],"dims":{"level":"store"}}' 2>/dev/null || echo 000)
+        if [ "$QCODE" = "500" ] && grep -qi 'store not configured' /tmp/q-db.json; then
+          bad "接了库却仍报 store not configured —— DSN 没传进 store 层"
+        else
+          ok "★ /api/query 已走真库路径（HTTP $QCODE，非 store-not-configured）"
+        fi
+      else
+        bad "带 DSN 的 sparkd 启动失败"; tail -20 /tmp/sparkd-db.log
+      fi
+      kill "$DB_PID" 2>/dev/null
+      wait "$DB_PID" 2>/dev/null
+    else
+      bad "sparkd（真库版）构建失败"
+    fi
+  else
+    skip "compute 内核缺失：跳过真库 sparkd 冒烟"
+  fi
+fi
+
 # ───────────────────────── 5. Rust 内核 ─────────────────────────
 step "5. Rust 计算内核"
 if [ -n "$CARGOEXE" ]; then
@@ -161,17 +244,7 @@ step "8. sparkd 真进程冒烟（HTTP 层，不靠 mock）"
 
 # 8-pre ★ sparkd 是 fail-closed 的：拿不到 compute 内核就拒绝启动。
 #        因此冒烟必须先确保 Rust 内核二进制存在（缺失时先构建）。
-COMPUTE_BIN=""
-for cand in "$ROOT/compute/target/release/spark-compute" "$ROOT/compute/target/release/spark-compute.exe" "$ROOT/spark-compute" "$ROOT/spark-compute.exe"; do
-  [ -x "$cand" ] && COMPUTE_BIN="$cand" && break
-done
-if [ -z "$COMPUTE_BIN" ] && [ -n "$CARGOEXE" ]; then
-  printf '  · 未找到 compute 内核，尝试构建（cargo build --release）…\n'
-  ( cd compute && "$CARGOEXE" build --release --locked --quiet >/dev/null 2>&1 )
-  for cand in "$ROOT/compute/target/release/spark-compute" "$ROOT/compute/target/release/spark-compute.exe"; do
-    [ -x "$cand" ] && COMPUTE_BIN="$cand" && break
-  done
-fi
+#        ⚠ 内核定位已提前到 §4b 之前（真库段也要用），此处只做**结果汇报**。
 if [ -n "$COMPUTE_BIN" ]; then
   ok "compute 内核就位：$COMPUTE_BIN"
 else
@@ -179,11 +252,18 @@ else
 fi
 
 if [ -n "$COMPUTE_BIN" ] && [ -d web/dist ] && [ -f web/dist/index.html ]; then
-  # 起进程：不设 DSN ⇒ 应进入降级模式（这是**预期**行为，不是失败）
+  # ★ 本段**故意不注入 DSN**：要验证的是「无库时 fail-closed 降级」这条路径。
+  #
+  #   因此这里显式 env -u 抹掉两个 DSN 变量 —— 不能靠「CI 恰好没设」来成立。
+  #   否则一旦上游作业级 env 注入了 DSN（CI 现在就是），sparkd 会真去连库，
+  #   而 launch-check 作业并没有跑迁移 ⇒ 连到一个空 schema 库，
+  #   8c 断言 db=false 会莫名失败，且报错指向 healthz 而非「环境串味了」。
+  #   显式隔离比隐式假设可靠。
   ( cd backend && "$GOEXE" build -o /tmp/sparkd ./cmd/sparkd ) || \
     "$GOEXE" build -o /tmp/sparkd ./backend/cmd/sparkd
   if [ -x /tmp/sparkd ]; then
-    SPARK_COMPUTE_BIN="$COMPUTE_BIN" SPARK_WEB_DIR="$ROOT/web/dist" \
+    env -u SPARK_DB_DSN -u SPARK_TEST_DB_DSN -u SPARK_PG_HOST -u SPARK_PG_USER \
+      SPARK_COMPUTE_BIN="$COMPUTE_BIN" SPARK_WEB_DIR="$ROOT/web/dist" \
       /tmp/sparkd -addr 127.0.0.1:18099 >/tmp/sparkd.log 2>&1 &
     SRV_PID=$!
     sleep 3

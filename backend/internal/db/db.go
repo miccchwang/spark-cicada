@@ -295,16 +295,34 @@ func stripOuterTx(sql string) string {
 
 // DSNFromEnv 从环境变量取连接串。
 //
-// 约定：SPARK_DB_DSN 优先；否则用 SPARK_PG_* 组装。
+// 优先级（★ 两个名字都必须认）：
+//
+//  1. SPARK_DB_DSN       —— 运行期主名（sparkd / spark-migrate 部署用）
+//  2. SPARK_TEST_DB_DSN  —— 测试期名（真库集成测试用；CI 只设这一个）
+//  3. SPARK_PG_*         —— 分字段组装（本地/容器编排）
+//
+// ★ 真实事故（CI 真库首次抓出）：本函数原先**只认 SPARK_DB_DSN**，
+// 而 CI workflow 只设了 SPARK_TEST_DB_DSN，于是 `spark-migrate -up`
+// 在真库步骤直接死于「未配置连接信息」—— 迁移根本没跑，
+// 后续所有真库闸门全部 skip。
+//
+// 更值得记的是**为什么没被早发现**：
+// 集成测试读 SPARK_TEST_DB_DSN、迁移读 SPARK_DB_DSN，两者各自"都对"，
+// 单看任一侧都没有 bug；只有把它们放进同一个 CI 作业才暴露。
+// 所以这里不再让两个名字各自为政 —— 统一由本函数解析，单一事实来源。
+//
 // **绝不**在返回值之外打印口令。
 func DSNFromEnv() (string, error) {
-	if dsn := strings.TrimSpace(os.Getenv("SPARK_DB_DSN")); dsn != "" {
-		return dsn, nil
+	// 主名优先；测试期名次之。两者都空才回落到分字段组装。
+	for _, key := range []string{"SPARK_DB_DSN", "SPARK_TEST_DB_DSN"} {
+		if dsn := strings.TrimSpace(os.Getenv(key)); dsn != "" {
+			return dsn, nil
+		}
 	}
 	host := os.Getenv("SPARK_PG_HOST")
 	user := os.Getenv("SPARK_PG_USER")
 	if host == "" || user == "" {
-		return "", errors.New("db: 未配置连接信息（需 SPARK_DB_DSN 或 SPARK_PG_HOST/SPARK_PG_USER）")
+		return "", errors.New("db: 未配置连接信息（需 SPARK_DB_DSN / SPARK_TEST_DB_DSN，或 SPARK_PG_HOST/SPARK_PG_USER）")
 	}
 	port := envOr("SPARK_PG_PORT", "5432")
 	name := envOr("SPARK_PG_DB", "spark_cicada")

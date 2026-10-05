@@ -38,6 +38,9 @@ jobs:
           --health-retries 10
     env:
       # 仅 CI 用的临时口令；不是任何真实环境的口令（G11：不入库、不入镜像）。
+      # ★ 两个名字都设：运行期组件（sparkd/spark-migrate）读 SPARK_DB_DSN，
+      #   真库集成测试读 SPARK_TEST_DB_DSN。曾因只设后者而让迁移步骤
+      #   「未配置连接信息」秒退、其后所有真库闸门全部 skip。
       SPARK_TEST_DB_DSN: postgres://spark:spark_ci_only@localhost:5432/spark_cicada?sslmode=disable
       SPARK_REQUIRE_DB: "1"
     steps:
@@ -55,6 +58,14 @@ jobs:
       - name: go vet
         working-directory: backend
         run: go vet ./...
+
+      # 连接串自检：在跑迁移之前先证明「配置确实被解析出来了」。
+      # 若这一步失败，报错会直指配置名，而不是让迁移以一句模糊的
+      # 「无法连接数据库」失败、再让人以为是 SQL 写错。
+      - name: ★ 连接串解析自检（DSN 必须非空）
+        working-directory: backend
+        run: |
+          go test ./internal/db/ -run TestDSNFromEnv -count=1 -v
 
       # 迁移必须先把库建起来 —— 真库测试依赖 schema。
       - name: 应用迁移（真库，幂等）
@@ -174,6 +185,7 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
+      # ★ 两个名字都设（同 go 作业，理由见上）。
       SPARK_TEST_DB_DSN: postgres://spark:spark_ci_only@localhost:5432/spark_cicada?sslmode=disable
       SPARK_REQUIRE_DB: "1"
     steps:
@@ -196,6 +208,13 @@ jobs:
       - name: 安装前端依赖
         working-directory: web
         run: npm install --no-audit --no-fund
+
+      # 预先把迁移应用到真库：让 launch-check 的 §4b 能验证
+      # 「真库数据面端到端」（healthz db=true + /api/query 真读库）。
+      # 不跑这一步的话，§4b 只能验证「无库降级」，覆盖不到接线正确性。
+      - name: 应用迁移（真库）
+        working-directory: backend
+        run: go run ./cmd/spark-migrate -dir ../sql/migrations -up
 
       # 脚本里的托管绝对路径在 Linux 上不存在，会回退到 PATH —— 此处显式清空以免误用。
       - name: 上线前证据链
