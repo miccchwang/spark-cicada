@@ -12,13 +12,16 @@ GO_PKG  := ./backend/...
 
 .PHONY: help
 help:
-	@echo "make gate        全部闸门"
-	@echo "make gate-fast   静态闸门（G4/G11）"
-	@echo "make gate-auth   权限闸门（G7）"
-	@echo "make gate-dr     备份与容灾（G12）"
-	@echo "make gate-compute 计算内核自检"
-	@echo "make test        全部测试"
-	@echo "make build       构建 Go + Rust"
+	@echo "make gate          全部闸门"
+	@echo "make gate-fast     静态闸门（G1/G4/G11）"
+	@echo "make gate-auth     权限闸门（G2/G3/G7/G10）"
+	@echo "make gate-precomp  预计算一致性（G5/G6）"
+	@echo "make gate-plugins  插槽与性能（G8/G9）"
+	@echo "make gate-dr       备份与容灾（G12）"
+	@echo "make gate-compute  计算内核自检"
+	@echo "make gate-secret   全仓密钥扫描（gitleaks）"
+	@echo "make test          全部测试"
+	@echo "make build         构建 Go + Rust"
 
 # ───────────────────────────── 构建 ─────────────────────────────
 
@@ -49,18 +52,18 @@ test-rust:
 # ───────────────────────────── 闸门 ─────────────────────────────
 
 .PHONY: gate
-gate: gate-fast gate-auth gate-dr gate-compute
+gate: gate-fast gate-auth gate-precomp gate-dr gate-compute
 	@echo "ALL GATES PASSED"
 
-# 静态闸门：G4（算法/数据槽分离）、G11（凭据泄漏）
+# 静态闸门：G1/G4/G11（源码静态扫描 + 前缀密钥扫描）
 .PHONY: gate-fast
 gate-fast:
-	cd backend && $(GO) test ./internal/gate/ -run 'TestG4|TestG11' -v
+	cd backend && $(GO) test ./internal/gate/ -run 'TestG1|TestG4|TestG11' -v
 
 # 权限闸门：G2/G3/G7/G10
 .PHONY: gate-auth
 gate-auth:
-	cd backend && $(GO) test ./internal/gate/ -run 'TestG2|TestG3|TestG7|TestG10' -v
+	cd backend && $(GO) test ./internal/gate/ -run 'TestG2|TestG3|TestG7|TestG10|TestCompute|TestSQL' -v
 	cd backend && $(GO) test ./internal/authz/ ./internal/chain/ ./internal/api/ ./internal/req/ -v
 
 # 预计算一致性：G5/G6
@@ -68,6 +71,11 @@ gate-auth:
 gate-precomp:
 	cd backend && $(GO) test ./internal/gate/ -run 'TestG5|TestG6' -v
 	cd backend && $(GO) test ./internal/precomp/ -v
+
+# 插槽与性能：G8/G9
+.PHONY: gate-plugins
+gate-plugins:
+	cd backend && $(GO) test ./internal/gate/ -run 'TestG8|TestG9' -v
 
 # 备份与容灾：G12
 .PHONY: gate-dr
