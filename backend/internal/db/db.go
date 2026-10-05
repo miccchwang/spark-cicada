@@ -1,0 +1,301 @@
+// Package db —— Postgres 连接、迁移执行与事务辅助（M1 数据层）。
+//
+// 纪律（docs/01 §5、docs/09）：
+//   * 连接串中的口令**绝不**写入日志或审计（G11）。
+//   * 迁移按文件名序执行，且**幂等**：已应用的迁移跳过（schema_migrations 记账）。
+//   * 每个迁移在**单事务**内执行；失败整体回滚（不留半截 schema）。
+//   * 禁止在代码中硬编码任何凭据 —— 一律来自环境变量。
+package db
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Migration 是一个待应用的迁移文件。
+type Migration struct {
+	Version string // 文件名前缀，如 0001
+	Name    string // 文件名，如 0001_core.sql
+	SQL     string
+	Hash    string // SQL 内容的 sha256（检测「已应用文件被改写」）
+}
+
+// migrationFileRe 匹配 NNNN_name.sql。
+var migrationFileRe = regexp.MustCompile(`^(\d{4,})_([a-z0-9_]+)\.sql$`)
+
+// LoadMigrations 从目录加载并校验迁移文件（按版本升序）。
+//
+// 校验：版本号唯一、命名规范、非空。发现重复版本直接报错（fail-fast）。
+func LoadMigrations(dir string) ([]Migration, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("db: read migrations dir %s: %w", dir, err)
+	}
+	seen := map[string]string{}
+	var out []Migration
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		m := migrationFileRe.FindStringSubmatch(e.Name())
+		if m == nil {
+			return nil, fmt.Errorf("db: 迁移文件名不合规（期望 NNNN_name.sql）：%s", e.Name())
+		}
+		version, name := m[1], e.Name()
+		if prev, dup := seen[version]; dup {
+			return nil, fmt.Errorf("db: 迁移版本重复 %s：%s 与 %s", version, prev, name)
+		}
+		seen[version] = name
+
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			return nil, fmt.Errorf("db: 读取迁移 %s: %w", name, err)
+		}
+		if strings.TrimSpace(string(b)) == "" {
+			return nil, fmt.Errorf("db: 迁移 %s 内容为空", name)
+		}
+		sum := sha256.Sum256(b)
+		out = append(out, Migration{
+			Version: version,
+			Name:    name,
+			SQL:     string(b),
+			Hash:    hex.EncodeToString(sum[:]),
+		})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("db: 目录 %s 下没有任何迁移文件", dir)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Version < out[j].Version })
+	return out, nil
+}
+
+// ensureLedger 建迁移记账表（若不存在）。
+const ensureLedger = `
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version     text        PRIMARY KEY,
+    name        text        NOT NULL,
+    hash        text        NOT NULL,
+    applied_at  timestamptz NOT NULL DEFAULT now()
+);`
+
+// AppliedMigration 是记账表里的一行。
+type AppliedMigration struct {
+	Version   string
+	Name      string
+	Hash      string
+	AppliedAt time.Time
+}
+
+// MigrateResult 汇总一次迁移运行的结果。
+type MigrateResult struct {
+	Applied []string // 本次新应用
+	Skipped []string // 已应用过、跳过
+}
+
+// Migrator 执行迁移。
+type Migrator struct {
+	pool *pgxpool.Pool
+}
+
+// NewMigrator 用给定连接串构造迁移器。
+//
+// 连接串**只**从参数/环境读取；本函数不打印它（G11）。
+func NewMigrator(ctx context.Context, dsn string) (*Migrator, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		// 注意：不回显 dsn（可能含口令）
+		return nil, fmt.Errorf("db: 连接串解析失败（不含口令回显）: %w", err)
+	}
+	cfg.MaxConns = 4
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("db: 建连接池失败: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("db: 连通性检测失败: %w", err)
+	}
+	return &Migrator{pool: pool}, nil
+}
+
+// Close 释放连接池。
+func (m *Migrator) Close() { m.pool.Close() }
+
+// Pool 暴露底层连接池（供 store 复用同一池）。
+func (m *Migrator) Pool() *pgxpool.Pool { return m.pool }
+
+// Applied 读取已应用迁移。
+func (m *Migrator) Applied(ctx context.Context) (map[string]AppliedMigration, error) {
+	if _, err := m.pool.Exec(ctx, ensureLedger); err != nil {
+		return nil, fmt.Errorf("db: 建记账表失败: %w", err)
+	}
+	rows, err := m.pool.Query(ctx, `SELECT version, name, hash, applied_at FROM schema_migrations`)
+	if err != nil {
+		return nil, fmt.Errorf("db: 读取记账表失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]AppliedMigration{}
+	for rows.Next() {
+		var a AppliedMigration
+		if err := rows.Scan(&a.Version, &a.Name, &a.Hash, &a.AppliedAt); err != nil {
+			return nil, fmt.Errorf("db: 扫描记账行失败: %w", err)
+		}
+		out[a.Version] = a
+	}
+	return out, rows.Err()
+}
+
+// DryRun 校验迁移集但**不**执行（供 CI 使用）。
+//
+// 同时检测「已应用迁移被改写」（hash 不一致）——这是最危险的漂移。
+func (m *Migrator) DryRun(ctx context.Context, migs []Migration) (MigrateResult, error) {
+	applied, err := m.Applied(ctx)
+	if err != nil {
+		return MigrateResult{}, err
+	}
+	var res MigrateResult
+	for _, mg := range migs {
+		a, done := applied[mg.Version]
+		if !done {
+			res.Applied = append(res.Applied, mg.Name+"（待应用）")
+			continue
+		}
+		if a.Hash != mg.Hash {
+			return res, fmt.Errorf(
+				"db: 迁移 %s 已被改写（已应用 hash=%s，当前 hash=%s）——拒绝继续，请新增迁移而非改动历史",
+				a.Name, a.Hash[:12], mg.Hash[:12])
+		}
+		res.Skipped = append(res.Skipped, mg.Name)
+	}
+	return res, nil
+}
+
+// Up 应用所有未执行的迁移。每个迁移在独立事务内执行。
+func (m *Migrator) Up(ctx context.Context, migs []Migration) (MigrateResult, error) {
+	applied, err := m.Applied(ctx)
+	if err != nil {
+		return MigrateResult{}, err
+	}
+	var res MigrateResult
+	for _, mg := range migs {
+		if a, done := applied[mg.Version]; done {
+			if a.Hash != mg.Hash {
+				return res, fmt.Errorf(
+					"db: 迁移 %s 已被改写（hash 不一致）——拒绝继续", a.Name)
+			}
+			res.Skipped = append(res.Skipped, mg.Name)
+			continue
+		}
+		if err := m.applyOne(ctx, mg); err != nil {
+			return res, err
+		}
+		res.Applied = append(res.Applied, mg.Name)
+	}
+	return res, nil
+}
+
+// applyOne 在单事务内执行一个迁移并记账。
+func (m *Migrator) applyOne(ctx context.Context, mg Migration) error {
+	tx, err := m.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("db: 开启事务失败: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// 迁移文件自带 BEGIN/COMMIT 时会与外层事务冲突；此处去掉外层包裹语义，
+	// 统一由本函数掌控事务边界。
+	body := stripOuterTx(mg.SQL)
+	if _, err := tx.Exec(ctx, body); err != nil {
+		return fmt.Errorf("db: 应用迁移 %s 失败: %w", mg.Name, err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO schema_migrations (version, name, hash) VALUES ($1,$2,$3)`,
+		mg.Version, mg.Name, mg.Hash); err != nil {
+		return fmt.Errorf("db: 记账迁移 %s 失败: %w", mg.Name, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("db: 提交迁移 %s 失败: %w", mg.Name, err)
+	}
+	return nil
+}
+
+// txEdgeRe 匹配文件首尾的裸 BEGIN;/COMMIT;（大小写不敏感）。
+var txEdgeRe = regexp.MustCompile(`(?im)^\s*(BEGIN|COMMIT)\s*;?\s*$`)
+
+// stripOuterTx 移除迁移文件最外层的 BEGIN/COMMIT，交由 Migrator 统一管理事务。
+func stripOuterTx(sql string) string {
+	return txEdgeRe.ReplaceAllString(sql, "")
+}
+
+// DSNFromEnv 从环境变量取连接串。
+//
+// 约定：SPARK_DB_DSN 优先；否则用 SPARK_PG_* 组装。
+// **绝不**在返回值之外打印口令。
+func DSNFromEnv() (string, error) {
+	if dsn := strings.TrimSpace(os.Getenv("SPARK_DB_DSN")); dsn != "" {
+		return dsn, nil
+	}
+	host := os.Getenv("SPARK_PG_HOST")
+	user := os.Getenv("SPARK_PG_USER")
+	if host == "" || user == "" {
+		return "", errors.New("db: 未配置连接信息（需 SPARK_DB_DSN 或 SPARK_PG_HOST/SPARK_PG_USER）")
+	}
+	port := envOr("SPARK_PG_PORT", "5432")
+	name := envOr("SPARK_PG_DB", "spark_cicada")
+	pass := os.Getenv("SPARK_PG_PASSWORD") // 允许为空（本地 trust）
+	ssl := envOr("SPARK_PG_SSLMODE", "disable")
+	if pass == "" {
+		return fmt.Sprintf("postgres://%s@%s:%s/%s?sslmode=%s", user, host, port, name, ssl), nil
+	}
+	// 口令做 URL 转义，避免特殊字符破坏 DSN 结构
+	return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s",
+		user, urlEscape(pass), host, port, name, ssl), nil
+}
+
+// RedactDSN 把连接串中的口令替换为 ***，供日志/错误展示（G11）。
+func RedactDSN(dsn string) string {
+	re := regexp.MustCompile(`(://[^:/@]+):([^@]*)@`)
+	return re.ReplaceAllString(dsn, "$1:***@")
+}
+
+func envOr(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+// urlEscape 只转义会破坏 DSN 结构的字符（口令用）。
+func urlEscape(s string) string {
+	r := strings.NewReplacer(
+		"%", "%25", ":", "%3A", "/", "%2F", "?", "%3F",
+		"#", "%23", "@", "%40", "[", "%5B", "]", "%5D", " ", "%20",
+	)
+	return r.Replace(s)
+}
+
+// InTx 在事务内运行 fn，出错自动回滚。
+func InTx(ctx context.Context, pool *pgxpool.Pool, fn func(pgx.Tx) error) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}

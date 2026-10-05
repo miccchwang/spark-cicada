@@ -20,7 +20,8 @@ services:
       - "5432:5432"
     volumes:
       - pg_primary:/var/lib/postgresql/data
-      - ./sql/migrations:/docker-entrypoint-initdb.d:ro
+      # 首次启动自动初始化（注意：路径相对 compose 文件所在目录 = deploy/）
+      - ../sql/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U spark -d spark_cicada"]
       interval: 5s
@@ -57,11 +58,12 @@ services:
   # ── Go 编排层 ──
   sparkd:
     build:
-      context: .
+      context: ..
       dockerfile: deploy/Dockerfile.sparkd
     environment:
       SPARK_COMPUTE_BIN: /usr/local/bin/spark-compute
       SPARK_DB_DSN: postgres://spark:spark_local_dev@postgres:5432/spark_cicada?sslmode=disable
+      SPARK_MIGRATIONS_DIR: /opt/spark/sql/migrations
       SPARK_REGION: ap-southeast-1   # 每地域部署一个实例；美区为 us-east-1
     ports:
       - "8080:8080"

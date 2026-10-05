@@ -9,7 +9,8 @@ RUN cd compute && cargo build --release && \
 FROM golang:1.27-slim AS backend
 WORKDIR /src
 COPY backend/ ./backend/
-RUN cd backend && CGO_ENABLED=0 go build -o /sparkd ./cmd/sparkd
+RUN cd backend && CGO_ENABLED=0 go build -o /sparkd ./cmd/sparkd && \
+    CGO_ENABLED=0 go build -o /spark-migrate ./cmd/spark-migrate
 
 # ── Stage 3: 运行镜像（最小化）──
 FROM debian:stable-slim
@@ -19,6 +20,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 RUN useradd -r -u 10001 spark
 COPY --from=compute /spark-compute /usr/local/bin/spark-compute
 COPY --from=backend /sparkd /usr/local/bin/sparkd
+COPY --from=backend /spark-migrate /usr/local/bin/spark-migrate
+# 迁移文件（供 sparkd 启动时幂等应用；sparkd 不会自动跑迁移，需显式调用）
+COPY sql/migrations/ /opt/spark/sql/migrations/
 USER spark
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/sparkd"]

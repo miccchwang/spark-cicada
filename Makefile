@@ -19,7 +19,12 @@ help:
 	@echo "make gate-plugins  插槽与性能（G8/G9）"
 	@echo "make gate-dr       备份与容灾（G12）"
 	@echo "make gate-compute  计算内核自检"
+	@echo "make gate-sql      SQL 迁移静态闸门（append-only/D7/可空/region/无凭据/种子诚实）"
+	@echo "make gate-admin    控制面闸门（G4 解耦 / G5 传播 / G6 局部重算 / G9 挂载 / G10 审计）"
+	@echo "make gate-db       真库集成闸门（需 SPARK_TEST_DB_DSN；未设置则跳过）"
 	@echo "make gate-secret   全仓密钥扫描（gitleaks）"
+	@echo "make migrate-up    应用数据库迁移"
+	@echo "make migrate-dry   迁移校验（不写库）"
 	@echo "make test          全部测试"
 	@echo "make build         构建 Go + Rust"
 
@@ -35,6 +40,21 @@ build-go:
 .PHONY: build-rust
 build-rust:
 	cd compute && $(CARGO) build --release
+
+# ───────────────────────────── 数据库 ─────────────────────────────
+
+# 应用迁移（幂等）。连接串取自 SPARK_DB_DSN 或 SPARK_PG_* 环境变量。
+.PHONY: migrate-up
+migrate-up:
+	cd backend && $(GO) run ./cmd/spark-migrate -dir ../sql/migrations -up
+
+.PHONY: migrate-dry
+migrate-dry:
+	cd backend && $(GO) run ./cmd/spark-migrate -dir ../sql/migrations -dry-run
+
+.PHONY: migrate-status
+migrate-status:
+	cd backend && $(GO) run ./cmd/spark-migrate -dir ../sql/migrations -status
 
 # ───────────────────────────── 测试 ─────────────────────────────
 
@@ -52,7 +72,7 @@ test-rust:
 # ───────────────────────────── 闸门 ─────────────────────────────
 
 .PHONY: gate
-gate: gate-fast gate-auth gate-precomp gate-dr gate-compute
+gate: gate-fast gate-auth gate-precomp gate-plugins gate-dr gate-compute gate-sql gate-admin
 	@echo "ALL GATES PASSED"
 
 # 静态闸门：G1/G4/G11（源码静态扫描 + 前缀密钥扫描）
@@ -63,7 +83,7 @@ gate-fast:
 # 权限闸门：G2/G3/G7/G10
 .PHONY: gate-auth
 gate-auth:
-	cd backend && $(GO) test ./internal/gate/ -run 'TestG2|TestG3|TestG7|TestG10|TestCompute|TestSQL' -v
+	cd backend && $(GO) test ./internal/gate/ -run 'TestG2|TestG3|TestG7|TestG10|TestCompute' -v
 	cd backend && $(GO) test ./internal/authz/ ./internal/chain/ ./internal/api/ ./internal/req/ -v
 
 # 预计算一致性：G5/G6
@@ -81,6 +101,21 @@ gate-plugins:
 .PHONY: gate-dr
 gate-dr:
 	cd backend && $(GO) test ./internal/gate/ -run 'TestG12' -v
+
+# SQL 迁移静态闸门（不依赖数据库）
+.PHONY: gate-sql
+gate-sql:
+	cd backend && $(GO) test ./internal/gate/ -run 'TestSQL' -v
+
+# 控制面闸门（内存 Store，无需真库）
+.PHONY: gate-admin
+gate-admin:
+	cd backend && $(GO) test ./internal/admin/ -v
+
+# 真库集成闸门（未设置 SPARK_TEST_DB_DSN 时自动跳过）
+.PHONY: gate-db
+gate-db:
+	cd backend && $(GO) test ./internal/store/ -run Integration -v
 
 # 计算内核自检（缺失语义 / 覆盖率门控 / 银行家舍入）
 .PHONY: gate-compute

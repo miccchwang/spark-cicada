@@ -1,13 +1,147 @@
 // 装配辅助 —— 把内置的组织/模板/授权数据接到服务上。
 //
-// 生产环境这些数据来自 DB（dim_org / entitlement）；此处提供**最小可运行**夹具，
-// 让 sparkd 能端到端启动并被 /api/me、/api/query 探活。
+// 生产环境这些数据来自 DB（dim_org / fact_entitlement / dim_group）；
+// 未配置 DB 时回退到**内置最小夹具**，让 sparkd 仍可启动被探活。
+//
+// ★ 纪律：DB 缺席时**绝不**伪造业务数据 —— 查询路径会 fail-closed 报错，
+//   而不是返回编造的 0 或空行。
 package main
 
 import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/miccchwang/spark-cicada/backend/internal/admin"
 	"github.com/miccchwang/spark-cicada/backend/internal/authz"
 	"github.com/miccchwang/spark-cicada/backend/internal/chain"
+	"github.com/miccchwang/spark-cicada/backend/internal/db"
+	"github.com/miccchwang/spark-cicada/backend/internal/gate"
+	"github.com/miccchwang/spark-cicada/backend/internal/store"
 )
+
+// dataPlane 打包运行时数据面依赖（可为部分降级）。
+type dataPlane struct {
+	pool     *pgxpool.Pool
+	store    *store.Postgres
+	admin    *admin.Plane
+	registry *gate.Registry
+	org      *chain.OrgDirectory
+	resolver *authz.Resolver
+	ents     func(string) (*authz.Entitlement, []*authz.Entitlement)
+	// dbReady 表示真库已就绪（迁移已应用、注册表已加载）。
+	dbReady bool
+}
+
+// buildDataPlane 尝试连接 DB；失败时**降级**到内置夹具（不阻断启动）。
+//
+// 降级语义：dbReady=false ⇒ 查询接口返回明确错误（fail-closed），
+// /api/me 与 /healthz 仍可用（便于排障）。
+func buildDataPlane(ctx context.Context) *dataPlane {
+	p := &dataPlane{
+		org:      buildOrgDirectory(),
+		resolver: authz.NewResolver(builtinTemplates()),
+		ents:     buildEntitlementSource(),
+		// 模块注册表：初始可用能力（后续可由控制面动态调整）
+		registry: gate.NewRegistry([]string{
+			"cap.core", "slot.revenue", "slot.cogs", "slot.platform_fee", "slot.inventory_snap",
+		}),
+	}
+
+	dsn, err := db.DSNFromEnv()
+	if err != nil {
+		log.Printf("[warn] 未配置数据库（%v）—— 数据面降级：/api/query 将 fail-closed", err)
+		return p
+	}
+
+	m, err := db.NewMigrator(ctx, dsn)
+	if err != nil {
+		log.Printf("[warn] 数据库连接失败（%s）：%v —— 降级运行",
+			db.RedactDSN(dsn), err)
+		return p
+	}
+	pool := m.Pool()
+	p.pool = pool
+
+	// ── 应用迁移（幂等）──
+	migDir := envOr("SPARK_MIGRATIONS_DIR", "../sql/migrations")
+	migs, err := db.LoadMigrations(migDir)
+	if err != nil {
+		log.Printf("[warn] 加载迁移失败（%s）：%v —— 降级运行", migDir, err)
+		return p
+	}
+	res, err := m.Up(ctx, migs)
+	if err != nil {
+		log.Printf("[warn] 应用迁移失败：%v —— 降级运行", err)
+		return p
+	}
+	if len(res.Applied) > 0 {
+		log.Printf("[db] 本次应用迁移 %d 个：%v", len(res.Applied), res.Applied)
+	}
+	log.Printf("[db] 数据库就绪（%s）", db.RedactDSN(dsn))
+
+	// ── 构造数据面组件 ──
+	p.store = store.New(pool)
+	adminStore := store.NewAdmin(pool)
+	p.admin = admin.New(adminStore, adminStore.AuditSink())
+	p.admin.Registry = p.registry
+	p.dbReady = true
+	return p
+}
+
+// startupGateChecks 真库的启动自检（G6 漂移 + 注册表一致性）。
+//
+// 只有真库就绪时才执行；返回错误 ⇒ 拒绝启动（fail-closed）。
+func (p *dataPlane) startupGateChecks(ctx context.Context) error {
+	if !p.dbReady {
+		return nil // 降级模式不阻断启动
+	}
+	// 桶版本 vs 注册表算法版本（G6）
+	meta, err := p.store.BucketState(ctx, "pnl_month")
+	if err != nil {
+		return fmt.Errorf("读桶状态失败：%w", err)
+	}
+	if meta.State == "UNREGISTERED" {
+		// 未注册的桶是**配置缺陷**，但不应阻止进程启动（可能正在初始化）；
+		// 查询侧已 fail-closed，此处仅告警。
+		log.Printf("[warn] 桶 pnl_month 未注册 —— 查询将被拒绝（请检查迁移 0004）")
+		return nil
+	}
+	// 从注册表读当前算法版本，与桶内记录比对
+	current, err := p.currentAlgoVersions(ctx, "pnl_month")
+	if err != nil {
+		return err
+	}
+	drift := gate.VersionDrift(meta.AlgoVersions, current)
+	if len(drift) > 0 {
+		log.Printf("[warn] 桶版本漂移（G6）：%v —— 该桶应重算后使用（查询侧会拒绝 STALE 桶）", drift)
+	}
+	if meta.State != "FRESH" {
+		log.Printf("[warn] 桶 pnl_month 状态=%s（非 FRESH）—— 查询将被 fail-closed 拒绝", meta.State)
+	}
+	return nil
+}
+
+// currentAlgoVersions 汇总注册表中产出该桶的算法版本。
+func (p *dataPlane) currentAlgoVersions(ctx context.Context, bucket string) (map[string]int, error) {
+	if p.admin == nil {
+		return map[string]int{}, nil
+	}
+	ov, err := p.admin.Snapshot(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("读注册表失败：%w", err)
+	}
+	out := map[string]int{}
+	for _, a := range ov.Algorithms {
+		if a.WritesBucket == bucket {
+			out[a.ID] = a.Version
+		}
+	}
+	return out, nil
+}
 
 // buildOrgDirectory 构造演示组织架构（F9=A 单主属）。
 func buildOrgDirectory() *chain.OrgDirectory {
@@ -29,7 +163,7 @@ func buildOrgDirectory() *chain.OrgDirectory {
 	return d
 }
 
-// builtinTemplates 内置账号模板。
+// builtinTemplates 内置账号模板（DB 缺席时的兜底）。
 //
 // 注意：模板**不含** canViewBusinessValues 的置真逻辑 —— D7 由 Resolver 兜底。
 func builtinTemplates() map[string]*authz.Entitlement {
@@ -51,16 +185,16 @@ func builtinTemplates() map[string]*authz.Entitlement {
 		},
 		// IT：只给运维模块，**不给**业务数值（D7）
 		"tpl.it": {
-			Account:  "tpl.it",
-			Modules:  authz.ModuleGrant{Enabled: []string{"m.ops"}},
-			MaxLevel: authz.L2,
+			Account:    "tpl.it",
+			Modules:    authz.ModuleGrant{Enabled: []string{"m.ops"}},
+			MaxLevel:   authz.L2,
 			Dimensions: []authz.DimensionGrant{{Dim: "brand"}},
 			// 不设 CanViewBusinessValues
 		},
 	}
 }
 
-// buildEntitlementSource 返回账号 → 授权 的查询函数。
+// buildEntitlementSource 返回账号 → 授权 的查询函数（DB 缺席时的兜底）。
 func buildEntitlementSource() func(string) (*authz.Entitlement, []*authz.Entitlement) {
 	accounts := map[string]string{
 		"ceo":      "tpl.lead",
@@ -80,4 +214,12 @@ func buildEntitlementSource() func(string) (*authz.Entitlement, []*authz.Entitle
 			BaseTemplate: tpl,
 		}, nil // 分组授权（groupGrants）由 DB 提供；此处为空
 	}
+}
+
+// envOr 读取环境变量（带默认值）。
+func envOr(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
 }

@@ -50,14 +50,26 @@ func main() {
 		return
 	}
 
+	// ── 数据面装配（DB 可选；缺席则降级为 fail-closed）──
+	dp := buildDataPlane(context.Background())
+	if err := dp.startupGateChecks(context.Background()); err != nil {
+		log.Fatalf("数据面自检失败（fail-closed，拒绝启动）：%v", err)
+	}
+
 	// ── 装配 ──
-	org := buildOrgDirectory()
-	resolver := authz.NewResolver(builtinTemplates())
-	ents := buildEntitlementSource()
+	org := dp.org
+	resolver := dp.resolver
+	ents := dp.ents
 	reqSvc := req.NewService(org, resolver, ents)
 
+	// Store：真库就绪则接 Postgres；否则 nil（查询明确报错，不伪造数据）
+	var qStore query.Store
+	if dp.dbReady {
+		qStore = dp.store
+	}
+
 	orch := &query.Orchestrator{
-		Store:  nil, // 生产接 DB；未配置 ⇒ 查询返回错误（fail-closed）
+		Store:  qStore,
 		Cache:  nil,
 		Kernel: kernel,
 		Policy: query.Policy{
@@ -74,8 +86,8 @@ func main() {
 		Resolve: func(account string) *authz.EntitlementView { return resolveFor(resolver, ents, account) },
 		Policy: api.FieldPolicy{
 			FieldLevel: map[string]authz.Level{
-				"gp":    authz.L3,
-				"cogs":  authz.L3,
+				"gp":          authz.L3,
+				"cogs":        authz.L3,
 				"net_contrib": authz.L4,
 			},
 			FieldGroup: map[string]authz.DataUseGroup{
@@ -105,13 +117,21 @@ func main() {
 	mux.HandleFunc("/api/query", srv.QueryHandler())
 	mux.HandleFunc("/api/me", srv.MeHandler())
 	mux.HandleFunc("/api/request", requestHandler(reqSvc))
+	mux.HandleFunc("/api/admin/overview", adminOverviewHandler(dp))
+	mux.HandleFunc("/api/admin/slots", adminSlotHandler(dp))
+	mux.HandleFunc("/api/admin/algorithms", adminAlgoHandler(dp))
+	mux.HandleFunc("/api/admin/modules", adminModulesHandler(dp))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		v, err := kernel.Health(r.Context())
 		if err != nil {
 			http.Error(w, "kernel unhealthy: "+err.Error(), http.StatusServiceUnavailable)
 			return
 		}
-		writeJSON(w, map[string]any{"ok": true, "kernel": v})
+		writeJSON(w, map[string]any{
+			"ok":     true,
+			"kernel": v,
+			"db":     dp.dbReady, // 显式暴露数据面状态（降级时可观测）
+		})
 	})
 
 	httpSrv := &http.Server{
@@ -130,7 +150,7 @@ func main() {
 		_ = httpSrv.Shutdown(ctx)
 	}()
 
-	log.Printf("sparkd listening on %s (compute kernel: %s)", *addr, *computeBin)
+	log.Printf("sparkd listening on %s (compute kernel: %s, db: %v)", *addr, *computeBin, dp.dbReady)
 	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http server: %v", err)
 	}
@@ -216,11 +236,4 @@ func requestHandler(svc *req.Service) http.HandlerFunc {
 			"ccs":        reqObj.CCs,
 		})
 	}
-}
-
-func envOr(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
 }
