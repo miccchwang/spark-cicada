@@ -100,6 +100,18 @@ jobs:
         working-directory: backend
         run: go test ./internal/slot/ -count=1 -v
 
+      # ★ 桶注册表闸门（G4 引用完整性的**反向**：桶 → 算法）
+      #   buckets/*.yaml 的 produced_by 在此之前**全仓没有任何代码读过** ——
+      #   pnl_month.yaml 可以列出 algo.rev / algo.net_rev / algo.platform_fee 等
+      #   在 algorithms/ 下**并不存在**的算法而不报错。后果不是「少一条断言」，
+      #   而是 G6 的 AffectedBuckets（算法升级后要重算哪些桶）**静默漏算**。
+      #   bucket_test.go 从 LoadBucketRegistry 入口进、以加载成功/失败出，
+      #   并用静态扫描钉住 gate.CheckBucketProducersRegistered 有非测试调用点。
+      #   已实测抓到真缺陷：pnl_month 的 produced_by 含 4 个幽灵算法。
+      - name: ★ 桶注册表闸门（G4 反向引用完整性：桶→算法）
+        working-directory: backend
+        run: go test ./internal/slot/ -count=1 -run "Bucket" -v
+
       - name: 控制面闸门
         working-directory: backend
         run: go test ./internal/admin/ -count=1 -v

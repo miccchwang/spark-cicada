@@ -130,6 +130,16 @@ func (r *Registry) RegisteredSlotIDs() map[string]bool {
 	return out
 }
 
+// RegisteredAlgorithmIDs 返回「已注册算法」集合，供 gate.CheckBucketProducersRegistered
+// 做**桶 → 算法**这一侧的引用完整性（G4 反向）。
+func (r *Registry) RegisteredAlgorithmIDs() map[string]bool {
+	out := make(map[string]bool, len(r.algos))
+	for id := range r.algos {
+		out[id] = true
+	}
+	return out
+}
+
 // AlgoDocs 把算法翻成 gate.AlgoDoc（Raw 原样带上 ⇒ G4 能真扫数据源字段）。
 func (r *Registry) AlgoDocs() []gate.AlgoDoc {
 	algos := r.Algorithms()

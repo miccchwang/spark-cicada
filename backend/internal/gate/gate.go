@@ -148,6 +148,50 @@ func CheckSlotsRegistered(docs []AlgoDoc, registered map[string]bool) []string {
 	return violations
 }
 
+// BucketDoc 是桶 YAML 的解析产物（最小字段集，对应 buckets/*.yaml）。
+type BucketDoc struct {
+	ID            string
+	ProducedBy    []string
+	AlgoVersions  map[string]int
+	Grain         []string
+	Refresh       string
+}
+
+// CheckBucketProducersRegistered 断言桶的 produced_by 引用的算法均已注册（G4 引用完整性的**反向**）。
+//
+// 为什么需要这条：G4 原有的 CheckSlotsRegistered 只查「算法 → 槽」这一侧；
+// 而「**桶 → 算法**」这一侧在此之前**全仓没有任何校验、也没有任何生产调用点**
+// （`buckets/*.yaml` 从来没有被读过）。后果是 `pnl_month.yaml` 的 produced_by
+// 可以列一串**根本不存在的算法**而不报错，进而让 G6 的
+// `AffectedBuckets`（算法升级后要重算哪些桶）静默漏算。
+func CheckBucketProducersRegistered(docs []BucketDoc, registeredAlgos map[string]bool) []string {
+	var violations []string
+	for _, d := range docs {
+		if len(d.ProducedBy) == 0 {
+			violations = append(violations, fmt.Sprintf(
+				"桶 %s 的 produced_by 为空（该桶永远不会被算法升级触发重算）", d.ID))
+		}
+		for _, a := range d.ProducedBy {
+			if strings.TrimSpace(a) == "" {
+				violations = append(violations, fmt.Sprintf("桶 %s 的 produced_by 含空项", d.ID))
+				continue
+			}
+			if !registeredAlgos[a] {
+				violations = append(violations, fmt.Sprintf(
+					"桶 %s 引用未注册算法 %q（G6『仅重算受影响桶』将漏算）", d.ID, a))
+			}
+		}
+		// algo_versions 的键同为算法 ID：拼错不会报错，只会让版本漂移检测对该算法恒不生效。
+		for a := range d.AlgoVersions {
+			if !registeredAlgos[a] {
+				violations = append(violations, fmt.Sprintf(
+					"桶 %s 的 algo_versions 含未注册算法 %q（版本漂移检测对该算法恒不生效）", d.ID, a))
+			}
+		}
+	}
+	return violations
+}
+
 // ───────────────────────────── G5 · 覆盖率门控 ─────────────────────────────
 
 // CoverageCase 覆盖率门控的判定输入。

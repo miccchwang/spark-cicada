@@ -9,6 +9,8 @@ depends_on_slots:
   - slot.platform_fee
   - slot.ad_spend
   - slot.affiliate
+  - slot.shipping
+  - slot.mkt_expense
 writes_bucket: pnl_month
 missing_policy: skip
 trace: true

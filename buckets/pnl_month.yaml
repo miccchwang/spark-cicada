@@ -2,18 +2,29 @@
 # 预计算桶：把法则落在 DB 物化，请求时只读不算。
 id: pnl_month
 grain: [month, channel_code, shop_id, brand]
+# ★ 2026-10-07 修正：原 produced_by 列了 7 个算法，其中 4 个（algo.rev / algo.net_rev /
+#   algo.platform_fee / algo.net_contrib）在 algorithms/ 下**并不存在**。
+#   幽灵引用会让 G6「算法升级后仅重算受影响桶」漏算，且此前全仓没有任何代码读这份定义
+#   （唯一的 "produced_by" 命中是 store/admin.go 的一条 INSERT 列名，不是读定义）。
+#   权威来源是 algorithms/ 目录本身（口径①单一事实源）。
 produced_by:
-  - algo.rev
-  - algo.cogs
-  - algo.gp
-  - algo.gmp
-  - algo.net_rev
-  - algo.platform_fee
-  - algo.net_contrib
+  - algo.cogs            # algorithms/cogs.yaml  ✅ 真存在（v3）
+  - algo.gp              # algorithms/gp.yaml    ✅ 真存在（v3）
+  - algo.gmp             # algorithms/gmp.yaml   ✅ 真存在（v3）
+  - algo.net_contrib     # algorithms/net_contrib.yaml ✅ 真存在（v1）
+  # ── ★ 在 algorithms/ 下缺失、已从本清单**移除**（否则引用完整性校验失败）──
+  #   如需恢复，须先在 algorithms/ 下补出对应 YAML（公式与依赖槽见 docs/03 §3.2）：
+  #     - algo.rev          收入 Σ(qty×unit_price)                     依赖 slot.qty slot.revenue
+  #     - algo.net_revenue  净收入 gross_listing-seller_disc-platform_disc 依赖 slot.revenue
+  #     - algo.platform_fee 平台费用 按规则集逐项计提                   依赖 slot.platform_fee
+  #     - algo.marketing    营销费用 ads+affiliate+sample               依赖 slot.ad_spend slot.affiliate
+  #   注意：docs/03 §3.2 的算法表列了 16 个算法，而 algorithms/ 下只有 4 个 YAML ——
+  #   即**文档表比实现多出 12 个算法定义**，属文档 vs 实现的漂移，需另行收口。
 refresh: monthly_incremental
 algo_versions:
   algo.gp: 3
   algo.gmp: 3
+  algo.cogs: 3
   algo.net_contrib: 1
 indexes:
   - [month]
