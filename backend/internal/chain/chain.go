@@ -180,6 +180,12 @@ type CcRecord struct {
 	NotifiedAt time.Time
 	// 会签模式下：是否否决（F8）
 	Vetoed bool
+	// 会签模式下：表态时间。
+	//
+	// ★ 为什么必须有这个字段：只有 `Vetoed` 时无法区分
+	//   「会签人**尚未**表态」与「会签人**已同意**」—— 两者 Vetoed 都是 false。
+	//   而「尚未表态」时**不得放行**（否则会签形同虚设）。nil = 未表态。
+	DecidedAt *time.Time
 }
 
 // ApprovalChain 审批链（+1 审批 / +2 抄送）。

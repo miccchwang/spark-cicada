@@ -13,6 +13,7 @@ package req
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/miccchwang/spark-cicada/backend/internal/authz"
@@ -230,15 +231,29 @@ func (s *Service) Submit(r *Request, dataChain *chain.DataChain) (*Validation, e
 }
 
 // Approve 审批通过：写入授权（由调用方落库）并置 APPROVED。
+//
+// ★ 会签纪律（F8）：只要存在 **cosign 模式且尚未决策** 的抄送人，
+// 就**不得**通过 —— 否则「会签」等同虚设（等于默认知会）。
+// 曾经的实现只在 `cc.Vetoed` 为真时拒绝，看起来对，实则漏了
+// 「会签人还没表态」这一最常见的情形：那时 vetoed=false，于是一路放行。
 func (s *Service) Approve(r *Request, approver, reason string) error {
 	if r.Status != StatusApproving && r.Status != StatusCosignPending {
 		return fmt.Errorf("req: cannot approve in status %s", r.Status)
 	}
-	// 会签未决前不得通过
+	// 会签未决 ⇒ 不得通过；已否决 ⇒ 直接驳回。
 	for _, cc := range r.CCs {
-		if cc.Mode == chain.CcCosign && cc.Vetoed {
+		if cc.Mode != chain.CcCosign {
+			continue
+		}
+		if cc.Vetoed {
 			r.Status = StatusRejected
+			now := s.now()
+			r.ResolvedAt = &now
 			return errors.New("req: vetoed by cosigner")
+		}
+		if cc.DecidedAt == nil {
+			r.Status = StatusCosignPending
+			return fmt.Errorf("req: cosign pending for %s —— 会签人未表态前不得通过（F8）", cc.Cc)
 		}
 	}
 	now := s.now()
@@ -252,6 +267,100 @@ func (s *Service) Approve(r *Request, approver, reason string) error {
 	r.Status = StatusApproved
 	r.ResolvedAt = &now
 	return nil
+}
+
+// Cosign 会签人表态：approve=true 记决策；approve=false 即否决（驳回）。
+//
+// 仅 cosign 模式可会签 —— notify（知会）模式的抄送人**无决定权**，
+// 传入会返回错误，避免「知会」被误当成「会签」使用。
+func (s *Service) Cosign(r *Request, ccAccount string, approve bool, reason string) error {
+	now := s.now()
+	found := false
+	for i := range r.CCs {
+		cc := &r.CCs[i]
+		if cc.Cc != ccAccount {
+			continue
+		}
+		found = true
+		if cc.Mode != chain.CcCosign {
+			return fmt.Errorf("req: %s 是知会（notify）而非会签，无决定权（F8）", ccAccount)
+		}
+		cc.DecidedAt = &now
+		cc.Vetoed = !approve
+		if !approve {
+			r.Status = StatusRejected
+			r.ResolvedAt = &now
+			_ = reason
+			return nil
+		}
+	}
+	if !found {
+		return fmt.Errorf("req: %s 不在本申请的抄送名单中", ccAccount)
+	}
+	// 全部会签人已表态 ⇒ 由 COSIGN_PENDING 回到 APPROVING，等待 +1 最终批准
+	if r.Status == StatusCosignPending {
+		if s.AllCosignsDecided(r) {
+			r.Status = StatusApproving
+		}
+	}
+	return nil
+}
+
+// AllCosignsDecided 判断所有 cosign 抄送人是否均已表态。
+func (s *Service) AllCosignsDecided(r *Request) bool {
+	for _, cc := range r.CCs {
+		if cc.Mode == chain.CcCosign && cc.DecidedAt == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// Withdraw 申请人撤回（仅在其自身申请且尚未终结时允许）。
+func (s *Service) Withdraw(r *Request, by string) error {
+	if by != r.Applicant {
+		return errors.New("req: 只有申请人本人可以撤回")
+	}
+	switch r.Status {
+	case StatusApproved, StatusRejected, StatusWithdrawn:
+		return fmt.Errorf("req: 已终结（%s）的申请不可撤回", r.Status)
+	}
+	now := s.now()
+	r.Status = StatusWithdrawn
+	r.ResolvedAt = &now
+	return nil
+}
+
+// Reject 审批人拒绝。
+func (s *Service) Reject(r *Request, approver, reason string) error {
+	if r.Status != StatusApproving && r.Status != StatusCosignPending {
+		return fmt.Errorf("req: cannot reject in status %s", r.Status)
+	}
+	now := s.now()
+	for i := range r.Approvals {
+		if r.Approvals[i].Approver == approver {
+			r.Approvals[i].Action = "REJECT"
+			r.Approvals[i].Reason = reason
+			r.Approvals[i].At = now
+		}
+	}
+	r.Status = StatusRejected
+	r.ResolvedAt = &now
+	return nil
+}
+
+// Reclaim 到期回收判定：返回 true 表示该申请携带的授权应被回收。
+//
+// 时间盒纪律：长期申请（RequestedExpiry=nil）不回收；到期即回收。
+// 调用方据此写回 Entitlement 并落审计。
+func (s *Service) Reclaim(r *Request) bool {
+	if r == nil || r.Status != StatusApproved {
+		return false
+	}
+	if r.RequestedExpiry == nil {
+		return false
+	}
+	return !s.now().Before(*r.RequestedExpiry)
 }
 
 func (s *Service) now() time.Time {
@@ -323,6 +432,11 @@ func levelRank(l authz.Level) int {
 	return 0
 }
 
+// isIT 判断基础模板是否为 IT 模板（D7 的判定入口）。
+//
+// ★ 必须按「层级段」比较，不能用前缀裸比：`tpl.item` 的前 6 字符同样是
+// `tpl.it`，裸前缀会把「物料」模板误判成 IT，从而错误地禁掉一整批人。
+// 规则：恰好等于 `tpl.it`，或以 `tpl.it.` 开头（允许 tpl.it.v2 这类版本）。
 func isIT(tpl string) bool {
-	return tpl == "tpl.it" || (len(tpl) > 7 && tpl[:7] == "tpl.it")
+	return tpl == "tpl.it" || strings.HasPrefix(tpl, "tpl.it.")
 }
