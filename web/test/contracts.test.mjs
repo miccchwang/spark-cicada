@@ -34,6 +34,7 @@ function interfaceFields(src, name) {
 const PAIRS = [
   { dir: "query-state", ifaces: ["TimeRange", "FilterClause", "DimSelection", "OrderClause", "PageClause", "PrecomputeHint", "QueryState"] },
   { dir: "data-contract", ifaces: ["ColumnDef", "LevelSummary", "AlgoTrace", "DataGap", "DataContract"] },
+  { dir: "view-template", ifaces: ["ViewTemplate", "ColumnPref", "LayoutPref"] },
 ];
 
 for (const { dir, ifaces } of PAIRS) {
@@ -66,4 +67,10 @@ test("契约版本号一致", () => {
   const dvTruth = dTruth.match(/DATA_CONTRACT_VERSION\s*=\s*"([^"]+)"/)?.[1];
   const dvMirror = dMirror.match(/DATA_CONTRACT_VERSION\s*=\s*"([^"]+)"/)?.[1];
   assert.equal(dvMirror, dvTruth, "DataContract 版本号漂移");
+
+  const tTruth = readFileSync(join(REPO, "contracts", "view-template.ts"), "utf8");
+  const tMirror = readFileSync(join(WEB, "src", "contracts", "view-template.ts"), "utf8");
+  const tvTruth = tTruth.match(/VIEW_TEMPLATE_VERSION\s*=\s*"([^"]+)"/)?.[1];
+  const tvMirror = tMirror.match(/VIEW_TEMPLATE_VERSION\s*=\s*"([^"]+)"/)?.[1];
+  assert.equal(tvMirror, tvTruth, "ViewTemplate 版本号漂移");
 });

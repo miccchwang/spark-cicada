@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -20,7 +21,9 @@ import (
 	"github.com/miccchwang/spark-cicada/backend/internal/chain"
 	"github.com/miccchwang/spark-cicada/backend/internal/db"
 	"github.com/miccchwang/spark-cicada/backend/internal/gate"
+	"github.com/miccchwang/spark-cicada/backend/internal/groupstore"
 	"github.com/miccchwang/spark-cicada/backend/internal/store"
+	"github.com/miccchwang/spark-cicada/backend/internal/templatestore"
 )
 
 // dataPlane 打包运行时数据面依赖（可为部分降级）。
@@ -32,6 +35,10 @@ type dataPlane struct {
 	org      *chain.OrgDirectory
 	resolver *authz.Resolver
 	ents     func(string) (*authz.Entitlement, []*authz.Entitlement)
+	// groups / templates：M-GROUP/M-REQ 与 M-TEMPLATE 的持久化入口。
+	// nil 表示库未就绪（对应接口按 503 fail-closed，不返回编造数据）。
+	groups    *groupstore.Store
+	templates *templatestore.Store
 	// dbReady 表示真库已就绪（迁移已应用、注册表已加载）。
 	dbReady bool
 	// dbDegradeReason 在 dbReady=false 时说明**为什么**降级。
@@ -108,6 +115,9 @@ func buildDataPlane(ctx context.Context) *dataPlane {
 	adminStore := store.NewAdmin(pool)
 	p.admin = admin.New(adminStore, adminStore.AuditSink())
 	p.admin.Registry = p.registry
+	// M-GROUP/M-REQ 与 M-TEMPLATE 的持久化（与 store 同池）
+	p.groups = groupstore.New(pool)
+	p.templates = templatestore.New(pool)
 	p.dbReady = true
 	return p
 }
@@ -242,4 +252,100 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// ───────────────────────────── 管理员 / 主管判定 ─────────────────────────────
+
+// isAdminFunc 返回「某账号是否具备全局管理权限」的判定函数。
+//
+// ★ 判定依据刻意做成**可注入的一处**（而不是散落在各 handler）：
+//   M-GROUP 的组管理、M-TEMPLATE 的模板管理都要用它；
+//   若两处各写一份，迟早出现「组管理认他是管理员、模板管理不认」的错位，
+//   而这类错位在权限系统里就是权限漏洞。
+//
+// 依据（按优先级）：
+//  1. 模板基座为 IT（tpl.it*）—— IT 承担平台治理，但**看不到业务数值**（D7）。
+//  2. 授权里显式启用了 m.admin 模块。
+//
+// 数据面就绪时走真库（fact_entitlement），否则回退到内置夹具。
+func (p *dataPlane) isAdminFunc() func(string) bool {
+	return func(account string) bool {
+		if account == "" {
+			return false
+		}
+		// ① 基座为 IT ⇒ 平台治理者（D7：仍看不到业务数值）
+		if p.baseTemplateOf(account) != "" && isITBase(p.baseTemplateOf(account)) {
+			return true
+		}
+		// ② 授权里显式启用 m.admin 模块
+		if p.dbReady && p.resolver != nil && p.ents != nil {
+			view := resolveFor(p.resolver, p.ents, account)
+			if view != nil {
+				for _, m := range view.Modules {
+					if m == "m.admin" {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+}
+
+// baseTemplateOf 取某账号的基座模板 id。
+//
+// ★ 从**授权来源**取（authoritative），不从求值后的视图取 ——
+//   视图里不保留 BaseTemplate 字段（它只有展开后的模块/维度）。
+//   数据面就绪时查库，否则回退内置夹具。
+func (p *dataPlane) baseTemplateOf(account string) string {
+	if account == "" {
+		return ""
+	}
+	if p.dbReady && p.pool != nil {
+		var tpl *string
+		err := p.pool.QueryRow(context.Background(),
+			`SELECT base_template FROM fact_entitlement WHERE account = $1`, account).Scan(&tpl)
+		if err == nil && tpl != nil {
+			return *tpl
+		}
+		return ""
+	}
+	ent, _ := buildEntitlementSource()(account)
+	if ent == nil {
+		return ""
+	}
+	return ent.BaseTemplate
+}
+
+// isSupervisorFunc 返回「某账号是否主管及以上」的判定函数。
+//
+// ★ 「主管及以上」= 组织链路（D9）里**有人向他汇报**。
+//   数据面就绪时按 dim_org.supervisor 反查（存在直接下属即为主管）。
+//
+// ★ 库未就绪时**保守返回 false**：
+//   「不知道谁是主管」绝不能退化成「所有人都是主管」——
+//   那会让任何用户都能创建团队档模板（对全部门可见），属于提权。
+func (p *dataPlane) isSupervisorFunc() func(string) bool {
+	return func(account string) bool {
+		if account == "" || !p.dbReady || p.pool == nil {
+			return false
+		}
+		var n int
+		err := p.pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM dim_org WHERE supervisor = $1 LIMIT 1`, account).Scan(&n)
+		if err != nil {
+			// 查询失败也保守拒绝（fail-closed）
+			return false
+		}
+		return n > 0
+	}
+}
+
+// isITBase 判断模板基座是否属于 IT（tpl.it 或 tpl.it.*）。
+//
+// ★ 用前缀 + 边界判断而非 `strings.HasPrefix(tpl, "tpl.it")`：
+//   后者会误把 `tpl.item` 也当成 IT —— 这是历史上已修过一次的同类 bug
+//   （见 internal/req/req.go 的 isIT 注释）。
+func isITBase(tpl string) bool {
+	return tpl == "tpl.it" || strings.HasPrefix(tpl, "tpl.it.")
 }

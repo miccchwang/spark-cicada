@@ -121,6 +121,31 @@ func main() {
 	mux.HandleFunc("/api/admin/slots", adminSlotHandler(dp))
 	mux.HandleFunc("/api/admin/algorithms", adminAlgoHandler(dp))
 	mux.HandleFunc("/api/admin/modules", adminModulesHandler(dp))
+
+	// ── M-GROUP / M-REQ（组授权 + 申请流）与 M-TEMPLATE（模板中心）──
+	//
+	// ★ 二者共用同一套「管理员判定」，注入同一个 isAdmin 函数 ——
+	//   若两处各写一份判断，迟早出现「组管理认他是管理员、模板管理不认」的错位。
+	//
+	// ★ 库未就绪时不注册这些路由 ⇒ 由兜底路由返回 404/503，
+	//   而不是挂一个「查不到库所以返回空」的假实现（那才是真正危险）。
+	if dp.dbReady {
+		isAdmin := dp.isAdminFunc()
+		groupsH := &api.GroupHandlers{
+			Svc:     dp.groups,
+			Req:     reqSvc,
+			IsAdmin: isAdmin,
+		}
+		groupsH.Routes(mux)
+
+		tplH := &api.TemplateHandlers{
+			Svc:          dp.templates,
+			IsAdmin:      isAdmin,
+			IsSupervisor: dp.isSupervisorFunc(),
+		}
+		tplH.Routes(mux)
+	}
+
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		v, err := kernel.Health(r.Context())
 		if err != nil {
