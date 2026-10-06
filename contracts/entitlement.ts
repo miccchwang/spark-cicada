@@ -111,6 +111,14 @@ export interface GroupScopeGrant {
   maxLevel: Level;
   /** 组依赖是否已满足（grp.roi 需 cost_profit + inventory） */
   dependenciesMet?: boolean;
+  /** 本组可见的模块子集（渲染层据此裁边；空 = 不限） */
+  scopedModules?: string[];
+  /**
+   * 组内密级上限（四组各自独立）。
+   * ★ 这是「勾选组」区别于「模块开关」的关键：同一账号里
+   *   运营数据可以是 L2，而投资与回报只是 L1。空 = 沿用账号 maxLevel。
+   */
+  scopedLevel?: Level;
 }
 
 /** 构选组依赖表：key 依赖 value 中的组 */
@@ -140,6 +148,19 @@ export interface GrantRecord {
   at: string;
   /** 关联的申请单 ID（origin = REQUEST_APPROVED 时） */
   requestId?: string;
+  /** 本来源实际生效的模块（回收时据此精确对账） */
+  moduleIds?: string[];
+  /** 本来源带来的勾选组（回收时判定「组是否本单独有」） */
+  groupIds?: string[];
+  /**
+   * 本来源自身的时间盒（RFC3339）。空 = 长期有效，永不到期。
+   * ★ 这是「到期自动回收」的唯一事实来源：求值层直接据此判活，
+   *   回收器无需另建索引。不可解析的时间戳一律按**已过期**处理（fail-closed）。
+   */
+  expiresAt?: string;
+  /** 已被到期回收（记录保留，满足全链路可审计） */
+  reclaimed?: boolean;
+  reclaimedAt?: string;
 }
 
 /** 权限求值结果（供渲染层与后端共用） */
@@ -149,6 +170,10 @@ export interface EntitlementView {
   dimensions: Record<string, string[]>;
   maxLevel: Level;
   canViewBusinessValues: boolean;
+  /** 四个勾选组（求值后存活的组） */
+  dataUseGroups: DataUseGroup[];
+  /** 各勾选组的组级限定（仅含确实声明了限定的组） */
+  groupScopes?: GroupScopeGrant[];
   /** 命中来源，便于审计与排障 */
   source: {
     fromTemplate: string[];
@@ -158,6 +183,12 @@ export interface EntitlementView {
     fromDelegations: string[];
     fromTemp: string[];
     deniedBy: string[];
+    /**
+     * 已过时间盒、本次**不再生效**的授权来源（带 `[expired]` / `[reclaimed]` 标记）。
+     * 与 deniedBy 分开：被 DENY 是「不允许」，过期是「曾经允许、现已失效」——
+     * 两者在排障时的处置完全不同，混在一起会误导追责。
+     */
+    expiredGrants: string[];
   };
 }
 

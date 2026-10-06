@@ -28,7 +28,6 @@ package req
 import (
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/miccchwang/spark-cicada/backend/internal/authz"
@@ -42,6 +41,12 @@ var ErrAlreadyApplied = errors.New("req: 该申请已生效，跳过重复生效
 
 // ErrITCannotActivate —— IT 账号不得因申请获得业务数值权限（D7）。
 var ErrITCannotActivate = errors.New("req: IT 账号不可因申请获得业务数值（D7）")
+
+// ErrNotApplied —— 该申请从未生效过，无可回收（回收必须幂等且不误伤）。
+var ErrNotApplied = errors.New("req: 该申请未生效过，无可回收")
+
+// ErrNotReclaimable —— 不满足回收条件（未到期 / 长期申请）。
+var ErrNotReclaimable = errors.New("req: 未到回收条件")
 
 // Activate 把一份**已批准**的申请合并进目标账号的授权。
 //
@@ -95,7 +100,10 @@ func Activate(r *Request, target *authz.Entitlement, now time.Time) error {
 	// 密级：取更宽松者（并集语义）。安全由「审批人自身覆盖」在上游把关。
 	target.MaxLevel = authz.MaxLevel(target.MaxLevel, d.MaxLevel)
 
-	// ── 纪律 4：来源可溯 ──
+	// ── 纪律 4：来源可溯 + 时间盒 ──
+	// 来源记录**自带到期时间** —— 这是「到期回收」能落地的前提：
+	// 若来源记录里没有 ExpiresAt，回收器查不到任何到期信息，
+	// 「到期自动回收」就会像此前的「自动开通」一样恒真（永远「没漏收」）。
 	grantedBy := r.ApproverAccount()
 	if grantedBy == "" {
 		grantedBy = "system"
@@ -105,114 +113,42 @@ func Activate(r *Request, target *authz.Entitlement, now time.Time) error {
 		GrantedBy: grantedBy,
 		At:        now.UTC().Format(time.RFC3339),
 		RequestID: r.ID,
+		ExpiresAt: expiryOf(r),
+		ModuleIDs: append([]string(nil), effectiveModules(d, target)...),
+		GroupIDs:  groupIDsOf(d),
 	})
 	return nil
 }
 
-// ApproverAccount 返回实际作出批准决定的审批人账号（用于来源记录）。
-//
-// 取「最后一条 Action == APPROVE 的步骤」；没有则退回第一条具名审批人。
-func (r *Request) ApproverAccount() string {
-	if r == nil {
-		return ""
-	}
-	for i := len(r.Approvals) - 1; i >= 0; i-- {
-		if r.Approvals[i].Action == "APPROVE" && r.Approvals[i].Approver != "" {
-			return r.Approvals[i].Approver
-		}
-	}
-	for _, a := range r.Approvals {
-		if a.Approver != "" {
-			return a.Approver
-		}
-	}
-	return ""
-}
-
-// ───────────────────────────── 辅助 ─────────────────────────────
-
-func contains(xs []string, v string) bool {
-	for _, x := range xs {
-		if x == v {
-			return true
-		}
-	}
-	return false
-}
-
-// mergeDimension 把一条维度授权并入 target（同维并集，"*" 吞并其余）。
-func mergeDimension(target *authz.Entitlement, dg DimGrant) {
-	for i := range target.Dimensions {
-		if target.Dimensions[i].Dim != dg.Dim {
+// effectiveModules 返回本单**实际落进 enabled 的**模块（DENY 掉的不算），
+// 供回收时精确对账 —— 记「草案里写了什么」会让回收去撤一个从没生效过的模块。
+func effectiveModules(d Draft, target *authz.Entitlement) []string {
+	out := make([]string, 0, len(d.Modules))
+	for _, m := range d.Modules {
+		if contains(target.Modules.Disabled, m) {
 			continue
 		}
-		cur := target.Dimensions[i]
-		// 已是「全部」则无需再并
-		if contains(cur.Values, "*") {
-			return
-		}
-		if contains(dg.Values, "*") {
-			target.Dimensions[i].Values = []string{"*"}
-		} else {
-			for _, v := range dg.Values {
-				if !contains(cur.Values, v) {
-					cur.Values = append(cur.Values, v)
-				}
-			}
-			target.Dimensions[i].Values = cur.Values
-		}
-		target.Dimensions[i].IncludeDescendants =
-			cur.IncludeDescendants || dg.IncludeDescendants
-		return
-	}
-	// 新维度：空 values 表示「全部」——原样保留语义（不擅自展开）。
-	target.Dimensions = append(target.Dimensions, authz.DimensionGrant{
-		Dim:                dg.Dim,
-		Values:             append([]string(nil), dg.Values...),
-		IncludeDescendants: dg.IncludeDescendants,
-	})
-}
-
-// mergeDataUseGroup 把一条勾选组授权并入 target（同组并集）。
-func mergeDataUseGroup(target *authz.Entitlement, gg authz.GroupScopeGrant) {
-	for i := range target.DataUseGroups {
-		if target.DataUseGroups[i].Group != gg.Group {
-			continue
-		}
-		cur := target.DataUseGroups[i]
-		// 字段：空 = 组内全部，吞并其余
-		cur.Fields = unionOrAll(cur.Fields, gg.Fields)
-		// 显式禁用：并集（DENY 只增不减）
-		cur.Denied = union(cur.Denied, gg.Denied)
-		cur.MaxLevel = authz.MaxLevel(cur.MaxLevel, gg.MaxLevel)
-		target.DataUseGroups[i] = cur
-		return
-	}
-	target.DataUseGroups = append(target.DataUseGroups, authz.GroupScopeGrant{
-		Group:    gg.Group,
-		Fields:   append([]string(nil), gg.Fields...),
-		Denied:   append([]string(nil), gg.Denied...),
-		MaxLevel: gg.MaxLevel,
-	})
-}
-
-func union(a, b []string) []string {
-	out := append([]string(nil), a...)
-	for _, v := range b {
-		if !contains(out, v) {
-			out = append(out, v)
-		}
+		out = append(out, m)
 	}
 	return out
 }
 
-// unionOrAll 并集语义，但空集合表示「全部」——空吞并任何集合仍为「全部」。
-func unionOrAll(a, b []string) []string {
-	if len(a) == 0 || len(b) == 0 {
-		return nil // 空 = 组内全部
+func groupIDsOf(d Draft) []string {
+	out := make([]string, 0, len(d.DataUseGroups))
+	for _, g := range d.DataUseGroups {
+		out = append(out, g.Group)
 	}
-	return union(a, b)
+	return out
 }
 
-// 保证 strings 被使用（保留给后续 scope 字符串规范化）。
-var _ = strings.TrimSpace
+// expiryOf 返回申请单的时间盒（RFC3339）；长期申请返回空串（= 永不到期）。
+//
+// ★ 「空串 = 永不到期」这条约定很关键：若把空串当作「立即到期」，
+//   一次普通的长期申请会在下一秒被自己的回收器收走。
+//   authz.isGrantExpired 用的是同一条约定（空 ⇒ false）。
+func expiryOf(r *Request) string {
+	if r == nil || r.RequestedExpiry == nil {
+		return ""
+	}
+	return r.RequestedExpiry.UTC().Format(time.RFC3339)
+}

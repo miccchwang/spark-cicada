@@ -72,6 +72,12 @@ type GroupScopeGrant struct {
 	Denied          []string         `json:"denied,omitempty"`
 	MaxLevel        Level            `json:"maxLevel"`
 	DependenciesMet bool             `json:"dependenciesMet,omitempty"`
+	// ScopedModules 本组可见的模块子集（渲染层据此裁剪，空 = 不限）。
+	ScopedModules []string `json:"scopedModules,omitempty"`
+	// ScopedLevel 本组内密级上限（四组各自独立；空 = 沿用账号 MaxLevel）。
+	// ★ 这是「勾选组」区别于「模块开关」的关键：同一账号里
+	//   运营数据可以是 L2，而投资与回报只是 L1。
+	ScopedLevel Level `json:"scopedLevel,omitempty"`
 }
 
 // DataUseGroup 四个数据用途组。
@@ -127,6 +133,17 @@ type GrantRecord struct {
 	At            string `json:"at,omitempty"`
 	// RequestID 关联的申请单 ID（Origin=REQUEST_APPROVED 时）。
 	RequestID string `json:"requestId,omitempty"`
+	// ModuleIDs 该来源**实际生效的模块**（REQUEST_TEMP/TEMP 等按模块限定的来源用）。
+	// 为空 = 不限定（并入来源携带的全部模块）。
+	ModuleIDs []string `json:"moduleIds,omitempty"`
+	// GroupIDs 该来源带来的勾选组，供回收时判定「组是否本单独有」。
+	GroupIDs []string `json:"groupIds,omitempty"`
+	// ExpiresAt 该来源自身的时间盒（RFC3339）。空 = 长期有效，永不到期。
+	// ★ 到期回收的唯一事实来源：Resolve 直接据此判活，回收器无需另建索引。
+	ExpiresAt string `json:"expiresAt,omitempty"`
+	// Reclaimed 该来源已被到期回收（保留记录以满足「全链路可审计」）。
+	Reclaimed   bool   `json:"reclaimed,omitempty"`
+	ReclaimedAt string `json:"reclaimedAt,omitempty"`
 }
 
 // Entitlement 账号授权项（与 contracts/entitlement.ts 对齐）。
@@ -160,6 +177,9 @@ type EntitlementView struct {
 	MaxLevel              Level               `json:"maxLevel"`
 	CanViewBusinessValues bool                `json:"canViewBusinessValues"`
 	DataUseGroups         []DataUseGroup      `json:"dataUseGroups"`
+	// GroupScopes 各勾选组的组级限定（字段子集 / 维度 / 密级）。
+	// 仅含确实声明了限定的组；用于渲染层做组级裁边。
+	GroupScopes           []GroupScopeGrant   `json:"groupScopes,omitempty"`
 	Source                SourceBreakdown     `json:"source"`
 }
 
@@ -172,6 +192,10 @@ type SourceBreakdown struct {
 	FromDelegation []string `json:"fromDelegations"`
 	FromTemp       []string `json:"fromTemp"`
 	DeniedBy       []string `json:"deniedBy"`
+	// ExpiredGrants 已过时间盒、本次**不再生效**的授权来源。
+	// 与 DeniedBy 分开：被 DENY 是「不允许」，过期是「曾经允许、现已失效」——
+	// 两者在排障时的处置完全不同，混在一起会误导追责。
+	ExpiredGrants []string `json:"expiredGrants"`
 }
 
 // Resolver 执行权限求值。
@@ -201,6 +225,9 @@ func (r *Resolver) Resolve(e *Entitlement, groupGrants []*Entitlement) *Entitlem
 	deniedModules := map[string]bool{}
 	dimValues := map[string]map[string]bool{}
 	groupSet := map[DataUseGroup]bool{}
+	// groupScopes 收集四个勾选组各自的限定（字段/维度/密级），
+	// 供渲染层做「组级裁边」；此前这些限定在 absorb 中被整体丢弃。
+	groupScopes := map[DataUseGroup]*GroupScopeGrant{}
 	fieldAllow := map[string]bool{}   // 逐字段覆写
 	fieldDeny := map[string]bool{}
 	groupFieldDeny := map[string]bool{}
@@ -233,6 +260,11 @@ func (r *Resolver) Resolve(e *Entitlement, groupGrants []*Entitlement) *Entitlem
 		}
 		for _, g := range src.DataUseGroups {
 			groupSet[DataUseGroup(g.Group)] = true
+			// 勾选组自带密级：此前 absorb 只把组名收录进 groupSet，
+			// **组的 MaxLevel / ScopedModules / Fields / Denied 全部被丢弃** ——
+			// 于是「四组各自独立密级」这一 D11 设计形同虚设（写了不生效）。
+			// 现按「同组取并集、密级取更宽松、DENY 只增不减」合并。
+			mergeGroupScopes(groupScopes, g)
 			for _, f := range g.Denied {
 				groupFieldDeny[f] = true
 			}
@@ -282,7 +314,30 @@ func (r *Resolver) Resolve(e *Entitlement, groupGrants []*Entitlement) *Entitlem
 	// fromDelegations —— **恒为空数组**：字段存在、接口不报错、但永远是 []，
 	// 排障时看不出「这条权限是上次申请批下来的」。
 	// 现按 e.Grants 的 origin 如实分层，并对未知来源显式标注（不静默丢弃）。
+	//
+	// ★ 时间盒（2026-10-06 补）：来源记录**必须带自己的到期时间**。
+	//   在此之前到期回收只能靠调用方另建索引 —— 但 GrantRecord 里根本没有
+	//   时间盒字段可查，于是「到期自动回收」（docs/02 M-REQ 闭环最后一步）
+	//   在服务端同样**恒真**：回收器查不到任何到期信息，自然「从不漏收」。
+	//   现改为：来源记录自带 ExpiresAt，Resolve 直接按它判活；
+	//   已到期的授权**照常分层**（排障要看得见它曾经生效）但在标识上标记
+	//   `[expired]`，并由 view.Source.ExpiredGrants 分类计数。
 	for _, g := range e.Grants {
+		// 时间盒：长授权（ExpiresAt 为空）视为永不到期。
+		// 已回收（Reclaimed）或已过期 ⇒ 本次**不再生效**，但仍照常分层，
+		// 让排障者看得见「这条权限曾经生效过、现已被收回」。
+		dead := g.Reclaimed
+		tag := ""
+		if dead {
+			tag = "[reclaimed]"
+		} else if isGrantExpired(g, now) {
+			dead = true
+			tag = "[expired]"
+		}
+		if dead {
+			view.Source.ExpiredGrants = append(view.Source.ExpiredGrants,
+				describeGrant(g, "request:")+tag)
+		}
 		switch g.Origin {
 		case OriginRequest:
 			view.Source.FromApproved = append(
@@ -353,10 +408,20 @@ func (r *Resolver) Resolve(e *Entitlement, groupGrants []*Entitlement) *Entitlem
 		view.Dimensions[dim] = vals
 	}
 	for g := range groupSet {
+		// 组级限定随组一并带出；仅当确实填了限定才输出（避免契约噪声）。
+		if s := groupScopes[g]; s != nil {
+			if s.MaxLevel != "" || len(s.Fields) > 0 ||
+				len(s.ScopedModules) > 0 || len(s.Denied) > 0 {
+				view.GroupScopes = append(view.GroupScopes, *s)
+			}
+		}
 		view.DataUseGroups = append(view.DataUseGroups, g)
 	}
 	sort.Slice(view.DataUseGroups, func(i, j int) bool {
 		return view.DataUseGroups[i] < view.DataUseGroups[j]
+	})
+	sort.Slice(view.GroupScopes, func(i, j int) bool {
+		return view.GroupScopes[i].Group < view.GroupScopes[j].Group
 	})
 
 	// ─────────── D7：IT 恒不可见业务数值（硬约束，不可被任何来源翻盘） ───────────
@@ -386,6 +451,76 @@ func describeGrant(g GrantRecord, prefix string) string {
 		return prefix + by + "@" + g.RequestID
 	}
 	return prefix + by
+}
+
+// mergeGroupScopes 把一份勾选组授权并入收集表（同组并集）。
+//
+// 纪律与其余授权一致：
+//   - 密级取**更宽松**者（并集语义；严格化由 DENY / 审批上界负责）
+//   - 字段 / 模块取并集；**空 = 组内全部**（空吞并任何集合仍为「全部」）
+//   - DENY（Denied）**只增不减**
+func mergeGroupScopes(m map[DataUseGroup]*GroupScopeGrant, g GroupScopeGrant) {
+	key := DataUseGroup(g.Group)
+	cur, ok := m[key]
+	if !ok {
+		cp := g
+		cp.Fields = append([]string(nil), g.Fields...)
+		cp.Denied = append([]string(nil), g.Denied...)
+		cp.ScopedModules = append([]string(nil), g.ScopedModules...)
+		cp.ScopedBy = append([]DimensionGrant(nil), g.ScopedBy...)
+		m[key] = &cp
+		return
+	}
+	cur.MaxLevel = MaxLevel(cur.MaxLevel, g.MaxLevel)
+	cur.Fields = unionOrAll(cur.Fields, g.Fields)
+	cur.ScopedModules = unionOrAll(cur.ScopedModules, g.ScopedModules)
+	cur.Denied = unionContains(cur.Denied, g.Denied)
+}
+
+// unionContains 普通并集（与 req 包同语义，此处自持以避免依赖倒置）。
+func unionContains(a, b []string) []string {
+	out := append([]string(nil), a...)
+	for _, v := range b {
+		if !containsStr(out, v) {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// unionOrAll 并集语义，但空集合表示「全部」——空吞并任何集合仍为「全部」。
+func unionOrAll(a, b []string) []string {
+	if len(a) == 0 || len(b) == 0 {
+		return nil
+	}
+	return unionContains(a, b)
+}
+
+func containsStr(xs []string, v string) bool {
+	for _, x := range xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// isGrantExpired 判定一条来源记录是否已过时间盒。
+//
+// 纪律：
+//   - ExpiresAt 为空 = 长期授权，**永不到期**（不能因为「没填就当作过期」而误回收）。
+//   - ExpiresAt 不可解析 = 视为**到期**（fail-closed）。解析不了的到期时间无法
+//     证明它还没过期；授权系统宁可少给，不可多给。
+//   - 恰好等于 now = 已到期（与 req.Service.Reclaim 的 `!Before(expiry)` 同口径）。
+func isGrantExpired(g GrantRecord, now time.Time) bool {
+	if strings.TrimSpace(g.ExpiresAt) == "" {
+		return false
+	}
+	exp, err := time.Parse(time.RFC3339, g.ExpiresAt)
+	if err != nil {
+		return true // fail-closed
+	}
+	return !now.Before(exp)
 }
 
 // isIT 判定是否 IT 模板（D7：IT 恒不可见业务数值）。
