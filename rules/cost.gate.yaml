@@ -1,0 +1,28 @@
+# rules/cost.gate.yaml —— 成本覆盖率门限规则（全局）
+#
+# docs/03 §4.2 的规则清单里列了 `rule.cost.gate`（全局，门限 0.80），
+# 但此前 `rules/` 下**只有 platform_fee.tk.yaml 一个文件** ——
+# 清单里的其余规则（cost.gate / stock.alert / discount.caliber / fx.base）
+# 在磁盘上并不存在。这是「文档清单 vs 实现」的漂移，本文件先补**唯一一条**
+# 与既有实现真正对应得上的规则（成本覆盖率门限 0.80 ⇒ slot.cogs 的 coverage_gate），
+# 其余仍如实标注为「待补」，不凭空造实现凑数。
+#
+# 文件名与 id 的段集合必须一一对应（G4）：
+#   cost.gate ↔ rule.{cost, gate}  ✓
+id: rule.cost.gate
+version: 1
+scope: { global: true }
+
+# 该门限决定「成本槽是否可用」，进而决定依赖它的算法是否跳过（G5）。
+applies_to_slots:
+  - slot.cogs
+applies_to_buckets:
+  - pnl_month
+
+items:
+  - id: cogs_min_coverage
+    name: 成本覆盖率下限
+    # ★ 这是**阈值**不是费率：以 rate 表达（0.80 = 80%），
+    #   并带 threshold 显式标注语义，避免被误读为「按 80% 计提费用」。
+    kind: threshold
+    rate: 0.80

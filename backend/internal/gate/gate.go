@@ -150,11 +150,12 @@ func CheckSlotsRegistered(docs []AlgoDoc, registered map[string]bool) []string {
 
 // BucketDoc 是桶 YAML 的解析产物（最小字段集，对应 buckets/*.yaml）。
 type BucketDoc struct {
-	ID            string
-	ProducedBy    []string
-	AlgoVersions  map[string]int
-	Grain         []string
-	Refresh       string
+	ID           string
+	ProducedBy   []string
+	AlgoVersions map[string]int
+	RuleVersions map[string]int
+	Grain        []string
+	Refresh      string
 }
 
 // CheckBucketProducersRegistered 断言桶的 produced_by 引用的算法均已注册（G4 引用完整性的**反向**）。
@@ -186,6 +187,39 @@ func CheckBucketProducersRegistered(docs []BucketDoc, registeredAlgos map[string
 			if !registeredAlgos[a] {
 				violations = append(violations, fmt.Sprintf(
 					"桶 %s 的 algo_versions 含未注册算法 %q（版本漂移检测对该算法恒不生效）", d.ID, a))
+			}
+		}
+	}
+	return violations
+}
+
+// CheckBucketRuleVersionsRegistered 断言桶的 `rule_versions` 引用的规则均已注册（G4 / G6）。
+//
+// 为什么单列一条（而不是并进 CheckBucketProducersRegistered）：
+//
+//	`produced_by` 与 `rule_versions` 是**两条独立的引用**，失效后果也不同 ——
+//	前者漏了 ⇒ 算法升级后桶不重算；后者漏了 ⇒ **规则（费率）改了桶不重算**。
+//	本条闸门出现之前，实测「往桶的 rule_versions 里塞一个幽灵规则名」
+//	**没有任何断言会红**：`bucket.Validate` 只校验了版本号为正，
+//	于是 G6 的规则漂移检测对该桶**恒不生效** —— 费率变了、桶不重算、报表口径错，
+//	而全程不报错。这是 G4 引用完整性的**第三个方向**（桶 → 规则），
+//	与「桶 → 算法」同样必须有关把点。
+func CheckBucketRuleVersionsRegistered(docs []BucketDoc, registeredRules map[string]bool) []string {
+	var violations []string
+	for _, d := range docs {
+		for r, v := range d.RuleVersions {
+			if v <= 0 {
+				violations = append(violations, fmt.Sprintf(
+					"桶 %s 的 rule_versions[%s]=%d 非正数", d.ID, r, v))
+			}
+			if strings.TrimSpace(r) == "" {
+				violations = append(violations, fmt.Sprintf("桶 %s 的 rule_versions 含空规则名", d.ID))
+				continue
+			}
+			if !registeredRules[r] {
+				violations = append(violations, fmt.Sprintf(
+					"桶 %s 的 rule_versions 含未注册规则 %q"+
+						"（G6 规则漂移检测对该规则恒不生效 ⇒ 费率改了桶也不重算）", d.ID, r))
 			}
 		}
 	}
@@ -492,4 +526,243 @@ func CheckAuditAppendOnly(op string) []string {
 		return []string{fmt.Sprintf("审计表 %s 操作被拒（append-only）", op)}
 	}
 	return nil
+}
+
+// ─────────────────── G4 · 引用完整性（第三侧：规则 → 槽/桶）───────────────────
+
+// RuleDoc 是规则 YAML 的解析产物（对应 rules/*.yaml，docs/03 §4）。
+//
+// 为什么单列一个类型而不是复用 AlgoDoc：规则的**可失败点**与算法不同 ——
+// 算法要防「混入数据源字段」，规则要防「凭空引用了不存在的槽/桶」，且
+// 规则是**版本化**的（同一 id 多版本并存、按生效期选取）。
+type RuleDoc struct {
+	ID      string
+	Version int
+	Scope   map[string]any
+	Items   []RuleItem
+
+	// Raw 保留原始键（供「未知键/拼写错误」探测 —— 拼错的键 YAML 不报错，
+	// 只会静默丢失，这正是本仓反复出现的静默失效形态）。
+	Raw map[string]any
+}
+
+// RuleItem 是一条费率/阈值明细（docs/03 §4.1）。
+type RuleItem struct {
+	ID            string
+	Name          string
+	Rate          float64
+	FlatPerOrder  float64
+	VATIncluded   bool
+	EffectiveFrom string
+}
+
+// CheckRuleIDsRegistered 断言规则集引用的槽与桶均已注册（G4 引用完整性的**第三侧**）。
+//
+// 为什么需要这条：G4 原本只有两向 ——
+//
+//	算法 → 槽（CheckSlotsRegistered）
+//	桶   → 算法（CheckBucketProducersRegistered）
+//
+// 而 **规则 → 槽 / 规则 → 桶** 这一侧此前**完全没有把关点，也没有任何代码
+// 读过 `rules/*.yaml`**（`grep "rules/"` 全仓唯一命中是 README 的一句话）。
+// 后果不是「少一条断言」，而是「规则集是费率/口径的唯一事实源」（docs/01 §0.3）
+// 这句话在实现侧**不成立**：`rules/` 可以被整体删除、可以被写成任意内容，
+// 而 `LoadRegistry` / `LoadBucketRegistry` 依然全绿 —— 费率的口径来源是隐形的。
+func CheckRuleIDsRegistered(rules []RuleDoc, registeredSlots, registeredBuckets map[string]bool) []string {
+	var violations []string
+	for _, r := range rules {
+		if strings.TrimSpace(r.ID) == "" {
+			violations = append(violations, "规则 ID 为空（名称不明 ⇒ 无法追溯）")
+			continue
+		}
+		if r.Version <= 0 {
+			violations = append(violations, fmt.Sprintf(
+				"规则 %s 的 version=%d 非正数（版本化规则的版本必须可追溯）", r.ID, r.Version))
+		}
+		// applies_to_slots / applies_to_buckets 里出现的每个 ID 都必须真实注册；
+		// 否则「改了规则要重算哪些桶」会漏掉它，而漏算不会报错。
+		for _, key := range []string{"applies_to_slots", "applies_to_buckets"} {
+			raw, ok := r.Raw[key]
+			if !ok {
+				continue
+			}
+			for _, id := range toStrings(raw) {
+				if strings.TrimSpace(id) == "" {
+					violations = append(violations, fmt.Sprintf("规则 %s 的 %s 含空项", r.ID, key))
+					continue
+				}
+				registered := registeredSlots
+				kind := "槽"
+				if key == "applies_to_buckets" {
+					registered = registeredBuckets
+					kind = "桶"
+				}
+				if !registered[id] {
+					violations = append(violations, fmt.Sprintf(
+						"规则 %s 的 %s 引用未注册%s %q（规则漂移后无法定位受影响对象）",
+						r.ID, key, kind, id))
+				}
+			}
+		}
+	}
+	return violations
+}
+
+// CheckRuleIDMatchesFilename 断言规则 YAML 的 `id` 与其文件名所指规则一致（G4）。
+//
+// 为什么这条也是必须的：文件名与 `id` 分叉时，**人类用文件名找规则、程序用 id 找规则**，
+// 两侧对不上且都不报错。
+//
+// 匹配口径（有意放宽「修饰段」、收紧「实义段」）：
+//   - 文件名段 = 去掉扩展名后按 `.` `_` `-` 切分，**剔除两类非身份段**：
+//     语言/地区（`tk`/`th`/`my`/`sg`/`id`/`vn`/`ph`）与平台名（`platform`/`shopee`/`lazada`）；
+//   - id 段 = 去掉 `rule.` 前缀后同样切分并同样剔除；
+//   - 要求两侧**实义段集合相等**：`platform_fee.tk.yaml` ↔ `rule.tk.fee`
+//     的实义段均为 {fee} ✓；而把 id 写成 `rule.tk.cost` 会被拦下
+//     （文件名实义段 {fee}、id 实义段 {cost}，不相等）。
+//
+// ★ 为什么容忍 `platform`：既有事实源 `rules/platform_fee.tk.yaml` 的 id 是
+// `rule.tk.fee` —— 文件名里的 `platform` 是**作用域/类别修饰**而非规则身份，
+// 两侧段数不等的历史已经存在。本断言的目标是「改规则时不会忘了改 id」，
+// 而不是强行重命名既有事实源（那是另一次决策，需用户拍板）。
+func CheckRuleIDMatchesFilename(doc RuleDoc, filename string) []string {
+	// 非身份段：作用域（平台/国家）与类别修饰，两侧都不参与身份比对。
+	nonIdentity := map[string]bool{
+		// 国家/地区
+		"tk": true, "th": true, "my": true, "sg": true,
+		"id": true, "vn": true, "ph": true,
+		// 平台名与类别修饰
+		"platform": true, "shopee": true, "lazada": true, "tiktok": true,
+	}
+
+	base := strings.TrimSuffix(strings.TrimSuffix(filename, ".yaml"), ".yml")
+	want := map[string]int{}
+	for _, seg := range splitRuleSegs(base) {
+		if nonIdentity[seg] {
+			continue
+		}
+		want[seg]++
+	}
+
+	id := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(doc.ID)), "rule.")
+	got := map[string]int{}
+	for _, seg := range splitRuleSegs(id) {
+		if nonIdentity[seg] {
+			continue
+		}
+		got[seg]++
+	}
+
+	var violations []string
+	if len(want) == 0 {
+		return []string{fmt.Sprintf("规则文件名 %q 去掉非身份段后没有实义段", filename)}
+	}
+	if len(got) == 0 {
+		return []string{fmt.Sprintf("规则 %s 的 id 去掉非身份段后没有实义段", doc.ID)}
+	}
+	// 双向包含：任一方向缺段都说明「用文件名找不到 id / 用 id 找不到文件」。
+	keys := map[string]bool{}
+	for k := range want {
+		keys[k] = true
+	}
+	for k := range got {
+		keys[k] = true
+	}
+	for seg := range keys {
+		if want[seg] != got[seg] {
+			violations = append(violations, fmt.Sprintf(
+				"规则 id=%q 与文件名 %q 的实义段不匹配（%q: 文件名 %d 次 / id %d 次）",
+				doc.ID, filename, seg, want[seg], got[seg]))
+		}
+	}
+	sort.Strings(violations)
+	return violations
+}
+
+// splitRuleSegs 按 `.` `_` `-` 切分并剔除空段。
+func splitRuleSegs(s string) []string {
+	var out []string
+	for _, seg := range strings.FieldsFunc(s, func(r rune) bool {
+		return r == '.' || r == '_' || r == '-'
+	}) {
+		if seg != "" {
+			out = append(out, seg)
+		}
+	}
+	return out
+}
+
+// CheckPlatformFeeRule 断言「按规则集逐项计提」的费率规则内部自洽（G4 / docs/03 §4.1）。
+//
+// 费率是 P&L 的乘数 —— **一个非法费率不会报错，只会把整张损益表算错一个系数**。
+// 因此这里逐项校验：
+//   - 每条明细必须有 ID 与名称（否则追责时无法指认是哪一项）；
+//   - 每条明细**必须且只能**给出 `rate`（比例）与 `flat_per_order`（每单定额）之一；
+//     ★ 两者都缺 ⇒ 该项实际按 0 计提（静默少算费用）；两者都给 ⇒ 重复计提。
+//   - `rate` 必须落在 (0, 1]（>1 是 100% 以上的费率，几乎必然是小数点写错位）；
+//   - `flat_per_order` 不得为负。
+func CheckPlatformFeeRule(doc RuleDoc) []string {
+	var violations []string
+	if len(doc.Items) == 0 {
+		violations = append(violations, fmt.Sprintf(
+			"规则 %s 的 items 为空（空的费率规则会让所有计提静默变成 0）", doc.ID))
+	}
+	seen := map[string]bool{}
+	for i, it := range doc.Items {
+		where := fmt.Sprintf("规则 %s 第 %d 项", doc.ID, i+1)
+		if strings.TrimSpace(it.ID) == "" {
+			violations = append(violations, fmt.Sprintf("%s 缺少 id（无法追责到具体费用项）", where))
+		} else if seen[it.ID] {
+			violations = append(violations, fmt.Sprintf(
+				"规则 %s 的 items 中 id=%q 重复（重复计提同一项费用）", doc.ID, it.ID))
+		} else {
+			seen[it.ID] = true
+			where = fmt.Sprintf("规则 %s 项 %s", doc.ID, it.ID)
+		}
+		if strings.TrimSpace(it.Name) == "" {
+			violations = append(violations, fmt.Sprintf("%s 缺少 name", where))
+		}
+
+		hasRate := it.Rate != 0
+		hasFlat := it.FlatPerOrder != 0
+		switch {
+		case !hasRate && !hasFlat:
+			violations = append(violations, fmt.Sprintf(
+				"%s 既无 rate 也无 flat_per_order ⇒ 该项按 0 计提（静默少算费用）", where))
+		case hasRate && hasFlat:
+			violations = append(violations, fmt.Sprintf(
+				"%s 同时给出 rate 与 flat_per_order ⇒ 重复计提", where))
+		}
+		if hasRate && (it.Rate <= 0 || it.Rate > 1) {
+			violations = append(violations, fmt.Sprintf(
+				"%s 的 rate=%.6f 不在 (0,1]（费率超过 100%% 通常是小数点错位）", where, it.Rate))
+		}
+		if it.FlatPerOrder < 0 {
+			violations = append(violations, fmt.Sprintf(
+				"%s 的 flat_per_order=%.4f 为负", where, it.FlatPerOrder))
+		}
+	}
+	return violations
+}
+
+// toStrings 把 YAML 解析出的任意值收敛成字符串切片（容忍 []any / []string / 单值）。
+func toStrings(v any) []string {
+	switch x := v.(type) {
+	case nil:
+		return nil
+	case []string:
+		return x
+	case []any:
+		out := make([]string, 0, len(x))
+		for _, e := range x {
+			if s, ok := e.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	case string:
+		return []string{x}
+	default:
+		return nil
+	}
 }

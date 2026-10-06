@@ -112,6 +112,18 @@ jobs:
         working-directory: backend
         run: go test ./internal/slot/ -count=1 -run "Bucket" -v
 
+      # ★ 规则集注册表闸门（G4 引用完整性的**第三侧**：规则 → 槽/桶）
+      #   rules/*.yaml 是 docs/01 §0.3 明写的「费率/口径唯一事实源」，但在此之前
+      #   **全仓没有任何代码读过它**（grep "rules/" 唯一命中是 README 的一句话）。
+      #   后果不是「少一条断言」，而是 G6 的规则漂移检测**没有输入来源** ——
+      #   规则升版本后没有任何桶会被标记 stale，报表口径慢慢失真而无人知。
+      #   rule_test.go 从 LoadRuleRegistry 入口进、以加载成功/失败出，
+      #   并覆盖「桶 → 规则」（rule_versions）这一方向 + 迁移种子版本一致性
+      #   （不需要数据库就能拦 —— 已实测抓到 0004 种子版本 2 vs 事实源 6 的真缺陷）。
+      - name: ★ 规则集注册表闸门（G4 第三侧：规则→槽/桶 + 桶→规则 + 种子版本）
+        working-directory: backend
+        run: go test ./internal/rule/ -count=1 -v
+
       - name: 控制面闸门
         working-directory: backend
         run: go test ./internal/admin/ -count=1 -v

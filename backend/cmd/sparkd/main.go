@@ -201,6 +201,11 @@ func main() {
 			// ★ 降级时必须说明原因，否则「没配库」与「配了但坏了」
 			//   在 healthz 上无法区分 —— 后者是部署事故，应被立刻发现。
 			"dbDegradeReason": dp.dbDegradeReason,
+			// ★ 规格定义文件（slots/algorithms/buckets/rules）的装载结果。
+			//   这些目录是 docs/01 §0.3 的「单一事实源」，此前**从没被任何生产代码读过**；
+			//   现在 sparkd 装载它们，问题不再静默 —— 列表为空即全部通过。
+			"specLoaded": dp.rules != nil && dp.buckets != nil,
+			"specIssues": dp.specIssues,
 		})
 	})
 	// ── 前端静态托管（兜底路由，必须最后注册）──

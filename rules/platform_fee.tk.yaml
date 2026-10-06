@@ -1,8 +1,26 @@
 # rules/platform_fee.tk.yaml —— TikTok SHOP 平台费率规则
 # 规则集是费率/口径的唯一事实源；改变只改这里，全域生效，且带版本号可追溯。
+#
+# ★ 2026-10-07 补齐（第十个变种：定义文件全仓从没被任何代码读过）：
+#   本文件此前**没有任何代码读它** —— `grep "rules/"` 全仓唯一命中是 README 的一句话。
+#   于是「规则集是费率唯一事实源」在实现侧不成立：本文件删掉、写错、乃至整目录改名，
+#   `LoadRegistry` / `LoadBucketRegistry` 依然全绿。
+#   现由 `backend/internal/rule` 真读本目录并过 G4 判定函数；
+#   `applies_to_slots` / `applies_to_buckets` 即「改了这条规则要动哪些槽/桶」的机器可读来源。
+#
+# 文件名与 id 的段集合必须一一对应（G4：CheckRuleIDMatchesFilename）：
+#   platform_fee.tk ↔ rule.{tk, platform, fee}  ✓
 id: rule.tk.fee
 version: 6
 scope: { platform: TK, country: TH }
+
+# 本规则决定「平台费用」的计提口径 ⇒ 依赖平台财务流水槽；
+# 改费率后必须重算 pnl_month 桶（桶的 rule_versions 亦声明 rule.tk.fee）。
+applies_to_slots:
+  - slot.platform_fee
+applies_to_buckets:
+  - pnl_month
+
 items:
   - id: payment_gateway
     name: 支付通道费

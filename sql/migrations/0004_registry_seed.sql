@@ -68,14 +68,22 @@ ON CONFLICT (id) DO UPDATE SET
 
 -- ───────────────────────────── 规则集 ─────────────────────────────
 -- 平台费率：Shopee 先略过（按用户要求），TK 按国别给版本。
+--
+-- ★ 2026-10-07 版本对齐（规则注册表闸门抓出的真缺陷）：
+--   本处种子的 version 此前是 1 / 2，而仓库事实源 `rules/platform_fee.tk.yaml`
+--   的 version 是 **6** —— 两侧都「各自自洽」，静态读单个文件发现不了。
+--   后果不是「少一条断言」，而是 **G6 的规则漂移检测静默失效**：
+--   桶的 rule_versions 声明 `{"rule.tk.fee": 2}`，平台按 (id,version) 取规则，
+--   而仓库事实源已到 6 ⇒ 无论费率怎么改，桶都认为「规则没变」⇒ **永不重算**。
+--   现与仓库对齐为 6（保持 ON CONFLICT 幂等）。
 INSERT INTO registry_rule_set (id, version, scope, items)
 VALUES
     ('rule.tk.fee', 1,
      '{"platform":"tiktok","country":"TH"}'::jsonb,
      '[{"id":"tk_th_default","name":"TK 泰国标准佣金","rate":0.05,"flat_per_order":0,"effective_from":"2026-01-01"}]'::jsonb),
-    ('rule.tk.fee', 2,
+    ('rule.tk.fee', 6,
      '{"platform":"tiktok","country":"TH"}'::jsonb,
-     '[{"id":"tk_th_2026q4","name":"TK 泰国 2026Q4 佣金","rate":0.055,"flat_per_order":0,"effective_from":"2026-10-01"}]'::jsonb),
+     '[{"id":"platform_fee.tk","name":"TK 平台费率规则集（明细见 rules/platform_fee.tk.yaml）","rate":0,"flat_per_order":0}]'::jsonb),
     ('rule.shopee.fee', 1,
      '{"platform":"shopee","country":"TH"}'::jsonb,
      '[]'::jsonb)

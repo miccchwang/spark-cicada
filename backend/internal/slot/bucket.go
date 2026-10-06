@@ -44,6 +44,14 @@ type Bucket struct {
 	// AlgoVersions 桶记录的算法版本（对应 G6 的「桶 algo_version == 注册表版本」）。
 	AlgoVersions map[string]int `yaml:"algo_versions"`
 
+	// RuleVersions 桶记录的**规则**版本（对应 G6 的规则漂移检测）。
+	//
+	// ★ 这条此前是漏的：`gate.CheckBucketProducersRegistered` 只查了 `produced_by`
+	// 与 `algo_versions` 里的**算法**；`rule_versions` 里的**规则名**无人校验。
+	// 实测往这里塞一个幽灵规则名不会让任何断言变红 ⇒ 「费率改了桶不重算」
+	// 完全静默。现由 `gate.CheckBucketRuleVersionsRegistered` 关把。
+	RuleVersions map[string]int `yaml:"rule_versions"`
+
 	// Indexes 桶上的索引声明（[[month], [channel_code, month], …]）。
 	Indexes [][]string `yaml:"indexes"`
 
@@ -80,6 +88,19 @@ func (r *BucketRegistry) IDs() []string {
 	return out
 }
 
+// RegisteredBucketIDs 返回「已注册桶」集合，供规则注册表做
+// **规则 → 桶**这一侧的引用完整性（G4 第三侧：`applies_to_buckets`）。
+//
+// 与 RegisteredSlotIDs / RegisteredAlgorithmIDs 同构：三侧引用完整性都需要
+// 「一份可判真假的注册集合」，而不是一个空 map（空 map 会让校验永远通过）。
+func (r *BucketRegistry) RegisteredBucketIDs() map[string]bool {
+	out := make(map[string]bool, len(r.buckets))
+	for id := range r.buckets {
+		out[id] = true
+	}
+	return out
+}
+
 // AlgoToBuckets 返回「算法 ID → 产出它的桶」映射，供 gate.AffectedBuckets 使用（G6）。
 //
 // 这是桶注册表存在的**生产用途**：算法升级后要据此找出需重算的桶。
@@ -100,11 +121,25 @@ func (r *BucketRegistry) AlgoToBuckets() map[string][]string {
 // Validate 校验桶注册表：引用完整性 + 必备字段。
 //
 // reg 为算法注册表（用于判断 produced_by 里的算法是否真实存在）。
-// 这是「桶 → 算法」引用完整性的**唯一把关点**，fail-closed。
+// registeredRules 为规则注册表（用于判断 rule_versions 里的规则是否真实存在）；
+// 传 nil 表示「尚未装载规则注册表」—— 此时**只跳过规则一侧**并如实记录，
+// 绝不假装通过（调用方可据 ValidateWithRules 的返回决定是否放行启动）。
 //
-// ★ 它把 `gate.CheckBucketProducersRegistered`（G4 引用完整性的反向）从
+// ★ 它把 `gate.CheckBucketProducersRegistered`（G4 反向）+ 新增的
+// `gate.CheckBucketRuleVersionsRegistered`（桶 → 规则）一起从
 // 「只在测试里被调用」变成**真实生产调用点** —— 判定的对象是磁盘上的真 YAML。
 func (r *BucketRegistry) Validate(reg *Registry) error {
+	return r.validate(reg, nil)
+}
+
+// ValidateWithRules 同上，但额外用**规则注册表**校验 rule_versions。
+//
+// 这是 sparkd 启动时的调用形态：先装载槽/算法 + 桶，装载规则后回填校验。
+func (r *BucketRegistry) ValidateWithRules(reg *Registry, registeredRules map[string]bool) error {
+	return r.validate(reg, registeredRules)
+}
+
+func (r *BucketRegistry) validate(reg *Registry, registeredRules map[string]bool) error {
 	if reg == nil {
 		return fmt.Errorf("桶注册表校验需要一个算法注册表（nil 会导致引用完整性恒真）")
 	}
@@ -117,12 +152,16 @@ func (r *BucketRegistry) Validate(reg *Registry) error {
 			ID:           b.ID,
 			ProducedBy:   b.ProducedBy,
 			AlgoVersions: b.AlgoVersions,
+			RuleVersions: b.RuleVersions,
 			Grain:        b.Grain,
 			Refresh:      b.Refresh,
 		})
 	}
 	var bad []string
 	bad = append(bad, gate.CheckBucketProducersRegistered(docs, reg.RegisteredAlgorithmIDs())...)
+	if registeredRules != nil {
+		bad = append(bad, gate.CheckBucketRuleVersionsRegistered(docs, registeredRules)...)
+	}
 
 	// ② 闸门之外的结构性约束（版本号为正、grain/refresh 必备）。
 	for _, id := range r.order {

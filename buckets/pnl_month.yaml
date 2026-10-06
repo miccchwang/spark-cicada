@@ -26,6 +26,16 @@ algo_versions:
   algo.gmp: 3
   algo.cogs: 3
   algo.net_contrib: 1
+# ★ 2026-10-07 补齐（G4 引用完整性第三方向的关把点）：
+#   本字段此前**无人校验** —— `gate.CheckBucketProducersRegistered` 只查
+#   `produced_by` 与 `algo_versions` 里的**算法**，`rule_versions` 里的**规则名**
+#   没有关把点。实测往这里塞一个幽灵规则名不会让任何断言变红 ⇒
+#   「费率改了桶不重算」（G6 规则漂移检测）对该桶**恒不生效**，且全程不报错。
+#   现由 `gate.CheckBucketRuleVersionsRegistered` 校验；
+#   规则侧的真来源是 rules/platform_fee.tk.yaml（version 6）。
+rule_versions:
+  rule.tk.fee: 6
+  rule.cost.gate: 1
 indexes:
   - [month]
   - [channel_code, month]

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -27,6 +28,8 @@ import (
 	"github.com/miccchwang/spark-cicada/backend/internal/db"
 	"github.com/miccchwang/spark-cicada/backend/internal/gate"
 	"github.com/miccchwang/spark-cicada/backend/internal/groupstore"
+	"github.com/miccchwang/spark-cicada/backend/internal/rule"
+	"github.com/miccchwang/spark-cicada/backend/internal/slot"
 	"github.com/miccchwang/spark-cicada/backend/internal/store"
 	"github.com/miccchwang/spark-cicada/backend/internal/templatestore"
 	"github.com/miccchwang/spark-cicada/backend/internal/tenant"
@@ -71,6 +74,19 @@ type dataPlane struct {
 	//   就「成功地」以降级模式跑起来，看起来一切正常。
 	//   「静默降级」比「启动失败」危险：它把一个坏的部署伪装成好的部署。
 	dbDegradeReason string
+
+	// rules 规则集注册表（M-RULE，G4 第三侧的真实生产链路）。
+	//
+	// ★ 必要性：`rules/*.yaml` 是 docs/01 §0.3 明写的「费率/口径的唯一事实源」，
+	// 但在本字段出现之前**全仓没有任何代码读过它**（grep "rules/" 唯一命中是 README）。
+	// 于是「唯一事实源」在实现侧不成立：该目录可被删空/写错而无人报错，
+	// 且桶的 rule_versions（G6 规则漂移检测的输入）没有来源 ⇒ 规则改了桶永不重算。
+	rules *rule.Registry
+	// buckets 预计算桶注册表（G4 反向 + G6 映射来源）。
+	buckets *slot.BucketRegistry
+	// specIssues 记录「仓库定义文件」层面的问题（不阻断启动，但进 healthz 暴露）。
+	// 与 dbDegradeReason 同源纪律：静默失败必须变成可观测的失败。
+	specIssues []string
 }
 
 // buildDataPlane 尝试连接 DB；失败时**降级**到内置夹具（不阻断启动）。
@@ -87,6 +103,18 @@ func buildDataPlane(ctx context.Context) *dataPlane {
 			"cap.core", "slot.revenue", "slot.cogs", "slot.platform_fee", "slot.inventory_snap",
 		}),
 	}
+
+	// ── 规格注册表（无需数据库：读仓库里的定义文件）──
+	//
+	// ★ 这一步是「判定函数没有生产调用点」这个病的**第十个变种**的解药：
+	//   `rules/*.yaml` 此前全仓没有任何代码读过，`slot.LoadRegistry` /
+	//   `slot.LoadBucketRegistry` 也只有测试调用。现在 sparkd 启动时**真的装载**它们，
+	//   于是 G2/G3/G4/G5 与 G4 第三侧（规则 → 槽/桶）第一次有了**进程内的生产调用点**。
+	//
+	// 失败不阻断启动（与 DB 降级同纪律），但**进 healthz**（specIssues），
+	// 避免「静默降级伪装成部署正常」。
+	specDir := envOr("SPARK_SPEC_DIR", "..")
+	p.loadSpecs(specDir)
 
 	dsn, err := db.DSNFromEnv()
 	if err != nil {
@@ -269,6 +297,75 @@ func buildEntitlementSource() func(string) (*authz.Entitlement, []*authz.Entitle
 			Account:      account,
 			BaseTemplate: tpl,
 		}, nil // 分组授权（groupGrants）由 DB 提供；此处为空
+	}
+}
+
+// loadSpecs 装载仓库里的**规格定义文件**（slots / algorithms / buckets / rules）。
+//
+// ★ 为什么 sparkd 必须做这件事（不必等数据库）：
+//
+//	docs/01 §0.3 规定「算法在 algorithms/、数据槽在 slots/、规则在 rules/」是
+//	**单一事实源**。但在本方法出现之前，这些目录**全仓没有任何生产代码读过**
+//	（`grep "buckets/"` 唯一命中是 store/admin.go 的一条 INSERT 列名，
+//	 `grep "rules/"` 唯一命中是 README 的一句话）——
+//	于是「单一事实源」在实现侧不成立：删掉某个目录、改错某个 ID，
+//	服务照样启动、接口照样返回，而 G2/G3/G4/G5/G6 的判定函数**从没有真实调用点**
+//	（这是本仓反复出现的「假闸门」形态，此处是第十个变种）。
+//
+// 纪律（与 dbDegradeReason 同源）：**失败不阻断启动，但绝不静默** ——
+// 问题进 `specIssues` 并由 `/healthz` 暴露，避免「静默降级伪装成部署正常」。
+func (p *dataPlane) loadSpecs(specDir string) {
+	slotsDir := filepath.Join(specDir, "slots")
+	algosDir := filepath.Join(specDir, "algorithms")
+	bucketsDir := filepath.Join(specDir, "buckets")
+	rulesDir := filepath.Join(specDir, "rules")
+
+	reg, err := slot.LoadRegistry(slotsDir, algosDir)
+	if err != nil {
+		p.specIssues = append(p.specIssues, "data-slot registry: "+err.Error())
+		log.Printf("[warn] 数据槽/算法注册表加载失败（%s）：%v", slotsDir, err)
+		return
+	}
+	log.Printf("[spec] 数据槽 %d 个、算法 %d 个（G4 分离与引用完整性已过闸门）",
+		len(reg.Slots()), len(reg.Algorithms()))
+
+	buckets, err := slot.LoadBucketRegistry(bucketsDir, reg)
+	if err != nil {
+		p.specIssues = append(p.specIssues, "bucket registry: "+err.Error())
+		log.Printf("[warn] 桶注册表加载失败（%s）：%v", bucketsDir, err)
+		return
+	}
+	p.buckets = buckets
+	log.Printf("[spec] 预计算桶 %d 个（produced_by 引用完整性已过闸门）", len(buckets.Buckets()))
+
+	rules, err := rule.LoadRuleRegistry(rulesDir, reg.RegisteredSlotIDs(), buckets.RegisteredBucketIDs())
+	if err != nil {
+		p.specIssues = append(p.specIssues, "rule registry: "+err.Error())
+		log.Printf("[warn] 规则注册表加载失败（%s）：%v", rulesDir, err)
+		return
+	}
+	p.rules = rules
+	log.Printf("[spec] 规则 %d 条（费率/口径唯一事实源已真读并过闸门）", len(rules.Rules()))
+
+	// ★ 回填校验：桶的 `rule_versions` 引用的规则必须真实注册（G4 第三方向）。
+	//
+	// 为什么必须回填而不是并进上面的 LoadBucketRegistry：
+	// 装载顺序是「桶在规则之前」（规则要按桶 ID 校验 applies_to_buckets），
+	// 因此首次装载时 rules 尚不存在。若不回填，`rule_versions` 就永远只被
+	// 「版本号为正」这种弱断言覆盖 —— 往里面塞幽灵规则名不会让任何东西变红，
+	// 而后果是「费率改了桶不重算」全程静默。
+	if err := buckets.ValidateWithRules(reg, rules.RegisteredRuleIDs()); err != nil {
+		p.specIssues = append(p.specIssues, "bucket rule_versions: "+err.Error())
+		log.Printf("[warn] 桶的 rule_versions 引用校验失败：%v", err)
+		return
+	}
+	log.Printf("[spec] 桶的 rule_versions 引用完整性已过闸门")
+
+	// ★ 规则 ⇒ 桶 的映射必须有内容：否则「规则升版本后要重算哪些桶」（G6）
+	//   会永远返回空，桶永远不重算 —— 不报错，只是报表口径慢慢失真。
+	if len(rules.ApplyToBuckets()) == 0 {
+		p.specIssues = append(p.specIssues,
+			"rule→bucket mapping is empty: G6 rule drift will never mark any bucket stale")
 	}
 }
 
