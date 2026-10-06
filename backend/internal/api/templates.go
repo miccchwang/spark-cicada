@@ -64,7 +64,12 @@ type TemplateHandlers struct {
 	// ★ 与 IsAdmin 分开注入：两者的判定依据不同（一个看管理员模板，
 	//   一个看组织链路 D9），且都会演进。留空时保守返回 false ——
 	//   绝不能因为「不知道谁是主管」就默认所有人都是（那是提权）。
-	IsSupervisor func(account string) bool
+	//
+	// ★★ 参数带 tenantID（0012 起）：dim_org 主键 = (tenant_id, account)，
+	//   同一个 account 可同时存在于多家租户。组织链路的判定必须**限定在本租户内**，
+	//   否则 A 租户的账号可能命中 B 租户的同名下属行 ⇒ 误判为「主管」⇒ 越权建团队档。
+	//   实现方（sparkd）走特权通道查库，不受 RLS 约束，故须由本参数显式限定。
+	IsSupervisor func(tenantID, account string) bool
 
 	// ★★ ForTenant 返回**绑定到指定租户**的服务实现（多租户部署必填）。
 	//
@@ -125,16 +130,18 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 // tenantHeader 是租户标识的请求头名。
 //
 // ★ 与 X-Spark-Account 同层：都是**请求身份**的一部分，由前置认证中间件
-//   校验/注入。二者缺一不可 —— 账号回答「你是谁」，租户回答「你在谁的数据里」。
 //
-//	注意：本包**不**校验租户是否合法/是否存在（那是租户注册表 + 认证层的职责）；
-//	这里只做「取到就往下传」。租户是否可用由 ForTenant 返回 nil 体现。
+//	  校验/注入。二者缺一不可 —— 账号回答「你是谁」，租户回答「你在谁的数据里」。
+//
+//		注意：本包**不**校验租户是否合法/是否存在（那是租户注册表 + 认证层的职责）；
+//		这里只做「取到就往下传」。租户是否可用由 ForTenant 返回 nil 体现。
 const tenantHeader = "X-Spark-Tenant"
 
 // TenantIDFromRequest 取本次请求的租户标识；空串表示未提供（单租户部署）。
 //
 // ★ 先查 context，再查头：认证中间件若已把租户解析进 context，
-//   就以 context 为准（头可被客户端伪造，context 是中间件校验过的）。
+//
+//	就以 context 为准（头可被客户端伪造，context 是中间件校验过的）。
 func TenantIDFromRequest(r *http.Request) string {
 	if r == nil {
 		return ""
@@ -148,7 +155,8 @@ func TenantIDFromRequest(r *http.Request) string {
 // tenantCtxKey 是本包 context 中租户值的键类型。
 //
 // ★ 用私有空结构体而非字符串：避免与其它包放进 context 的同名键相撞
-//   （string 键在不同包间会冲突，且 staticcheck SA1029 会报）。
+//
+//	（string 键在不同包间会冲突，且 staticcheck SA1029 会报）。
 type tenantCtxKey struct{}
 
 // WithTenantID 把租户标识放入 context（供认证中间件使用）。
@@ -305,13 +313,13 @@ func (h *TemplateHandlers) handleSaveTemplate(w http.ResponseWriter, r *http.Req
 		}
 		// 改档位要重新过 CanSetScope（否则普通人可把自己的个人模板改成 system 档，
 		// 一步变成全体默认视图 —— 典型的提权）
-		if !template.CanSetScope(body.Scope, v, h.isSupervisor(r.Context(), actor)) {
+		if !template.CanSetScope(body.Scope, v, h.isSupervisor(r, actor)) {
 			http.Error(w, "forbidden: 无权将模板设为该档位", http.StatusForbidden)
 			return
 		}
 	} else {
 		// 新建：档位授权
-		if !template.CanSetScope(body.Scope, v, h.isSupervisor(r.Context(), actor)) {
+		if !template.CanSetScope(body.Scope, v, h.isSupervisor(r, actor)) {
 			http.Error(w, "forbidden: 无权创建该档位模板", http.StatusForbidden)
 			return
 		}
@@ -495,9 +503,20 @@ func (h *TemplateHandlers) readable(ctx context.Context, svc TemplateService, t 
 //
 //	默认实现保守返回 false（只有管理员能在 CanSetScope 里过关），
 //	避免「因为不知道谁是主管，就默认所有人都是」的提权。
-func (h *TemplateHandlers) isSupervisor(_ context.Context, account string) bool {
-	if h.IsSupervisor != nil {
-		return h.IsSupervisor(account)
+//
+// ★★ 从请求解析租户一并传入（0012 起必需）：
+//
+//	判定必须在**本租户内**进行 —— 特权通道查 dim_org 不受 RLS 约束，
+//	若不带租户，跨租户的同名账号会互相污染判定结果。
+//	★ 取不到租户时**保守返回 false**（fail-closed）：宁可少给权限。
+func (h *TemplateHandlers) isSupervisor(r *http.Request, account string) bool {
+	if h.IsSupervisor == nil {
+		return false
 	}
-	return false
+	// ★ 租户缺失 ⇒ 保守返回 false（fail-closed），绝不用「无租户」通道判定。
+	tid := TenantIDFromRequest(r)
+	if tid == "" {
+		return false
+	}
+	return h.IsSupervisor(tid, account)
 }

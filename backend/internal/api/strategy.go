@@ -80,7 +80,11 @@ type StrategyHandlers struct {
 	//
 	// ★ D6 决策：仅管理层（T1–T2）。
 	// ★ 默认（nil）**拒绝**：见文件头第 2 条。
-	ScopeGuard func(account string) bool
+	// ★★ 参数带 tenantID（0012 起）：判定依据之一是 dim_org.tier，
+	//   而 dim_org 主键 = (tenant_id, account)，账号不再全局唯一。
+	//   必须限定在本租户内判定，否则跨租户同名账号会互相污染
+	//   （A 租户普通账号命中 B 租户同名 T1 行 ⇒ 越权使用策略实验室）。
+	ScopeGuard func(tenantID, account string) bool
 	// SnapshotHash 取当前数据快照哈希（决策依据）。
 	//
 	// ★ 做成注入点而不是在 handler 里现算：快照哈希的来源会演进
@@ -418,7 +422,13 @@ func (h *StrategyHandlers) allowed(r *http.Request, w http.ResponseWriter) bool 
 		return false
 	}
 	acct := r.Header.Get("X-Spark-Account")
-	if !h.ScopeGuard(acct) {
+	// ★ 租户缺失 ⇒ 保守拒绝（fail-closed），绝不用「无租户」通道判定。
+	tid := TenantIDFromRequest(r)
+	if tid == "" {
+		http.Error(w, "forbidden: 缺少租户上下文（D6 判定须限定在租户内）", http.StatusForbidden)
+		return false
+	}
+	if !h.ScopeGuard(tid, acct) {
 		http.Error(w, "forbidden: 策略实验室仅限管理层（D6）", http.StatusForbidden)
 		return false
 	}

@@ -10,12 +10,12 @@
 //   - CI 设 SPARK_REQUIRE_DB=1 ⇒ 未设 DSN 时直接失败，绝不静默跳过。
 //
 // ★ 本文件要钉死的三件事（纯逻辑单测覆盖不到）：
-//   1. queryState 是 **jsonb 原样往返**，不是被 base64 编码过的字符串。
-//      （历史上 Template.QueryState 用过 []byte，json 会把它编成 base64 ——
-//        前端拿到的是乱码，且发对象时直接 400。）
-//   2. 「本页默认」的部分唯一索引真的生效：同 (scope,owner,page) 不能有两个默认。
-//   3. team 档「无显式分享」时按 owner 主部门可见 —— 这条只在 SQL + 纯函数
-//      串起来才跑得到。
+//  1. queryState 是 **jsonb 原样往返**，不是被 base64 编码过的字符串。
+//     （历史上 Template.QueryState 用过 []byte，json 会把它编成 base64 ——
+//     前端拿到的是乱码，且发对象时直接 400。）
+//  2. 「本页默认」的部分唯一索引真的生效：同 (scope,owner,page) 不能有两个默认。
+//  3. team 档「无显式分享」时按 owner 主部门可见 —— 这条只在 SQL + 纯函数
+//     串起来才跑得到。
 package templatestore
 
 import (
@@ -67,12 +67,35 @@ func openTestDB(t *testing.T) (*Store, func()) {
 
 // ───────────────────────────── 帮手 ─────────────────────────────
 
+// testSharedTenantID 取本测试库的 shared 档租户 id（没有就建一个）。
+//
+// ★ 0012 起 dim_org 主键 = (tenant_id, account)，账号不再全局唯一，
+//
+//	因此写 dim_org 必须显式带 tenant_id，且冲突目标要写成 (tenant_id, account)。
+func testSharedTenantID(t *testing.T, ctx context.Context, s *Store) string {
+	t.Helper()
+	var id string
+	err := s.pool.QueryRow(ctx,
+		`SELECT id FROM dim_tenant WHERE tier = 'shared' ORDER BY created_at LIMIT 1`).Scan(&id)
+	if err == nil && id != "" {
+		return id
+	}
+	const fixed = "00000000-0000-4000-8000-0000000000c1"
+	_, _ = s.pool.Exec(ctx, `
+		INSERT INTO dim_tenant (id, code, name, tier, status, region)
+		VALUES ($1, 'test-shared', 'test shared', 'shared', 'active', 'test')
+		ON CONFLICT (id) DO NOTHING`, fixed)
+	return fixed
+}
+
 func seedOrg(t *testing.T, ctx context.Context, s *Store, acct, dept string) {
 	t.Helper()
+	tid := testSharedTenantID(t, ctx, s)
 	if _, err := s.pool.Exec(ctx, `
-		INSERT INTO dim_org (account, display_name, tier, primary_dept)
-		VALUES ($1, $1, 'T3', $2)
-		ON CONFLICT (account) DO UPDATE SET primary_dept = EXCLUDED.primary_dept`, acct, dept); err != nil {
+		INSERT INTO dim_org (tenant_id, account, display_name, tier, primary_dept)
+		VALUES ($1, $2, $2, 'T3', $3)
+		ON CONFLICT (tenant_id, account) DO UPDATE SET primary_dept = EXCLUDED.primary_dept`,
+		tid, acct, dept); err != nil {
 		t.Fatalf("建 dim_org %s: %v", acct, err)
 	}
 }
@@ -498,7 +521,8 @@ func TestIntegration_BumpUse_IncrementsAndAudits(t *testing.T) {
 // ───────────────────────────── 5. 分享对象事务性 ─────────────────────────────
 
 // ★ Save 必须原子地写「模板 + 分享」：若只写模板漏写分享，
-//   team 档会从「只分享给 d.ops」退化成「同部门可见」= 静默扩大可见范围。
+//
+//	team 档会从「只分享给 d.ops」退化成「同部门可见」= 静默扩大可见范围。
 func TestIntegration_Save_SharesAreAtomic(t *testing.T) {
 	s, closeFn := openTestDB(t)
 	defer closeFn()

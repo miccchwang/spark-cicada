@@ -170,12 +170,23 @@ func strategyRequest(t *testing.T, h http.HandlerFunc, method, target string,
 	if account != "" {
 		r.Header.Set("X-Spark-Account", account)
 	}
+	// ★ 0012 起 D6 判定（ScopeGuard）要求租户上下文：
+	//   缺少租户会被**保守拒绝**（403）。本文件的测试关注业务逻辑而非租户，
+	//   故统一注入一个测试租户，让「有身份」的用例能走到业务分支。
+	//   （「缺租户即拒绝」这条本身另有专门用例覆盖，见 TestStrategy_缺租户403）
+	if r.Header.Get("X-Spark-Tenant") == "" {
+		r.Header.Set("X-Spark-Tenant", testTenantID)
+	}
 	w := httptest.NewRecorder()
 	h(w, r)
 	return w
 }
 
-func allowAll(string) bool { return true }
+// testTenantID 是接口层单测用的固定租户 uuid（合法格式，无需真实存在）。
+const testTenantID = "00000000-0000-4000-8000-0000000000a1"
+
+// allowAll 放行任意 (tenantID, account) —— 仅用于测试「不关心权限」的分支。
+func allowAll(string, string) bool { return true }
 
 // ───────────────────────────── 身份 ─────────────────────────────
 
@@ -217,6 +228,57 @@ func TestStrategy_写接口无身份401(t *testing.T) {
 
 // ───────────────────────────── D6 范围守卫 ─────────────────────────────
 
+// ★★ 缺租户 ⇒ 403（本用例钉死 0012 引入的 fail-closed 语义）。
+//
+// ★ 为什么必须单独有一条：D6 判定（tier ∈ T1/T2）查的是 dim_org，
+//
+//	而 0012 起 dim_org 主键 = (tenant_id, account)，账号不再全局唯一。
+//	判定必须限定在租户内；**取不到租户时若还去判**，就会退化成
+//	「跨租户按账号匹配」—— A 租户的普通账号可能命中 B 租户同名 T1 行 ⇒ 越权。
+//	所以「缺租户」必须是**拒绝**，而不是「跳过判定后放行」。
+func TestStrategy_缺租户403(t *testing.T) {
+	// guard 恒放行 —— 证明 403 来自「缺租户」，而不是 guard 判定结果。
+	h := &StrategyHandlers{Svc: newFakeStrategy(), ScopeGuard: allowAll}
+	r := httptest.NewRequest("GET", "/api/strategy/choices", nil)
+	r.Header.Set("X-Spark-Account", "ceo") // 有身份，但**故意不设租户头**
+	w := httptest.NewRecorder()
+	h.handleListChoices(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("★ 缺租户必须 403（fail-closed），得 %d", w.Code)
+	}
+}
+
+// ★★ guard 必须收到**请求里的租户**，而不是空串/硬编码。
+//
+// ★ 这条断言的是「租户真的被传下去了」：若实现里忘了传 tid，
+//
+//	guard 会收到空串，本用例立刻变红（而不是等到线上越权才发现）。
+func TestStrategy_守卫收到请求租户(t *testing.T) {
+	const wantTenant = "11111111-1111-4111-8111-111111111111"
+	var gotTenant, gotAcct string
+	h := &StrategyHandlers{
+		Svc: newFakeStrategy(),
+		ScopeGuard: func(tid, acct string) bool {
+			gotTenant, gotAcct = tid, acct
+			return true
+		},
+	}
+	r := httptest.NewRequest("GET", "/api/strategy/choices", nil)
+	r.Header.Set("X-Spark-Account", "ceo")
+	r.Header.Set("X-Spark-Tenant", wantTenant)
+	w := httptest.NewRecorder()
+	h.handleListChoices(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，得 %d：%s", w.Code, w.Body.String())
+	}
+	if gotTenant != wantTenant {
+		t.Fatalf("★ guard 收到的租户应为 %q，实际 %q —— 租户没被传下去", wantTenant, gotTenant)
+	}
+	if gotAcct != "ceo" {
+		t.Fatalf("guard 收到的账号应为 ceo，实际 %q", gotAcct)
+	}
+}
+
 func TestStrategy_未注入guard默认拒绝(t *testing.T) {
 	// ★ 关键：nil guard 必须是「拒绝」，不能是「放行」
 	h := &StrategyHandlers{Svc: newFakeStrategy()}
@@ -227,7 +289,7 @@ func TestStrategy_未注入guard默认拒绝(t *testing.T) {
 }
 
 func TestStrategy_guard拒绝则403(t *testing.T) {
-	h := &StrategyHandlers{Svc: newFakeStrategy(), ScopeGuard: func(string) bool { return false }}
+	h := &StrategyHandlers{Svc: newFakeStrategy(), ScopeGuard: func(string, string) bool { return false }}
 	w := strategyRequest(t, h.handleListChoices, "GET", "/api/strategy/choices", "ops.sea", nil)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("期望 403，得 %d", w.Code)
@@ -252,7 +314,7 @@ func TestStrategy_guard放行则200(t *testing.T) {
 }
 
 func TestStrategy_写接口也受guard约束(t *testing.T) {
-	h := &StrategyHandlers{Svc: newFakeStrategy(), ScopeGuard: func(string) bool { return false }}
+	h := &StrategyHandlers{Svc: newFakeStrategy(), ScopeGuard: func(string, string) bool { return false }}
 	w := strategyRequest(t, h.handleDecide, "POST", "/api/strategy/decide", "ops.sea",
 		decideReq{ChoiceID: "ch.fee", Kind: "keep_current"})
 	if w.Code != http.StatusForbidden {
@@ -312,6 +374,9 @@ func TestStrategy_非法JSON400(t *testing.T) {
 	h := &StrategyHandlers{Svc: newFakeStrategy(), ScopeGuard: allowAll}
 	r := httptest.NewRequest("POST", "/api/strategy/decide", strings.NewReader("{not json"))
 	r.Header.Set("X-Spark-Account", "ceo")
+	// ★ 必须带租户：否则 D6 守卫会先以「缺租户」拒绝（403），
+	//   本用例要验证的是「JSON 非法 ⇒ 400」，需要先过守卫。
+	r.Header.Set("X-Spark-Tenant", testTenantID)
 	w := httptest.NewRecorder()
 	h.handleDecide(w, r)
 	if w.Code != http.StatusBadRequest {

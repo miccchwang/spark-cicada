@@ -21,6 +21,7 @@
 // ★ 这套"看不到 + 特权能看到"的双向断言是必须的：
 //
 //	只断言"B 看不到"的话，一个"写入失败"的实现也能让测试通过。
+//
 // ══════════════════════════════════════════════════════════════════════════
 package templatestore
 
@@ -42,7 +43,8 @@ import (
 // tenantDSN 返回用于特权通道（superuser / BYPASSRLS）的 DSN。
 //
 // ★ 特权通道的用途**仅限**：从外部确认"数据确实写进了库里"（绕开 RLS 看全貌）。
-//   隔离本身必须用**应用角色**通道验证 —— 用超级用户测 RLS 等于没测。
+//
+//	隔离本身必须用**应用角色**通道验证 —— 用超级用户测 RLS 等于没测。
 func tenantDSN(t *testing.T) string {
 	t.Helper()
 	dsn := strings.TrimSpace(os.Getenv("SPARK_TEST_DB_DSN"))
@@ -111,7 +113,8 @@ func newAppPool(t *testing.T, dsn string) *pgxpool.Pool {
 // newTenantPool 开一个特权池（用于"从外部确认数据真的在库里"）。
 //
 // ★ 用特权通道是**刻意**的：app 角色受 RLS 限制，用它去"确认数据存在"
-//   会得到 0 行，从而无法区分"隔离正确"与"数据没写进去"。
+//
+//	会得到 0 行，从而无法区分"隔离正确"与"数据没写进去"。
 func newTenantPool(t *testing.T, dsn string) *pgxpool.Pool {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -130,7 +133,8 @@ func newTenantPool(t *testing.T, dsn string) *pgxpool.Pool {
 // tenantCtxFor 构造一个 shared 档租户上下文。
 //
 // ★ 用真实 uuid（RLS 策略要求 tenant_id 能匹配）：这里编两个固定 uuid，
-//   测试前后清理，避免污染。
+//
+//	测试前后清理，避免污染。
 func tenantCtxFor(id string) tenant.TenantContext {
 	return tenant.TenantContext{
 		TenantID:    id,
@@ -152,23 +156,33 @@ func cleanupTenantTemplates(ctx context.Context, pool *pgxpool.Pool, tid string)
 	_, _ = pool.Exec(ctx, `DELETE FROM audit_log WHERE action = 'view_template.apply' AND tenant_id = $1`, tid)
 }
 
-// seedOwnerOrgs 建两个 owner（两租户各自一个）。
-func seedOwnerOrgs(ctx context.Context, pool *pgxpool.Pool, accts ...string) error {
-	for _, a := range accts {
+// seedOwnerOrgs 建 owner 的 dim_org 行。
+//
+// ★ 0012 起 dim_org 主键 = (tenant_id, account)：账号不再全局唯一，
+//
+//	因此**必须**显式指定每个 owner 属于哪个租户，冲突目标为 (tenant_id, account)。
+//	这也正是 dim_view_template.owner 的复合外键（→ dim_org(tenant_id, account)）
+//	能生效的前提 —— owner 与模板必须同租户。
+func seedOwnerOrgs(ctx context.Context, pool *pgxpool.Pool, pairs ...[2]string) error {
+	for _, p := range pairs {
+		tid, a := p[0], p[1]
 		if _, err := pool.Exec(ctx, `
-			INSERT INTO dim_org (account, display_name, tier, primary_dept)
-			VALUES ($1, $1, 'T3', 'D1')
-			ON CONFLICT (account) DO NOTHING`, a); err != nil {
-			return fmt.Errorf("建 dim_org %s: %w", a, err)
+			INSERT INTO dim_org (tenant_id, account, display_name, tier, primary_dept)
+			VALUES ($1, $2, $2, 'T3', 'D1')
+			ON CONFLICT (tenant_id, account) DO NOTHING`, tid, a); err != nil {
+			return fmt.Errorf("建 dim_org %s/%s: %w", tid, a, err)
 		}
 	}
 	return nil
 }
 
-func cleanupOwnerOrgs(ctx context.Context, pool *pgxpool.Pool, accts ...string) {
-	for _, a := range accts {
-		_, _ = pool.Exec(ctx, `DELETE FROM dim_view_template WHERE owner=$1`, a)
-		_, _ = pool.Exec(ctx, `DELETE FROM dim_org WHERE account=$1`, a)
+// cleanupOwnerOrgs 按 (tenantID, account) 对清理 owner 的 dim_org 行。
+// 参数为**扁平**的 tid/account 交替序列，例如 cleanupOwnerOrgs(ctx, p, tA, aA, tB, aB)。
+func cleanupOwnerOrgs(ctx context.Context, pool *pgxpool.Pool, flat ...string) {
+	for i := 0; i+1 < len(flat); i += 2 {
+		tid, a := flat[i], flat[i+1]
+		_, _ = pool.Exec(ctx, `DELETE FROM dim_view_template WHERE tenant_id=$1 AND owner=$2`, tid, a)
+		_, _ = pool.Exec(ctx, `DELETE FROM dim_org WHERE tenant_id=$1 AND account=$2`, tid, a)
 	}
 }
 
@@ -187,10 +201,10 @@ func TestTenant_两租户模板互不可见(t *testing.T) {
 
 	acctA := "u.tenantA"
 	acctB := "u.tenantB"
-	if err := seedOwnerOrgs(ctx, priv, acctA, acctB); err != nil {
+	if err := seedOwnerOrgs(ctx, priv, [2]string{tenantA, acctA}, [2]string{tenantB, acctB}); err != nil {
 		t.Fatalf("%v", err)
 	}
-	defer cleanupOwnerOrgs(ctx, priv, acctA, acctB)
+	defer cleanupOwnerOrgs(ctx, priv, tenantA, acctA, tenantB, acctB)
 
 	sa := NewForTenant(app, tenantCtxFor(tenantA))
 	sb := NewForTenant(app, tenantCtxFor(tenantB))
@@ -255,10 +269,10 @@ func TestTenant_列表也只含本租户(t *testing.T) {
 	defer cleanupTenantTemplates(ctx, priv, tenantB)
 
 	acctA, acctB := "u.listA", "u.listB"
-	if err := seedOwnerOrgs(ctx, priv, acctA, acctB); err != nil {
+	if err := seedOwnerOrgs(ctx, priv, [2]string{tenantA, acctA}, [2]string{tenantB, acctB}); err != nil {
 		t.Fatalf("%v", err)
 	}
-	defer cleanupOwnerOrgs(ctx, priv, acctA, acctB)
+	defer cleanupOwnerOrgs(ctx, priv, tenantA, acctA, tenantB, acctB)
 
 	sa := NewForTenant(app, tenantCtxFor(tenantA))
 	sb := NewForTenant(app, tenantCtxFor(tenantB))
@@ -304,10 +318,10 @@ func TestTenant_跨租户写入必须被RLS拒绝(t *testing.T) {
 	defer cleanupTenantTemplates(ctx, priv, tenantB)
 
 	acctA := "u.forgeA"
-	if err := seedOwnerOrgs(ctx, priv, acctA); err != nil {
+	if err := seedOwnerOrgs(ctx, priv, [2]string{tenantA, acctA}); err != nil {
 		t.Fatalf("%v", err)
 	}
-	defer cleanupOwnerOrgs(ctx, priv, acctA)
+	defer cleanupOwnerOrgs(ctx, priv, tenantA, acctA)
 
 	sa := NewForTenant(app, tenantCtxFor(tenantA))
 	if err := sa.Save(ctx, mkTpl("tpl.forge", acctA, "/report", template.ScopePersonal), acctA); err != nil {
@@ -366,6 +380,7 @@ func TestTenant_跨租户写入必须被RLS拒绝(t *testing.T) {
 //	   本测试把「NULL ≠ 公共」这条语义钉在代码里，让这个反模式**改不动**。
 //	   若将来真需要平台共享模板，正确做法是**新增一条 OR tenant_id IS NULL
 //	   的独立策略**（显式、可审计），而不是把写入放宽到允许 NULL。
+//
 // ══════════════════════════════════════════════════════════════════════════
 func TestTenant_平台档写入被RLS拒绝(t *testing.T) {
 	dsn := tenantDSN(t)
@@ -383,10 +398,10 @@ func TestTenant_平台档写入被RLS拒绝(t *testing.T) {
 	cleanupTenantTemplates(ctx, priv, tenantB)
 
 	acctP := "u.platform"
-	if err := seedOwnerOrgs(ctx, priv, acctP); err != nil {
+	if err := seedOwnerOrgs(ctx, priv, [2]string{tenantA, acctP}); err != nil {
 		t.Fatalf("%v", err)
 	}
-	defer cleanupOwnerOrgs(ctx, priv, acctP)
+	defer cleanupOwnerOrgs(ctx, priv, tenantA, acctP)
 
 	// ── ① 写侧：应用角色的平台档 store（New ⇒ 不施加租户）写入必须被拒 ──
 	//
@@ -456,9 +471,9 @@ func TestTenant_BumpUse审计必须带租户(t *testing.T) {
 
 	cleanupTenantTemplates(ctx, priv, tenantA)
 	defer cleanupTenantTemplates(ctx, priv, tenantA)
-	defer cleanupOwnerOrgs(ctx, priv, acct)
+	defer cleanupOwnerOrgs(ctx, priv, tenantA, acct)
 
-	if err := seedOwnerOrgs(ctx, priv, acct); err != nil {
+	if err := seedOwnerOrgs(ctx, priv, [2]string{tenantA, acct}); err != nil {
 		t.Fatalf("%v", err)
 	}
 
@@ -511,7 +526,7 @@ func TestTenant_分享表也受隔离(t *testing.T) {
 	defer cleanupTenantTemplates(ctx, priv, tenantB)
 
 	acctA, acctB := "u.shareA", "u.shareB"
-	if err := seedOwnerOrgs(ctx, priv, acctA, acctB); err != nil {
+	if err := seedOwnerOrgs(ctx, priv, [2]string{tenantA, acctA}, [2]string{tenantB, acctB}); err != nil {
 		t.Fatalf("%v", err)
 	}
 	defer cleanupOwnerOrgs(ctx, priv, acctA, acctB)

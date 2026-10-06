@@ -1,12 +1,16 @@
 // wiring_test.go —— 装配层的关键判定（管理员/主管/IT 基座前缀边界）
 //
 // ★ 这些断言存在的理由：它们是「一处判定、多处使用」的**唯一真相点**。
-//   组管理与模板管理共用 isAdmin，若这里判错，两个模块一起错；
-//   而 isITBase 的前缀边界是**已经踩过一次**的 bug 类别
-//   （`tpl.item` 被误判为 `tpl.it`），必须钉死。
+//
+//	组管理与模板管理共用 isAdmin，若这里判错，两个模块一起错；
+//	而 isITBase 的前缀边界是**已经踩过一次**的 bug 类别
+//	（`tpl.item` 被误判为 `tpl.it`），必须钉死。
 package main
 
 import "testing"
+
+// testTenant 是本文件用的合法租户 uuid（判定函数要求租户格式合法）。
+const testTenant = "00000000-0000-4000-8000-0000000000a1"
 
 func TestIsITBase_PrefixBoundary(t *testing.T) {
 	cases := []struct {
@@ -56,12 +60,29 @@ func TestIsAdminFunc_DegradedFixture(t *testing.T) {
 }
 
 // ★ 主管判定在无库时必须**保守返回 false**（不能退化成「人人都是主管」）。
+//
+// ★ 0012 起签名带 tenantID：判定须限定在租户内（dim_org 账号不再全局唯一）。
 func TestIsSupervisorFunc_NoDBIsConservative(t *testing.T) {
 	p := &dataPlane{dbReady: false}
 	isSup := p.isSupervisorFunc()
 	for _, acct := range []string{"ceo", "vp.sea", "lead.sea", "it.ops", "", "anyone"} {
-		if isSup(acct) {
+		if isSup(testTenant, acct) {
 			t.Fatalf("★ 无库时 isSupervisor(%q) 必须为 false（否则人人可建团队档模板 = 提权）", acct)
+		}
+	}
+}
+
+// ★ 缺租户 / 非法租户 ⇒ 保守拒绝。
+//
+// ★★ 为什么单独测这条：本函数走**特权通道**查库（绕过 RLS），
+// 正确性完全依赖显式 tenant_id 过滤。若租户为空还去查，
+// 就退化成「跨租户按账号匹配」—— 在多租户下会张冠李戴。
+func TestIsSupervisorFunc_MissingOrBadTenantIsConservative(t *testing.T) {
+	p := &dataPlane{dbReady: false}
+	isSup := p.isSupervisorFunc()
+	for _, tid := range []string{"", "   ", "not-a-uuid", "12345"} {
+		if isSup(tid, "lead.sea") {
+			t.Fatalf("★ 租户 %q 非法/缺失时 isSupervisor 必须为 false（fail-closed）", tid)
 		}
 	}
 }

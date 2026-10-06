@@ -148,6 +148,9 @@ func tplReq(t *testing.T, method, url, account string, body any) *http.Response 
 	if account != "" {
 		req.Header.Set("X-Spark-Account", account)
 	}
+	// ★ 0012 起 isSupervisor 需要租户上下文；缺租户会被保守拒绝（403）。
+	//   本文件关注模板业务逻辑，统一注入测试租户。
+	req.Header.Set("X-Spark-Tenant", testTenantID)
 	req.Header.Set("Content-Type", "application/json")
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -247,7 +250,7 @@ func TestHTTP_SaveTemplate_TeamScopeRequiresSupervisor(t *testing.T) {
 	h := &TemplateHandlers{
 		Svc:          svc,
 		IsAdmin:      func(string) bool { return false },
-		IsSupervisor: func(a string) bool { return a == "u.mgr" },
+		IsSupervisor: func(_, a string) bool { return a == "u.mgr" },
 	}
 	mux := http.NewServeMux()
 	h.Routes(mux)

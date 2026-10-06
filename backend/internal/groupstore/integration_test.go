@@ -14,9 +14,10 @@
 // 「未表态 vs 已同意」的语义位持久化，全成了「没人验证过却显示通过」的假绿。
 //
 // ★ 本文件还承担一个特殊职责：它是「表结构来自 0001」这一结论的**活证据**。
-//   初版 groupstore 用的是自创表名（dim_user_group 等），单测全绿、
-//   一跑真库立刻 SQLSTATE 42703 —— 因为真库里根本没有那些表。
-//   下面 TestIntegration_SchemaIsFromMigration0001 把这个事实钉死。
+//
+//	初版 groupstore 用的是自创表名（dim_user_group 等），单测全绿、
+//	一跑真库立刻 SQLSTATE 42703 —— 因为真库里根本没有那些表。
+//	下面 TestIntegration_SchemaIsFromMigration0001 把这个事实钉死。
 package groupstore
 
 import (
@@ -73,13 +74,14 @@ func openTestDB(t *testing.T) (*Store, func()) {
 // TestIntegration_SchemaIsFromMigration0001 断言本包用的表**确实来自 0001/0006**。
 //
 // ★ 这是从一次真实事故里长出来的断言。
-//   初版 groupstore 自创了 dim_user_group / fact_group_grant /
-//   dim_account_entitlement / fact_request_approval / fact_request_cc 五张表，
-//   而迁移里根本没有它们 —— 真库一跑就是 SQLSTATE 42703。
-//   更糟的是：这类错误**只在真库暴露**，纯逻辑单测永远是绿的。
 //
-//   所以这里正面断言「该存在的表存在」，并**反向断言自创的表不存在**，
-//   让「重新引入一套平行表」这个错误在 CI 里立刻变红。
+//	初版 groupstore 自创了 dim_user_group / fact_group_grant /
+//	dim_account_entitlement / fact_request_approval / fact_request_cc 五张表，
+//	而迁移里根本没有它们 —— 真库一跑就是 SQLSTATE 42703。
+//	更糟的是：这类错误**只在真库暴露**，纯逻辑单测永远是绿的。
+//
+//	所以这里正面断言「该存在的表存在」，并**反向断言自创的表不存在**，
+//	让「重新引入一套平行表」这个错误在 CI 里立刻变红。
 func TestIntegration_SchemaIsFromMigration0001(t *testing.T) {
 	s, done := openTestDB(t)
 	defer done()
@@ -192,7 +194,8 @@ func TestIntegration_GroupRoundTrip(t *testing.T) {
 // TestIntegration_ReplaceGrantsRemovesDropped 整体替换必须能**撤销**授权。
 //
 // ★ 这正是「逐条 upsert」会漏掉的场景：界面上取消勾选 module.pnl 后，
-//   若用 upsert 而非整体覆盖，那一项会永久留在 grants 里 ⇒ 权限依然生效。
+//
+//	若用 upsert 而非整体覆盖，那一项会永久留在 grants 里 ⇒ 权限依然生效。
 func TestIntegration_ReplaceGrantsRemovesDropped(t *testing.T) {
 	s, done := openTestDB(t)
 	defer done()
@@ -232,7 +235,8 @@ func TestIntegration_ReplaceGrantsRemovesDropped(t *testing.T) {
 // TestIntegration_GrantChangeLogIsWritten 授权变更必须留下可检索的流水。
 //
 // ★ 这条防的是「改了权限但没留痕」——M-REQ/M-GROUP 的价值之一就是可追溯。
-//   流水与主表同事务，所以这里断言的是「一次成功替换 = 恰好一组流水」。
+//
+//	流水与主表同事务，所以这里断言的是「一次成功替换 = 恰好一组流水」。
 func TestIntegration_GrantChangeLogIsWritten(t *testing.T) {
 	s, done := openTestDB(t)
 	defer done()
@@ -316,7 +320,8 @@ func TestIntegration_ITGroupCannotGrantBusinessValues(t *testing.T) {
 // TestIntegration_IllegalMaxLevelRejected 非法密级必须被库层拦住。
 //
 // ★ 为什么要在库层拦：非法密级（如 "L9"）到了求值器里，
-//   行为取决于实现细节（当 L1 还是当 L4），而其中一种选择就是静默扩权。
+//
+//	行为取决于实现细节（当 L1 还是当 L4），而其中一种选择就是静默扩权。
 func TestIntegration_IllegalMaxLevelRejected(t *testing.T) {
 	s, done := openTestDB(t)
 	defer done()
@@ -547,7 +552,8 @@ func TestIntegration_RequestRoundTrip(t *testing.T) {
 // TestIntegration_CosignDecidedAtSurvives 会签表态后 decidedAt 必须真的写进库。
 //
 // ★ 这是「未表态 vs 已同意」语义位持久化的另一半断言：
-//   上一条测 nil 能保留，这一条测非 nil 能保留。两条合起来才闭环。
+//
+//	上一条测 nil 能保留，这一条测非 nil 能保留。两条合起来才闭环。
 func TestIntegration_CosignDecidedAtSurvives(t *testing.T) {
 	s, done := openTestDB(t)
 	defer done()
@@ -639,8 +645,9 @@ func TestIntegration_SaveRequestReplacesStaleRows(t *testing.T) {
 // TestIntegration_ListReclaimable 到期回收检索必须准确。
 //
 // ★ 这条同时验证 0006 的索引条件与查询条件是否对齐 ——
-//   若两边条件不一致，索引不会被用上（这里测不出性能，但能测出语义：
-//   不该出现的（未到期/无 expiry/非 APPROVED）绝不能出现）。
+//
+//	若两边条件不一致，索引不会被用上（这里测不出性能，但能测出语义：
+//	不该出现的（未到期/无 expiry/非 APPROVED）绝不能出现）。
 func TestIntegration_ListReclaimable(t *testing.T) {
 	s, done := openTestDB(t)
 	defer done()
@@ -824,8 +831,9 @@ func TestIntegration_UnknownPersonalIsEmptyNotError(t *testing.T) {
 // TestIntegration_NilSlicesDoNotViolateNotNull nil 切片入库不得撞 NOT NULL。
 //
 // ★ 真实事故（M-COLLECT，SQLSTATE 23502）：`text[] NOT NULL DEFAULT '{}'`
-//   的 DEFAULT 只在**不提供该列**时生效；显式传 NULL 会直接撞 NOT NULL，
-//   而 Go 的 nil []string 经 pgx 正是被编码成 SQL NULL。
+//
+//	的 DEFAULT 只在**不提供该列**时生效；显式传 NULL 会直接撞 NOT NULL，
+//	而 Go 的 nil []string 经 pgx 正是被编码成 SQL NULL。
 func TestIntegration_NilSlicesDoNotViolateNotNull(t *testing.T) {
 	s, done := openTestDB(t)
 	defer done()
@@ -898,12 +906,37 @@ func seedApplicant(t *testing.T, ctx context.Context, s *Store, rid string) stri
 	return acct
 }
 
+// testTenantID 取本测试库的 shared 档租户 id（没有就建一个）。
+//
+// ★ 0012 把 dim_org 主键改成 (tenant_id, account) 之后，
+//
+//	账号不再全局唯一 —— 同一个 account 可以同时存在于多家租户。
+//	因此**任何写 dim_org 的地方都必须显式给出 tenant_id**：
+//	`ON CONFLICT (account)` 会因为「account 上已无唯一约束」直接报 SQLSTATE 42P10。
+//	这里统一取一个租户，模拟生产里「账号必属于某租户」的事实。
+func testTenantID(t *testing.T, ctx context.Context, s *Store) string {
+	t.Helper()
+	var id string
+	err := s.pool.QueryRow(ctx,
+		`SELECT id FROM dim_tenant WHERE tier = 'shared' ORDER BY created_at LIMIT 1`).Scan(&id)
+	if err == nil && id != "" {
+		return id
+	}
+	const fixed = "00000000-0000-4000-8000-0000000000c1"
+	_, _ = s.pool.Exec(ctx, `
+		INSERT INTO dim_tenant (id, code, name, tier, status, region)
+		VALUES ($1, 'test-shared', 'test shared', 'shared', 'active', 'test')
+		ON CONFLICT (id) DO NOTHING`, fixed)
+	return fixed
+}
+
 func seedOrg(t *testing.T, ctx context.Context, s *Store, acct string) {
 	t.Helper()
+	tid := testTenantID(t, ctx, s)
 	if _, err := s.pool.Exec(ctx, `
-		INSERT INTO dim_org (account, display_name, tier, primary_dept)
-		VALUES ($1, $1, 'T3', 'd.ops')
-		ON CONFLICT (account) DO NOTHING`, acct); err != nil {
+		INSERT INTO dim_org (tenant_id, account, display_name, tier, primary_dept)
+		VALUES ($1, $2, $2, 'T3', 'd.ops')
+		ON CONFLICT (tenant_id, account) DO NOTHING`, tid, acct); err != nil {
 		t.Fatalf("建 dim_org %s: %v", acct, err)
 	}
 }

@@ -4,7 +4,8 @@
 // 未配置 DB 时回退到**内置最小夹具**，让 sparkd 仍可启动被探活。
 //
 // ★ 纪律：DB 缺席时**绝不**伪造业务数据 —— 查询路径会 fail-closed 报错，
-//   而不是返回编造的 0 或空行。
+//
+//	而不是返回编造的 0 或空行。
 package main
 
 import (
@@ -284,9 +285,10 @@ func envOr(k, def string) string {
 // isAdminFunc 返回「某账号是否具备全局管理权限」的判定函数。
 //
 // ★ 判定依据刻意做成**可注入的一处**（而不是散落在各 handler）：
-//   M-GROUP 的组管理、M-TEMPLATE 的模板管理都要用它；
-//   若两处各写一份，迟早出现「组管理认他是管理员、模板管理不认」的错位，
-//   而这类错位在权限系统里就是权限漏洞。
+//
+//	M-GROUP 的组管理、M-TEMPLATE 的模板管理都要用它；
+//	若两处各写一份，迟早出现「组管理认他是管理员、模板管理不认」的错位，
+//	而这类错位在权限系统里就是权限漏洞。
 //
 // 依据（按优先级）：
 //  1. 模板基座为 IT（tpl.it*）—— IT 承担平台治理，但**看不到业务数值**（D7）。
@@ -392,8 +394,9 @@ func (p *dataPlane) templatesForTenant(tenantID string) api.TemplateService {
 // baseTemplateOf 取某账号的基座模板 id。
 //
 // ★ 从**授权来源**取（authoritative），不从求值后的视图取 ——
-//   视图里不保留 BaseTemplate 字段（它只有展开后的模块/维度）。
-//   数据面就绪时查库，否则回退内置夹具。
+//
+//	视图里不保留 BaseTemplate 字段（它只有展开后的模块/维度）。
+//	数据面就绪时查库，否则回退内置夹具。
 func (p *dataPlane) baseTemplateOf(account string) string {
 	if account == "" {
 		return ""
@@ -417,19 +420,39 @@ func (p *dataPlane) baseTemplateOf(account string) string {
 // isSupervisorFunc 返回「某账号是否主管及以上」的判定函数。
 //
 // ★ 「主管及以上」= 组织链路（D9）里**有人向他汇报**。
-//   数据面就绪时按 dim_org.supervisor 反查（存在直接下属即为主管）。
+//
+//	数据面就绪时按 dim_org.supervisor 反查（存在直接下属即为主管）。
+//
+// ★★ 多租户：必须带 tenantID —— 且**不能**只靠 RLS。
+//
+//	本函数用的是特权 pool（p.pool），它**绕过 RLS**（超级用户/BYPASSRLS 角色
+//	不受行级安全约束）。而 0012 把 dim_org 主键改成 (tenant_id, account) 之后，
+//	同一个 account 可以同时存在于多家租户。
+//	若查询只写 `WHERE supervisor = $1` 而不带 tenant_id：
+//	  · 单租户部署「碰巧正确」；
+//	  · 一旦同库承载多家租户，A 租户的账号会命中 B 租户的同名下属行
+//	    ⇒ 判定结果错乱（提权：不该给团队档的人拿到了团队档）。
+//	⇒ 因此这里**显式**用 tenant_id 过滤，把正确性建立在查询本身，
+//
+//	而不是「赌 RLS 会拦住」——特权通道根本不受 RLS 约束。
 //
 // ★ 库未就绪时**保守返回 false**：
-//   「不知道谁是主管」绝不能退化成「所有人都是主管」——
-//   那会让任何用户都能创建团队档模板（对全部门可见），属于提权。
-func (p *dataPlane) isSupervisorFunc() func(string) bool {
-	return func(account string) bool {
+//
+//	「不知道谁是主管」绝不能退化成「所有人都是主管」——
+//	那会让任何用户都能创建团队档模板（对全部门可见），属于提权。
+func (p *dataPlane) isSupervisorFunc() func(tenantID, account string) bool {
+	return func(tenantID, account string) bool {
 		if account == "" || !p.dbReady || p.pool == nil {
+			return false
+		}
+		// ★ 租户必须是合法 uuid；缺失即保守拒绝（fail-closed）。
+		if !tenant.IsUUID(tenantID) {
 			return false
 		}
 		var n int
 		err := p.pool.QueryRow(context.Background(),
-			`SELECT count(*) FROM dim_org WHERE supervisor = $1 LIMIT 1`, account).Scan(&n)
+			`SELECT count(*) FROM dim_org WHERE tenant_id = $1 AND supervisor = $2 LIMIT 1`,
+			tenantID, account).Scan(&n)
 		if err != nil {
 			// 查询失败也保守拒绝（fail-closed）
 			return false
@@ -441,8 +464,9 @@ func (p *dataPlane) isSupervisorFunc() func(string) bool {
 // isITBase 判断模板基座是否属于 IT（tpl.it 或 tpl.it.*）。
 //
 // ★ 用前缀 + 边界判断而非 `strings.HasPrefix(tpl, "tpl.it")`：
-//   后者会误把 `tpl.item` 也当成 IT —— 这是历史上已修过一次的同类 bug
-//   （见 internal/req/req.go 的 isIT 注释）。
+//
+//	后者会误把 `tpl.item` 也当成 IT —— 这是历史上已修过一次的同类 bug
+//	（见 internal/req/req.go 的 isIT 注释）。
 func isITBase(tpl string) bool {
 	return tpl == "tpl.it" || strings.HasPrefix(tpl, "tpl.it.")
 }
@@ -468,17 +492,23 @@ func isITBase(tpl string) bool {
 //  1. 组织链路里 tier ∈ {T1, T2}（数据面就绪时查 dim_org）。
 //  2. 显式启用 m.strategy 模块（为将来放权留的显式开关）。
 //
+// ★★ 多租户：与 isSupervisorFunc 同理，查询**必须**带 tenant_id ——
+// 本函数同样走特权 pool（绕过 RLS），而 0012 之后 dim_org 的账号不再全局唯一。
+// 不带 tenant_id 会让「A 租户的管理层账号」命中「B 租户的同名 T1/T2 行」，
+// 从而拿到改全公司费率口径的权限 —— 这是最严重的一类越权。
+//
 // ★ 库未就绪时**保守返回 false**：见下。
-func (p *dataPlane) isManagementFunc() func(string) bool {
-	return func(account string) bool {
+func (p *dataPlane) isManagementFunc() func(tenantID, account string) bool {
+	return func(tenantID, account string) bool {
 		if account == "" {
 			return false
 		}
 		// ① 组织层级 T1/T2
-		if p.dbReady && p.pool != nil {
+		if p.dbReady && p.pool != nil && tenant.IsUUID(tenantID) {
 			var tier *string
 			err := p.pool.QueryRow(context.Background(),
-				`SELECT tier FROM dim_org WHERE account = $1`, account).Scan(&tier)
+				`SELECT tier FROM dim_org WHERE tenant_id = $1 AND account = $2`,
+				tenantID, account).Scan(&tier)
 			if err == nil && tier != nil {
 				if *tier == "T1" || *tier == "T2" {
 					return true
@@ -511,14 +541,16 @@ func (p *dataPlane) isManagementFunc() func(string) bool {
 //	KODP 的教训正是「口径变更不追溯，导致无法解释为什么变了」。
 //
 // ★ 哈希的构成：各预计算桶的「状态 + 算法版本 + 规则集版本」拼起来的
-//   确定性指纹。选这个组合而不是「数据的哈希」，是因为：
-//   ① 桶的版本直接决定「报表会显示什么」，这才是决策真正依据的东西；
-//   ② 全量数据的哈希每次采数都会变（哪怕业务没变），
-//      那样哈希就失去了「可比对」的作用。
+//
+//	确定性指纹。选这个组合而不是「数据的哈希」，是因为：
+//	① 桶的版本直接决定「报表会显示什么」，这才是决策真正依据的东西；
+//	② 全量数据的哈希每次采数都会变（哪怕业务没变），
+//	   那样哈希就失去了「可比对」的作用。
 //
 // ★ 取不到时返回空串而不是报错：快照哈希是**辅助证据**，
-//   不应因为它拿不到就阻止一次决策（那会变成「因为观测不了所以不能决策」）。
-//   接口层会如实告知「未取到快照」，但不失败。
+//
+//	不应因为它拿不到就阻止一次决策（那会变成「因为观测不了所以不能决策」）。
+//	接口层会如实告知「未取到快照」，但不失败。
 func (p *dataPlane) snapshotHashFunc() func(context.Context) string {
 	return func(ctx context.Context) string {
 		if !p.dbReady || p.pool == nil {

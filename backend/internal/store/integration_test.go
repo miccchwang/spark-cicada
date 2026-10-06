@@ -176,12 +176,17 @@ func TestIntegration_NullNotZero(t *testing.T) {
 	pool := m.Pool()
 
 	// 注册桶为 FRESH，否则查询侧会 fail-closed 拒绝
+	//
+	// ★ 0012 起 registry_bucket 的 PK 是代理键 (pk)，业务键唯一性改为两条
+	//   部分唯一索引。这里是**平台默认行**（tenant_id IS NULL），
+	//   所以冲突目标必须写成 `(id) WHERE tenant_id IS NULL` ——
+	//   与索引谓词**逐字一致**，否则 PostgreSQL 认不出该索引（SQLSTATE 42P10）。
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO registry_bucket (id, grain, produced_by, refresh, algo_versions, rule_versions, state)
 		VALUES ('pnl_month', ARRAY['month','channel_code','shop_id','brand'],
 		        ARRAY['algo.gp','algo.cogs'], 'monthly_incremental',
 		        '{"algo.gp":3,"algo.cogs":2}'::jsonb, '{}'::jsonb, 'FRESH')
-		ON CONFLICT (id) DO UPDATE SET state='FRESH'`); err != nil {
+		ON CONFLICT (id) WHERE tenant_id IS NULL DO UPDATE SET state='FRESH'`); err != nil {
 		t.Fatalf("注册桶失败：%v", err)
 	}
 
@@ -261,10 +266,13 @@ func TestIntegration_SlotHealth(t *testing.T) {
 	pool := m.Pool()
 
 	// slot.affiliate 在 0002 里可能不存在；显式登记一个已知 MISSING 槽
+	//
+	// ★ 同 TestIntegration_NullNotZero：平台默认行 ⇒ 冲突目标要带
+	//   `WHERE tenant_id IS NULL`，与 uq_registry_slot_platform 的谓词逐字一致。
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO registry_slot (id, name, source_kind, source_ref, key_strategy, coverage_gate, freshness, permission, status)
 		VALUES ('slot.integ_test','集成测试槽','db','x','k',0.80,'1d','L2','MISSING')
-		ON CONFLICT (id) DO UPDATE SET status='MISSING'`); err != nil {
+		ON CONFLICT (id) WHERE tenant_id IS NULL DO UPDATE SET status='MISSING'`); err != nil {
 		t.Fatalf("登记测试槽失败：%v", err)
 	}
 	st := New(pool)

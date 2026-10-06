@@ -59,7 +59,8 @@ func seedChoice(t *testing.T, s *StrategyStore, id, curKey string, items string,
 	if _, err := s.pool.Exec(ctx, `
 		INSERT INTO registry_rule_set (id, version, scope, items)
 		VALUES ($1, 1, $2::jsonb, $3::jsonb)
-		ON CONFLICT (id, version) DO UPDATE SET scope=EXCLUDED.scope, items=EXCLUDED.items`,
+		ON CONFLICT (id, version) WHERE tenant_id IS NULL
+		DO UPDATE SET scope=EXCLUDED.scope, items=EXCLUDED.items`,
 		id, scope, items); err != nil {
 		t.Fatalf("种子选型卡 %s 失败：%v", id, err)
 	}
@@ -383,7 +384,8 @@ func TestStrategyIntegration_ListPending(t *testing.T) {
 		INSERT INTO registry_rule_set (id, version, scope, items)
 		VALUES ($1, 1,
 		        '{"global":true,"current_key":"A","blocking":false,"title":"非阻塞卡","context":"背景"}'::jsonb, $2::jsonb)
-		ON CONFLICT (id, version) DO UPDATE SET scope=EXCLUDED.scope, items=EXCLUDED.items`,
+		ON CONFLICT (id, version) WHERE tenant_id IS NULL
+		DO UPDATE SET scope=EXCLUDED.scope, items=EXCLUDED.items`,
 		cidB, testItems); err != nil {
 		t.Fatalf("种子失败：%v", err)
 	}

@@ -47,6 +47,16 @@
 --       租户会话**只能**写自己 tenant_id 的行，**不能**写 tenant_id=NULL。
 --       NULL 行只由平台/运维通道（特权角色）产生 —— 与 dim_view_template
 --       在 0011 的处置完全一致（NULL 不等于「公共」）。
+--
+--   决策 C：**registry_* 主键改代理键，并拆出「逻辑槽身份表」**。
+--     ★ 为什么不能只换代理键：换键后 registry_slot(id) 只剩**部分唯一索引**，
+--       而 PostgreSQL 外键**不能**引用局部唯一索引 ⇒ 子外键无法重建。
+--     ★ 修法：新增平台级 `registry_slot_identity(id text PRIMARY KEY)`
+--       （无 tenant_id、不开 RLS，只存"逻辑槽存在性"），
+--       两条子外键改指它。逻辑身份与租户覆盖由此**分层**，
+--       外键合法、语义正确（子表引用的是"概念槽"而非"某租户的物理行"）。
+--     ★ 一致性由触发器 trg_registry_slot_identity_sync 保证：
+--       任何写入 registry_slot 的行，其 id 自动 upsert 进身份表 ⇒ 永不缺项。
 -- ══════════════════════════════════════════════════════════════════════════
 
 BEGIN;
@@ -187,31 +197,105 @@ END $$;
 
 -- ───────────────────────────── registry_* 表：平台默认 + 租户覆盖 ─────────────────────────────
 --
--- ★★★ 本段是本迁移语义最微妙的一段，务必读懂再改。
+-- ★★★ 本段是本迁移语义最微妙、也最容易做错的一段，务必读懂再改。
 --
---   模型：`tenant_id IS NULL` = 平台默认；非 NULL = 租户覆盖。
+--   模型：`tenant_id IS NULL` = 平台默认配方；非 NULL = 租户覆盖配方。
 --   读取语义：**租户覆盖优先，否则回落平台默认**。
+--
+--   ★ 为什么不是「纯共享」也不是「纯私有」：
+--     纯共享 ⇒ 一家租户想微调费率口径就得改全平台的配方（不可能）；
+--     纯私有 ⇒ 每开一家租户都要复制整套配方（1000 家 ⇒ 表爆炸，
+--               且「升级算法版本」要改 1000 处，必然漂移）。
+--     「默认 + 覆盖」是唯一同时满足「开箱可用」与「可定制」的模型。
+--
+-- ───────────────────────────── 策略：读宽松、写严格 ─────────────────────────────
 --
 --   ★ 策略必须同时允许「自己的行」与「平台默认行」可见：
 --
 --       USING (tenant_id = rls_tenant_id() OR tenant_id IS NULL)
 --
---     ★ 但**不能**写成 `tenant_id = rls_tenant_id() OR tenant_id IS NULL`
---       就当作「NULL 等于公共」—— 这两者在**写侧**必须分开：
---       读允许看到 NULL（回落默认），写**禁止**产生 NULL
---       （否则任何租户都能改全平台的配方）。
+--     ★ 但**不能**因此把 NULL 当作「公共」而在**写侧**也放行：
 --
---   ★ 为什么写侧禁用 NULL 这么重要：
+--       WITH CHECK (tenant_id = rls_tenant_id())        ← 注意：没有 OR IS NULL
+--
+--   ★ 为什么写侧禁用 NULL 至关重要（横向提权，且极难发现）：
 --     registry_* 是**配方**（费率口径、槽位定义、算法公式）。
 --     若租户会话能写 NULL 行，它就能改**所有租户**看到的默认配方 ——
---     这是横向提权，且不像「读到别人数据」那样容易被发现
---     （症状只是「所有租户的数字都慢慢变了」）。
---     故 WITH CHECK 里**只有** `tenant_id = rls_tenant_id()`，没有 OR IS NULL。
---     NULL 行只能由平台/运维通道（特权角色，不受 RLS 约束）产生。
+--     症状不是「读到别人的数据」而是「所有租户的数字都慢慢变了」，
+--     几乎不会被当成安全事件。故 NULL 行只允许平台/运维通道（特权角色）产生。
+--
+-- ───────────────────────────── ★★ 为什么用代理主键 ─────────────────────────────
+--
+--   原始设计里 `registry_slot.id` 等**业务键就是主键**，而它被两条外键引用：
+--     · registry_slot_coverage.slot_id → registry_slot(id)
+--     · collect_job.slot_id            → registry_slot(id)   (ON DELETE SET NULL)
+--
+--   若要把「租户覆盖」做进去，业务键就必须变成 (tenant_id, id)。
+--   但那意味着**必须同时把上面两条子外键也改成复合键** ——
+--   而子表（collect_job 等）的语义是「某租户的采集任务」，
+--   让它们的 FK 也带上 tenant_id 会连锁地把 FK 图铺开，改动面与出错面都显著扩大。
+--
+--   ★ 代理主键方案把这个问题**从根上消掉**：
+--
+--     · registry_* 的新主键 = 自增 bigint（代理键，不可变、无业务含义）
+--     · 业务键 (tenant_id, id[, version]) = **部分唯一索引**（表达「唯一性」语义）
+--     · 子表 FK **仍指向业务键**（见下），因此**完全不需**改子表列结构。
+--
+--   ★ 代理主键的通用优点（顺带获得，也值得记下）：
+--     业务键是可变的（配方改名、口径调整），主键不可变。
+--     用业务键作主键，则「改业务键」= 「改主键」= 所有外键跟着改 —— 灾难。
+--     代理键把「身份」与「名称」分离，这类改动变成一次普通 UPDATE。
+--
+--   ★ 向后兼容：保留原 `id` 列原名与类型（text），仅把 PK 让给新列，
+--     故所有既有查询（SELECT ... WHERE id = ...）**无需改动**。
+--
+-- ────────────────────── ★★ 逻辑槽身份表（本迁移的第二个关键决策） ──────────────────────
+--
+--   ★ 问题：把 registry_slot 的 PK 换成代理键 `pk` 后，`registry_slot(id)` 上
+--     只剩**部分唯一索引**（WHERE tenant_id IS NULL / IS NOT NULL）。
+--     而 **PostgreSQL 的外键不能引用局部（partial）唯一索引** ——
+--     所以两条子外键无法重建，迁移会在此处**报错中止**。
+--
+--   ★ 语义澄清（决定了修法）：
+--     `registry_slot.id` 是**逻辑业务键**（如 `slot.cogs`），不是行身份。
+--     证据：`registry_algorithm.depends_on_slots text[]` 里存的就是这些
+--     逻辑键 —— 算法依赖的是「这个概念上的槽」，与哪家租户的覆盖行无关。
+--     同理，`collect_job.slot_id` / `registry_slot_coverage.slot_id`
+--     表达的也是「逻辑槽」，同样与租户无关。
+--
+--   ★ 结论：**逻辑身份与租户覆盖必须分层**。
+--     新增一张极小的平台级身份表：
+--
+--       registry_slot_identity (id text PRIMARY KEY)      -- 无 tenant_id
+--
+--     它只回答一个问题：「`slot.cogs` 这个逻辑槽**存在**吗？」
+--     （外键完整性要的正是「存在性」，而不是「谁的覆盖行」）
+--
+--     · 子表 FK 改指 `registry_slot_identity(id)` ⇒ **合法**（真 PK，非局部）
+--     · `registry_slot_identity` **不加 tenant_id、不开 RLS**：
+--       它的内容是「逻辑槽清单」，全平台公开、无租户敏感信息
+--       （只有 id 一列，不含任何口径/费率/来源）。
+--     · 用**触发器**保证一致性：任何写入 registry_slot 的行，
+--       其 `id` 都会 upsert 进身份表 ⇒ 身份表永不缺项，应用层无需关心。
+--
+--   ★ 为什么不让子表加 slot_pk 指向物理行（曾考虑，已否决）：
+--     物理行是「平台默认行」或「某租户覆盖行」之一 —— 让子表外键指向它，
+--     等于把「逻辑引用」偷换成「物理引用」，一旦平台行被替换，
+--     所有子表外键会级联失败或被 SET NULL，语义与运维代价都不可接受。
+--
+-- ★ 卸载旧 PK 前必须先卸载依赖它的外键 —— 本方案流程：
+--   ① DROP 两条子 FK（它们指向即将消失的 registry_slot(id) 唯一索引）
+--   ② 建 registry_slot_identity，并把现有 id 灌进去
+--   ③ 装触发器（此后 registry_slot 的新 id 自动同步到身份表）
+--   ④ registry_slot 换 PK 为 (pk)，补两条业务键部分唯一索引
+--   ⑤ 两条子 FK 重建为 → registry_slot_identity(id)
+
+-- ═══════════════ ① registry_* 默认+覆盖：加 tenant_id / 代理键 / RLS / 策略 ═══════════════
 DO $$
 DECLARE
     t text;
     cur_schema text := current_schema();
+    -- ★ 需要「默认 + 覆盖」语义的表
     tables text[] := ARRAY[
         'registry_slot',
         'registry_algorithm',
@@ -223,7 +307,7 @@ BEGIN
     RAISE NOTICE '[0012] registry 默认+覆盖段作用于 schema: %', cur_schema;
 
     FOREACH t IN ARRAY tables LOOP
-        -- ① 加 tenant_id
+        -- ① 加 tenant_id（NULL = 平台默认）
         IF NOT EXISTS (
             SELECT 1 FROM information_schema.columns
              WHERE table_schema = cur_schema AND table_name = t
@@ -232,102 +316,200 @@ BEGIN
             EXECUTE format('ALTER TABLE %I ADD COLUMN tenant_id uuid', t);
         END IF;
 
-        -- ② 开 RLS + FORCE
+        -- ② ★ 加代理主键列（bigint identity）。
+        --    ★ 用 GENERATED BY DEFAULT AS IDENTITY：
+        --      允许运维在数据迁移时显式指定代理键值（回滚/对拷场景需要）。
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+             WHERE table_schema = cur_schema AND table_name = t
+               AND column_name = 'pk'
+        ) THEN
+            EXECUTE format(
+                'ALTER TABLE %I ADD COLUMN pk bigint GENERATED BY DEFAULT AS IDENTITY', t);
+            RAISE NOTICE '[0012]   % 已加代理键列 pk', t;
+        END IF;
+
+        -- ③ 开 RLS + FORCE
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
 
-        -- ③ 策略：读 = 自己 OR 平台默认；写 = 只能是自己
+        -- ④ 策略：读 = 自己 OR 平台默认；写 = 只能是自己（见上文「策略：读宽松、写严格」）
         EXECUTE format('DROP POLICY IF EXISTS p_tenant_override_%s ON %I', t, t);
         EXECUTE format(
             'CREATE POLICY p_tenant_override_%s ON %I '
             'USING (tenant_id = rls_tenant_id() OR tenant_id IS NULL) '
             'WITH CHECK (tenant_id = rls_tenant_id())', t, t);
 
-        -- ④ 索引：RLS 条件含两个分支，两个都要能走索引
+        -- ⑤ 索引：tenant_id
         EXECUTE format(
             'CREATE INDEX IF NOT EXISTS idx_%s_tenant ON %I(tenant_id)', t, t);
 
-        RAISE NOTICE '[0012] 已加固表 %（默认+覆盖策略）', t;
+        RAISE NOTICE '[0012] 已加固表 %（默认+覆盖策略 + 代理键）', t;
     END LOOP;
 END $$;
 
--- ───────────────────────────── registry 唯一键修正 ─────────────────────────────
+-- ═══════════════ ② 逻辑槽身份表 registry_slot_identity ═══════════════
 --
--- ★★ 与 0011 同一条纪律：加了 tenant_id 之后，原来的**全局唯一键**
---   语义就错了（「全世界只有一条默认配方」应当变成
---   「每租户最多一条覆盖 + 一条平台默认」）。
+-- ★ 刻意**不**开 RLS、**不**加 tenant_id：
+--   它只存逻辑槽 id（如 'slot.cogs'），是全平台公开的存在性字典，
+--   不含任何租户敏感信息（费率、口径、来源都在 registry_slot 行里）。
+--   外键完整性需要一个**全局可见**的锚点，这正是它存在的理由。
+CREATE TABLE IF NOT EXISTS registry_slot_identity (
+    id text PRIMARY KEY
+);
+
+COMMENT ON TABLE registry_slot_identity IS
+    '[0012] 逻辑槽身份表：只存"逻辑槽存在性"，全平台公开、无 tenant_id、不开 RLS。'
+    'registry_slot_coverage.slot_id / collect_job.slot_id 的外键指向本表，'
+    '以绕开"registry_slot(id) 在默认+覆盖模型下只剩部分唯一索引、无法作 FK 目标"的限制。';
+
+-- ★ 一致性触发器：任何写入 registry_slot 的行，其 id 自动 upsert 进身份表。
+--   这样身份表**永不缺项**，应用层无需关心它的存在。
+CREATE OR REPLACE FUNCTION trgfn_registry_slot_identity_sync()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    INSERT INTO registry_slot_identity(id)
+    VALUES (NEW.id)
+    ON CONFLICT (id) DO NOTHING;
+    RETURN NEW;
+END $$;
+
+-- 触发器本身不省略：即便 registry_slot 已有行，也先建触发器再灌存量，避免漏项。
+DROP TRIGGER IF EXISTS trg_registry_slot_identity_sync ON registry_slot;
+CREATE TRIGGER trg_registry_slot_identity_sync
+    AFTER INSERT OR UPDATE OF id ON registry_slot
+    FOR EACH ROW
+    EXECUTE FUNCTION trgfn_registry_slot_identity_sync();
+
+-- ★ 存量灌入：把现有的 registry_slot.id 全部登记为逻辑槽。
+INSERT INTO registry_slot_identity(id)
+SELECT DISTINCT id FROM registry_slot
+ON CONFLICT (id) DO NOTHING;
+
+-- ═══════════════ ③ registry 主键/唯一键切换（代理键 + 身份表外键） ═══════════════
 --
---   不一致的后果很具体：
---     租户 X 想覆盖 slot 's1' ⇒ 插入 (s1, X) 时若还受全局 UNIQUE(id)
---     约束，**插入直接失败**（因为平台默认的 s1 已存在）⇒
---     「租户永远无法定制配方」，而报错指向上游，极难排障。
+-- ★ 本段做四件事：
+--   ① DROP 两条指向 registry_slot(id) 的子外键（旧唯一索引即将消失）
+--   ② 把 registry_* 的 PK 让给代理键 `pk`
+--   ③ 用**部分唯一索引**表达业务键的「平台默认唯一」与「租户内唯一」
+--   ④ 两条子外键重建为 → registry_slot_identity(id)（真 PK 目标，合法且强一致）
 --
---   ★ 正确语义的键设计：
---     · 平台默认：同一 id 只允许一条 NULL 行
---     · 租户覆盖：同一 (tenant_id, id) 只允许一条
---   两者用**两个部分唯一索引**表达（因为 NULL 不参与普通唯一约束）。
+-- ★★ 为什么用**两个部分唯一索引**而不是一个复合唯一约束：
+--
+--   业务键语义是「每个租户最多一条覆盖 + 平台最多一条默认」。
+--   而普通 UNIQUE(tenant_id, id) 对 NULL 行的行为是「NULL 互不相等」
+--   ⇒ 平台默认行可以插入任意多条（去重形同虚设）。
+--   必须用两个**部分**索引把两类行分开约束：
+--     UNIQUE(id)              WHERE tenant_id IS NULL      → 平台默认唯一
+--     UNIQUE(tenant_id, id)   WHERE tenant_id IS NOT NULL  → 租户覆盖唯一
 DO $$
 DECLARE
     cur_schema text := current_schema();
 BEGIN
-    RAISE NOTICE '[0012] registry 唯一键修正段作用于 schema: %', cur_schema;
+    RAISE NOTICE '[0012] registry 主键切换段作用于 schema: %', cur_schema;
 
-    -- registry_slot：原 PK(id) 全局唯一 → 改为「每租户/平台各一条」
+    -- ★ 幂等判断：若 registry_slot 的主键已经是代理键，整段跳过
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint c
+         WHERE c.conname = 'registry_slot_pkey'
+           AND c.connamespace = to_regnamespace(cur_schema)
+           AND pg_get_constraintdef(c.oid) LIKE '%(pk)%'
+    ) THEN
+        RAISE NOTICE '[0012] registry_* 已是代理主键 —— 跳过切换（幂等）';
+        RETURN;
+    END IF;
+
+    -- ① 先卸载指向 registry_slot(id) 的两条子外键
+    IF EXISTS (SELECT 1 FROM pg_constraint c
+                WHERE c.conname = 'registry_slot_coverage_slot_id_fkey'
+                  AND c.connamespace = to_regnamespace(cur_schema)) THEN
+        ALTER TABLE registry_slot_coverage DROP CONSTRAINT registry_slot_coverage_slot_id_fkey;
+        RAISE NOTICE '[0012]   已 DROP registry_slot_coverage_slot_id_fkey';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_constraint c
+                WHERE c.conname = 'collect_job_slot_id_fkey'
+                  AND c.connamespace = to_regnamespace(cur_schema)) THEN
+        ALTER TABLE collect_job DROP CONSTRAINT collect_job_slot_id_fkey;
+        RAISE NOTICE '[0012]   已 DROP collect_job_slot_id_fkey';
+    END IF;
+
+    -- ② 卸载旧 PK，改为代理键 PK
     IF EXISTS (SELECT 1 FROM pg_constraint c
                 WHERE c.conname = 'registry_slot_pkey'
                   AND c.connamespace = to_regnamespace(cur_schema)) THEN
         ALTER TABLE registry_slot DROP CONSTRAINT registry_slot_pkey;
     END IF;
-    -- 平台默认：id 唯一（限 NULL 行）
+    ALTER TABLE registry_slot ADD CONSTRAINT registry_slot_pkey PRIMARY KEY (pk);
+    RAISE NOTICE '[0012]   registry_slot 主键已改为代理键 (pk)';
+
+    -- ③ 业务键的部分唯一索引（平台默认 + 租户覆盖）
     CREATE UNIQUE INDEX IF NOT EXISTS uq_registry_slot_platform
         ON registry_slot (id) WHERE tenant_id IS NULL;
-    -- 租户覆盖：每租户每 id 唯一
     CREATE UNIQUE INDEX IF NOT EXISTS uq_registry_slot_tenant
         ON registry_slot (tenant_id, id) WHERE tenant_id IS NOT NULL;
 
-    -- registry_algorithm：同 registry_slot
+    -- ④ 重建两条子外键 —— ★ 指向**逻辑槽身份表**，而非物理行。
+    --    完整性语义 = 「这个逻辑槽确实被登记过」，与租户无关 —— 正是子表想表达的。
+    ALTER TABLE registry_slot_coverage
+        ADD CONSTRAINT registry_slot_coverage_slot_id_fkey
+        FOREIGN KEY (slot_id) REFERENCES registry_slot_identity(id) ON DELETE CASCADE;
+    ALTER TABLE collect_job
+        ADD CONSTRAINT collect_job_slot_id_fkey
+        FOREIGN KEY (slot_id) REFERENCES registry_slot_identity(id) ON DELETE SET NULL;
+    RAISE NOTICE '[0012]   已重建两条子 FK（→ registry_slot_identity.id，完整性恢复且语义正确）';
+
+    -- ── 其余 registry 表：无外部依赖，直接换 PK ──
+    -- registry_algorithm
     IF EXISTS (SELECT 1 FROM pg_constraint c
                 WHERE c.conname = 'registry_algorithm_pkey'
                   AND c.connamespace = to_regnamespace(cur_schema)) THEN
         ALTER TABLE registry_algorithm DROP CONSTRAINT registry_algorithm_pkey;
     END IF;
+    ALTER TABLE registry_algorithm ADD CONSTRAINT registry_algorithm_pkey PRIMARY KEY (pk);
     CREATE UNIQUE INDEX IF NOT EXISTS uq_registry_algorithm_platform
         ON registry_algorithm (id) WHERE tenant_id IS NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS uq_registry_algorithm_tenant
         ON registry_algorithm (tenant_id, id) WHERE tenant_id IS NOT NULL;
 
-    -- registry_bucket：同 registry_slot
+    -- registry_bucket
     IF EXISTS (SELECT 1 FROM pg_constraint c
                 WHERE c.conname = 'registry_bucket_pkey'
                   AND c.connamespace = to_regnamespace(cur_schema)) THEN
         ALTER TABLE registry_bucket DROP CONSTRAINT registry_bucket_pkey;
     END IF;
+    ALTER TABLE registry_bucket ADD CONSTRAINT registry_bucket_pkey PRIMARY KEY (pk);
     CREATE UNIQUE INDEX IF NOT EXISTS uq_registry_bucket_platform
         ON registry_bucket (id) WHERE tenant_id IS NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS uq_registry_bucket_tenant
         ON registry_bucket (tenant_id, id) WHERE tenant_id IS NOT NULL;
 
-    -- registry_rule_set：原 PK(id, version) → 加租户维度
+    -- registry_rule_set（业务键是 (id, version)）
     IF EXISTS (SELECT 1 FROM pg_constraint c
                 WHERE c.conname = 'registry_rule_set_pkey'
                   AND c.connamespace = to_regnamespace(cur_schema)) THEN
         ALTER TABLE registry_rule_set DROP CONSTRAINT registry_rule_set_pkey;
     END IF;
+    ALTER TABLE registry_rule_set ADD CONSTRAINT registry_rule_set_pkey PRIMARY KEY (pk);
     CREATE UNIQUE INDEX IF NOT EXISTS uq_registry_rule_set_platform
         ON registry_rule_set (id, version) WHERE tenant_id IS NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS uq_registry_rule_set_tenant
         ON registry_rule_set (tenant_id, id, version) WHERE tenant_id IS NOT NULL;
 
-    -- registry_slot_coverage：原 PK(slot_id, scope) → 加租户维度
+    -- registry_slot_coverage（业务键是 (slot_id, scope)）
     IF EXISTS (SELECT 1 FROM pg_constraint c
                 WHERE c.conname = 'registry_slot_coverage_pkey'
                   AND c.connamespace = to_regnamespace(cur_schema)) THEN
         ALTER TABLE registry_slot_coverage DROP CONSTRAINT registry_slot_coverage_pkey;
     END IF;
+    ALTER TABLE registry_slot_coverage ADD CONSTRAINT registry_slot_coverage_pkey PRIMARY KEY (pk);
     CREATE UNIQUE INDEX IF NOT EXISTS uq_registry_slot_coverage_platform
         ON registry_slot_coverage (slot_id, scope) WHERE tenant_id IS NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS uq_registry_slot_coverage_tenant
         ON registry_slot_coverage (tenant_id, slot_id, scope) WHERE tenant_id IS NOT NULL;
+
+    RAISE NOTICE '[0012] ★ registry_* 代理主键切换完成（业务键唯一性由部分唯一索引表达）';
 END $$;
 
 -- ───────────────────────────── 延迟表存量数据归属 ─────────────────────────────

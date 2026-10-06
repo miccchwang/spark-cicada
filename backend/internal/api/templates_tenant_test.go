@@ -3,12 +3,13 @@
 // ══════════════════════════════════════════════════════════════════════════
 // ★ 本文件只测一件事：handler 是否**经租户解析**取服务实例。
 //
-//   不测业务可见性（那在 templatestore 集成测试里）。
-//   这两者必须分开测，因为它们的失效模式完全不同：
-//     · 可见性逻辑错 ⇒ 某个用户看到不该看的模板（有症状）；
-//     · 租户路由错   ⇒ **所有**租户共用未绑定实例，RLS 静默不过滤
-//                      （在单租户测试里完全无症状）。
-//   后者是"看起来一切正常"的那类，必须单独用替身把它逼出来。
+//	不测业务可见性（那在 templatestore 集成测试里）。
+//	这两者必须分开测，因为它们的失效模式完全不同：
+//	  · 可见性逻辑错 ⇒ 某个用户看到不该看的模板（有症状）；
+//	  · 租户路由错   ⇒ **所有**租户共用未绑定实例，RLS 静默不过滤
+//	                   （在单租户测试里完全无症状）。
+//	后者是"看起来一切正常"的那类，必须单独用替身把它逼出来。
+//
 // ══════════════════════════════════════════════════════════════════════════
 package api
 
@@ -100,7 +101,8 @@ func doTenant(h http.HandlerFunc, method, target, account, tenantID string) *htt
 // TestHTTP_Templates_必须经租户解析取实例 —— 替身必须收到租户标识。
 //
 // ★ 若 handler 直接用 h.Svc（未绑定租户），本测试的 calls 里会缺少
-//   "tenantA:VisibleFor"，而是出现 "base:VisibleFor" ⇒ 红。
+//
+//	"tenantA:VisibleFor"，而是出现 "base:VisibleFor" ⇒ 红。
 func TestHTTP_Templates_必须经租户解析取实例(t *testing.T) {
 	var calls []string
 	base := &tenantProbeSvc{label: "base", calls: &calls}
@@ -109,7 +111,7 @@ func TestHTTP_Templates_必须经租户解析取实例(t *testing.T) {
 	h := &TemplateHandlers{
 		Svc:          base,
 		IsAdmin:      func(string) bool { return true },
-		IsSupervisor: func(string) bool { return true },
+		IsSupervisor: func(string, string) bool { return true },
 		ForTenant: func(tid string) TemplateService {
 			if tid == "aaaaaaaa-0000-4000-8000-000000000001" {
 				return tenantA
@@ -141,7 +143,7 @@ func TestHTTP_Templates_多租户配置下缺租户头必须拒绝(t *testing.T)
 	h := &TemplateHandlers{
 		Svc:          base,
 		IsAdmin:      func(string) bool { return true },
-		IsSupervisor: func(string) bool { return true },
+		IsSupervisor: func(string, string) bool { return true },
 		ForTenant:    func(string) TemplateService { return &tenantProbeSvc{label: "x", calls: &calls} },
 	}
 
@@ -161,7 +163,7 @@ func TestHTTP_Templates_租户不可用必须503(t *testing.T) {
 	h := &TemplateHandlers{
 		Svc:          base,
 		IsAdmin:      func(string) bool { return true },
-		IsSupervisor: func(string) bool { return true },
+		IsSupervisor: func(string, string) bool { return true },
 		ForTenant:    func(string) TemplateService { return nil }, // 解析不出 ⇒ nil
 	}
 
@@ -185,7 +187,7 @@ func TestHTTP_Templates_单租户部署忽略租户头(t *testing.T) {
 	h := &TemplateHandlers{
 		Svc:          base,
 		IsAdmin:      func(string) bool { return true },
-		IsSupervisor: func(string) bool { return true },
+		IsSupervisor: func(string, string) bool { return true },
 		// ForTenant 留 nil ⇒ 单租户
 	}
 	w := doTenant(h.handleListTemplates, http.MethodGet, "/api/templates?page=/report", "u1", "")
@@ -200,7 +202,8 @@ func TestHTTP_Templates_单租户部署忽略租户头(t *testing.T) {
 // TestHTTP_Templates_写路径也必须带租户 —— Save 走的是同一套解析。
 //
 // ★ 只测读路径是不够的：写路径漏租户会让数据写进错误的租户（比读到别人的更糟，
-//   因为它是**持久性**的污染）。
+//
+//	因为它是**持久性**的污染）。
 func TestHTTP_Templates_写路径也必须带租户(t *testing.T) {
 	var calls []string
 	base := &tenantProbeSvc{label: "base", calls: &calls}
@@ -208,7 +211,7 @@ func TestHTTP_Templates_写路径也必须带租户(t *testing.T) {
 	h := &TemplateHandlers{
 		Svc:          base,
 		IsAdmin:      func(string) bool { return true },
-		IsSupervisor: func(string) bool { return true },
+		IsSupervisor: func(string, string) bool { return true },
 		ForTenant:    func(string) TemplateService { return tenantA },
 	}
 
