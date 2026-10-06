@@ -85,7 +85,11 @@ type Validation struct {
 	OutOfScope []string
 	Duplicates []string
 	Route      []ApprovalStep
-	Message    string
+	// CCs 与 Route **同一次**路由产出的抄送记录。
+	// ★ 单列为字段而不是让 Submit 再调一次 Org.Route：Route 内含 time.Now()，
+	//   两次调用的 NotifiedAt 会不同，且任何对路由的改动都可能在两次调用间漂移。
+	CCs     []chain.CcRecord
+	Message string
 }
 
 // Service 申请流服务。
@@ -162,14 +166,40 @@ func (s *Service) Validate(r *Request, dataChain *chain.DataChain) (*Validation,
 	}
 
 	// 4) 路由：+1 审批 / +2 抄送（F9=A）；须自身拥有被申请权限
+	//    BatchSize 由维度被授范围推导 —— 见 grantedAccountScope。
 	ac, err := s.Org.Route(chain.RouteInput{
 		Applicant:   r.Applicant,
 		DraftLevel:  string(r.Draft.MaxLevel),
 		DraftGroups: groupIDs(r.Draft.DataUseGroups),
+		ExpiryDays:  expiryDaysFrom(r),
+		BatchSize:   grantedAccountScope(r.Draft),
 		CrossDept:   r.CrossDept,
 	}, s.CcPolicy)
 	if err != nil {
 		return nil, err
+	}
+	r.CCs = ac.CcRecords
+
+	// 5) 会签补判（F8）：L4 / 跨部门 / 长期 / 敏感组已在 Route 内判定；
+	//    「批量授予 ≥ 阈值」的规模随 RouteInput.BatchSize 传入（见 grantedAccountScope），
+	//    故此处无需再补判，只做一次自证：名单里若仍有 cosign 而未命中任一条件，
+	//    说明 Route 与 CosignTrigger 已经漂移（有人在 Route 里私自塞了会签）。
+	//    ★ 这条自证的价值：会签一旦被"多触发"，申请会永远卡在 COSIGN_PENDING，
+	//    而表象只是"审批很久没动"，极难定位。
+	for i := range ac.CcRecords {
+		if ac.CcRecords[i].Mode != chain.CcCosign {
+			continue
+		}
+		if ok, _ := chain.CosignTrigger(chain.RouteInput{
+			Applicant:   r.Applicant,
+			DraftLevel:  string(r.Draft.MaxLevel),
+			DraftGroups: groupIDs(r.Draft.DataUseGroups),
+			ExpiryDays:  expiryDaysFrom(r),
+			BatchSize:   grantedAccountScope(r.Draft),
+			CrossDept:   r.CrossDept,
+		}, s.CcPolicy); !ok {
+			return nil, errors.New("req: 会签标记与触发条件不一致（Route 与会签判定漂移）")
+		}
 	}
 
 	approver := ac.Approver
@@ -187,8 +217,66 @@ func (s *Service) Validate(r *Request, dataChain *chain.DataChain) (*Validation,
 		Tier:     apNode.Tier,
 		Action:   "PENDING",
 	}}
-	r.CCs = ac.CcRecords
+	v.CCs = ac.CcRecords
+	// CCs 由本函数连同 Route 一起返回（同源），供 Submit 直接落单。
 	return v, nil
+}
+
+// expiryDaysFrom 由申请单推导有效期天数（F8「有效期 > 90 天 ⇒ 会签」）。
+//
+// ★ 为什么必须有：此前 RouteInput 从未填 ExpiryDays，于是
+//   「有效期>90天 ⇒ 会签」这条触发条件在**生产路径上永远不成立** ——
+//   闸门单测直接构造 RouteInput{ExpiryDays: 91} 能过，真实提交却恒为 0。
+//   这是"闸门测的是入参、不是链路"的典型空转。
+//
+// 语义：
+//   - RequestedExpiry 为空 ⇒ 0（= 非长期授权，不触发长期会签）
+//   - 已过期的时间点 ⇒ 0（不因一个无效时间点升级为会签；
+//     有效性由提交校验负责，不在这里兜底）
+//   - 向上取整到天：23 小时也算 1 天，绝不向下取整 ——
+//     向下取整会让"90 天零几小时"仍被当成 90 天而漏掉会签。
+func expiryDaysFrom(r *Request) int {
+	if r == nil || r.RequestedExpiry == nil {
+		return 0
+	}
+	d := r.RequestedExpiry.Sub(r.CreatedAt)
+	if d <= 0 {
+		return 0
+	}
+	const day = 24 * time.Hour
+	days := int(d / day)
+	if d%day != 0 {
+		days++
+	}
+	return days
+}
+
+// grantedAccountScope 估计本次申请的**被授账号规模**（F8「批量授予 ≥10 ⇒ 会签」）。
+//
+// ★ 为什么必须有：此前 RouteInput.BatchSize 从未被填，恒为 0 ⇒
+//   「批量≥10 ⇒ 会签」在生产路径上永远不成立。闸门用裸 RouteInput 测得到，
+//   真实提交永远不触发。
+//
+// 口径：按维度的**被授范围基数**求和。
+//   - IncludeDescendants=true ⇒ 至少按 2 估（该节点 + 其下至少一个后代）。
+//     这是保守**高估**还是低估？—— 高估：宁可多触发会签，不可漏。
+//     「批量授权」的风险来自覆盖面，宁可误报一次会签也不能漏一次。
+//   - 无维度项 ⇒ 0（不是"全量"）：全量范围由 MaxLevel/模块表达，
+//     不在本函数的职责内，凭空记一个巨大数字会让所有申请都被判批量。
+func grantedAccountScope(d Draft) int {
+	n := 0
+	for _, dg := range d.Dimensions {
+		if dg.IncludeDescendants {
+			if len(dg.Values) == 0 {
+				n += 2 // 整个维度下所有取值 + 其后代 ⇒ 至少 2
+				continue
+			}
+			n += len(dg.Values) * 2
+			continue
+		}
+		n += len(dg.Values)
+	}
+	return n
 }
 
 // escalateToSuperset 沿主属链向上找第一个权限覆盖草案的审批人；无则 T1。
@@ -225,8 +313,15 @@ func (s *Service) Submit(r *Request, dataChain *chain.DataChain) (*Validation, e
 		return v, nil
 	}
 	r.Approvals = v.Route
+	// CCs 与 Route 同源（v.CCs 由 Validate 内那次唯一的 Route 产出）。
+	// ★ 若这里改用另一次 Org.Route 的结果，就会出现"审批人来自一次路由、
+	//   抄送来自另一次路由"的错位 —— Route 内含 time.Now()，两次结果不保证一致。
+	r.CCs = v.CCs
+	// ★ 抄送模式必须在**确定状态之前**落定到 r.CCs：状态由"是否存在会签抄送"决定。
+	//   曾经此处先置 APPROVING 再检查模式，若检查的是另一次路由结果，
+	//   就会出现"状态 = APPROVING 但名单里全是 notify"——会签被静默跳过，
+	//   且没有任何断言会红（G7「会签触发」测的是 Route 的输出，不是申请单的状态）。
 	r.Status = StatusApproving
-	// 若非"知会"而是"会签"，则进入 COSIGN_PENDING
 	for _, cc := range r.CCs {
 		if cc.Mode == chain.CcCosign {
 			r.Status = StatusCosignPending
