@@ -173,19 +173,30 @@ const (
 )
 
 // CcRecord 抄送记录。
+//
+// ★ JSON tag 必须与 contracts/permission-request.ts 的 CcRecord **逐字一致**：
+//   本结构体会序列化进 fact_permission_request.ccs 这个 jsonb 列，
+//   0006 的 v_cosign_pending 视图直接按 `cc->>'decidedAt'` 取键判定
+//   「会签人是否已表态」。键名一旦被改成 PascalCase（如去掉 tag），
+//   视图里的判定会永远拿到 NULL ⇒ 把「已表态」全判成「未表态」，
+//   待办列表虚增；反向则更糟 —— 若判定写反就会漏掉真正卡住的单。
 type CcRecord struct {
-	Cc         string
-	Reason     string // "+2" / "+1 的直属上级" / "虚线汇报"
-	Mode       CcMode
-	NotifiedAt time.Time
+	Cc         string    `json:"cc"`
+	Reason     string    `json:"reason"` // "+2" / "+1 的直属上级" / "虚线汇报"
+	Mode       CcMode    `json:"mode"`
+	NotifiedAt time.Time `json:"notifiedAt"`
 	// 会签模式下：是否否决（F8）
-	Vetoed bool
+	Vetoed bool `json:"vetoed"`
 	// 会签模式下：表态时间。
 	//
 	// ★ 为什么必须有这个字段：只有 `Vetoed` 时无法区分
 	//   「会签人**尚未**表态」与「会签人**已同意**」—— 两者 Vetoed 都是 false。
 	//   而「尚未表态」时**不得放行**（否则会签形同虚设）。nil = 未表态。
-	DecidedAt *time.Time
+	//
+	//   omitempty 必须**去掉**：nil 时要显式序列化成 null，
+	//   让「未表态」这个语义位在 jsonb 里可见；若省略该键，
+	//   读取方无法区分「未表态」与「旧数据没这个字段」。
+	DecidedAt *time.Time `json:"decidedAt"`
 }
 
 // ApprovalChain 审批链（+1 审批 / +2 抄送）。

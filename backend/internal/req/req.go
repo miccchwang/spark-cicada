@@ -50,12 +50,18 @@ type DimGrant struct {
 }
 
 // ApprovalStep 审批步骤。
+//
+// ★ JSON tag 必须与 contracts/permission-request.ts 的 ApprovalStep **逐字一致**。
+//   这些结构体会被序列化进 fact_permission_request.approvals 这个 jsonb 列，
+//   而前端按契约的 camelCase 读取。若去掉 tag，Go 会输出 PascalCase，
+//   前端拿不到 approver/action ⇒ 待办列表空白，且**不会报错**（字段就是 undefined）。
+//   同样重要的是：0006 的 jsonb containment 检索也依赖这对键名。
 type ApprovalStep struct {
-	Approver string
-	Tier     string
-	Action   string // APPROVE | REJECT | RETURN | PENDING
-	Reason   string
-	At       time.Time
+	Approver string    `json:"approver"`
+	Tier     string    `json:"tier"`
+	Action   string    `json:"action"` // APPROVE | REJECT | RETURN | PENDING
+	Reason   string    `json:"reason,omitempty"`
+	At       time.Time `json:"at"`
 }
 
 // Request 申请单。

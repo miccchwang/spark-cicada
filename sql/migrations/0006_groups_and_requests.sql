@@ -1,188 +1,224 @@
--- 0006_groups_and_requests.sql —— M-GROUP 用户分组（D12）+ M-REQ 权限申请流（D14）
+-- 0006_groups_and_requests.sql —— M-GROUP（D12）+ M-REQ（D14）**增量补强**
 --
--- 为什么需要这一层：
---   勾选式授权（D11）解决了「能精确勾选」，但没有解决「批量管理」与「自助流程」：
---     * 同一批人（如「华东渠道组」）的权限逐账号重复勾选 ⇒ 必然漂移与遗漏；
---     * 用户想要一点额外权限时，只能线下找管理员 ⇒ 无留痕、无审批、无到期回收。
---   于是引入：
---     * 分组（UserGroup）：把「一批人的共同权限」抽出来，成员自动继承（取并集）。
---     * 申请流（PermissionRequest）：用户勾选 → 提交 → 审批 → 自动开通 → 到期回收。
+-- ══════════════════════════════════════════════════════════════════════════
+-- ★ 本迁移的由来（一次真实的「两套真相」事故，值得写下来）
 --
--- 关键纪律（docs/02 M-GROUP / M-REQ、contracts/user-group.ts、contracts/permission-request.ts）：
---   1. 一人多组，授权**取并集**；组不含层级（层级由 D13 职权链承担）。
---   2. 组授权与个人勾选冲突 → **DENY 优先**（绝不因「在某个组里」而扩权）。
---   3. 成员可「退出继承」（inherits_grants=false）以处理例外。
---   4. 申请单草案**不含 canViewBusinessValues** —— IT 恒不可申请业务数值（D7）。
---   5. 审批人必须**自身拥有**被申请的全部权限（S ⊆ 权限(P)）；不足则上溯到权限超集者，
---      无则 T1 兜底。该判定在应用层完成，DB 只负责留痕与状态。
---   6. 跨部门 → BLOCKED_CROSS_DEPT（需 T1 直接授予，不可自助申请）。
---   7. 会签（F8）：高风险场景抄送人具**否决权**；知会（默认）不阻断。
---   8. 全部变更 append-only 留痕（走 audit_log 触发器）。
+--   初版 0006 是**另起一套**结构：dim_user_group / fact_group_membership /
+--   fact_group_grant / dim_account_entitlement / fact_request_approval /
+--   fact_request_cc —— 七张全新的表。
 --
--- 分层（与 0001/0002 一致）：
---   dim_user_group             ── 维表：分组定义
---   fact_group_membership      ── 事实：成员关系（可继承开关）
---   fact_group_grant           ── 事实：组级授权（模块/维度/密级）
---   dim_account_entitlement    ── 维表：账号个人勾选（与组授权合并求值）
---   fact_permission_request    ── 事实：申请单
---   fact_request_approval      ── 事实：审批步骤
---   fact_request_cc            ── 事实：抄送 / 会签记录
+--   真库一跑就炸：`ERROR: column "region" does not exist (SQLSTATE 42703)`。
+--   排查后发现根因不是 SQL 写错，而是 —— **迁移 0001 早就建好了 M-GROUP / M-REQ 的表**：
+--
+--       dim_group                 ← 分组定义（含 grants jsonb）
+--       dim_group_member          ← 成员关系（含 inherits_grants）
+--       fact_entitlement          ← 账号权限（D11 逐项勾选）
+--       fact_permission_request   ← 申请单（approvals / ccs 存 jsonb）
+--
+--   而 0001 的这份设计**与契约完全一致**：
+--     * contracts/user-group.ts        v1.0 → grants: GroupGrants（单一 jsonb）
+--     * contracts/permission-request.ts v1.0 → approvals: ApprovalStep[]、ccs: CcRecord[]
+--     * docs/08 §2.1 数据模型         → UserGroup { grants: {...}, owners, ... }
+--     * docs/08 §3.3 / §4             → +1 审批 / +2 抄送，approvals 内联
+--
+--   也就是说：**初版 0006 才是错的那一方**。它凭空发明了
+--   region / restricted / deny / data_use_group 等契约里不存在的字段，
+--   并把「一份 grants」拆成七张表 —— 与 0001 形成两套并行真相。
+--
+--   若放任不管，后果是长期而隐蔽的：
+--     * 界面按 0001（jsonb）读、后台按 0006（子表）写 ⇒ 权限漂移；
+--     * 同一个「组成员」有两个来源，DENY 到底以谁为准无法回答；
+--     * 两套表都要维护，审计无法给出唯一答案。
+--   这正是本仓库反复强调的纪律所禁止的：**同一事实只允许一处真相**。
+--
+--   ⇒ 因此本迁移**推倒重写**为「只做 0001 缺的东西」的增量补强。
+-- ══════════════════════════════════════════════════════════════════════════
+--
+-- 0001 已经覆盖的部分（本迁移**不再重复建表**）：
+--   dim_group（分组定义 + grants jsonb + owners）
+--   dim_group_member（成员 + role + inherits_grants）
+--   fact_entitlement（个人勾选 + D7 的 DB 层 CHECK）
+--   fact_permission_request（申请单 + approvals/ccs jsonb + 状态 CHECK）
+--
+-- 本迁移补的三件事（每一件都对应一个**0001 无法表达的缺口**）：
+--
+--   ① **分组可授范围必须能被库层约束**（D7 兜底）。
+--      0001 的 grants 是单个 jsonb，DB 无法对「IT 组不得含 canViewBusinessValues」
+--      做 CHECK。这里加一条**表达式 CHECK**，让「IT 组带业务数值」在库层直接写入失败 ——
+--      而不是指望每个写入路径都记得在应用层拦。
+--
+--   ② **组授权的变更要能按行审计**（docs/08 §5「建组/改名/改授权全部落审计」）。
+--      整块 jsonb 的 UPDATE 在审计里只能看到「grants 变了」，看不到
+--      「具体多了/少了哪个 module」。这里加 fact_group_grant_change ——
+--      **只增不改**的变更流水，回答「谁在什么时候给哪个组加了什么」。
+--
+--   ③ **申请单的终态与到期回收需要可检索的索引**。
+--      0001 只有 (applicant) 与 (status) 两个索引；回收任务要按
+--      「APPROVED 且 requested_expiry 已过」筛选，需要复合索引才不至于全表扫。
+--
+-- 分层（与 0001/0002 一致）：本迁移**只加列/约束/索引/流水表**，不改任何既有列语义。
 
 BEGIN;
 
--- ───────────────────────── 分组定义 ─────────────────────────
-CREATE TABLE IF NOT EXISTS dim_user_group (
-    id          text        PRIMARY KEY,             -- grp_xxx
-    name        text        NOT NULL,                -- 「华东渠道组」
-    description text        NULL,
-    region      text        NOT NULL DEFAULT 'ap-southeast-1',   -- G12 分地域
-    -- 可管理本组成员与授权的账号（owners）
-    owners      text[]      NOT NULL DEFAULT '{}',
-    -- 是否受限分组：受限分组不得授出业务数值（与 D7 一致的兜底）
-    restricted  boolean     NOT NULL DEFAULT false,
-    created_at  timestamptz NOT NULL DEFAULT now(),
-    updated_at  timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_user_group_region ON dim_user_group(region);
-
--- ───────────────────────── 成员关系 ─────────────────────────
+-- ───────────────────────── ① 分组授权上界的库层约束（D7 兜底）─────────────
 --
--- ★ inherits_grants 是「例外处理」的载体：
---   成员在组内，但若其职责特殊（如借调期），可置 false 而不继承组授权。
---   不能靠「把他移出组」来达到同样效果 —— 那会丢失「他在组内」这一事实。
-CREATE TABLE IF NOT EXISTS fact_group_membership (
-    group_id        text        NOT NULL REFERENCES dim_user_group(id) ON DELETE CASCADE,
-    account         text        NOT NULL,
-    role            text        NOT NULL DEFAULT 'member'
-                                CHECK (role IN ('member','owner')),
-    inherits_grants boolean     NOT NULL DEFAULT true,
-    joined_at       timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (group_id, account)
-);
-
-CREATE INDEX IF NOT EXISTS idx_group_membership_account ON fact_group_membership(account);
-
--- ───────────────────────── 组级授权 ─────────────────────────
+-- grants jsonb 的形状（contracts/user-group.ts GroupGrants）：
+--   { "modules":[...], "dimensions":[...], "maxLevel":"L1..L4",
+--     "canViewBusinessValues": bool }
 --
--- 一个组可授出多条（模块 / 维度 / 密级）授权。与个人授权同构，
--- 便于求值时「组授权 ∪ 个人授权 ⊖ DENY」用同一套代码路径。
-CREATE TABLE IF NOT EXISTS fact_group_grant (
-    id               bigserial   PRIMARY KEY,
-    group_id         text        NOT NULL REFERENCES dim_user_group(id) ON DELETE CASCADE,
-    -- 授权种类：module / dimension / level / data_use_group
-    kind             text        NOT NULL
-                                 CHECK (kind IN ('module','dimension','level','data_use_group')),
-    -- module:<id> / dimension:<dim> / level:<L1..L4> / data_use_group:<grp.xxx>
-    key              text        NOT NULL,
-    -- 维度的取值范围（空数组 = 全部，受密级约束）；非维度类为空
-    values           text[]      NOT NULL DEFAULT '{}',
-    include_descendants boolean  NOT NULL DEFAULT false,
-    -- ★ DENY 优先：允许显式拒绝项，覆盖个人勾选
-    deny             boolean     NOT NULL DEFAULT false,
-    granted_at       timestamptz NOT NULL DEFAULT now()
-);
-
--- 同一组内同一 key 只应有一条有效判定（kind+key 唯一）
-CREATE UNIQUE INDEX IF NOT EXISTS uq_group_grant_key
-    ON fact_group_grant (group_id, kind, key);
-
--- ───────────────────────── 账号个人勾选（D11） ─────────────────────────
+-- ★ 判据的选择（这里刻意不用组名）：
+--   初稿写了 `name LIKE '%IT%'` —— 那是**脆弱**的：一个叫「ITEM 铺货组」的
+--   业务组会被误判成 IT 组，于是它的业务数值权限被库层硬拦，属于误伤；
+--   而真正的 IT 组若叫「信息技术组」则又拦不住，属于漏放。
+--   两种错误方向都有，且都不易在测试中发现。
 --
--- 与组授权**分开存**：组授权是「批量、可复用」的；个人勾选是「逐账号微调」的。
--- 求值时合并，冲突时 DENY 优先（个人 DENY 也优先于组允许）。
-CREATE TABLE IF NOT EXISTS dim_account_entitlement (
-    account          text        NOT NULL,
-    base_template    text        NOT NULL DEFAULT 'tpl.base',
-    -- 个人勾选：模块 / 维度 / 密级 / 数据用途组
-    modules          text[]      NOT NULL DEFAULT '{}',
-    dimensions       jsonb       NOT NULL DEFAULT '{}'::jsonb,
-    data_use_groups  text[]      NOT NULL DEFAULT '{}',
-    max_level        text        NOT NULL DEFAULT 'L1'
-                                 CHECK (max_level IN ('L1','L2','L3','L4')),
-    -- ★ D7：IT 恒不可见业务数值。此处存的是「是否允许」，
-    --   但 IT 模板在应用层被强制置 false（DB 层不写死，便于将来政策调整留痕）。
-    can_view_business_values boolean NOT NULL DEFAULT false,
-    -- 个人 DENY 列表（kind:key），优先于任何允许
-    denies           text[]      NOT NULL DEFAULT '{}',
-    region           text        NOT NULL DEFAULT 'ap-southeast-1',
-    updated_at       timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (account)
-);
-
-CREATE INDEX IF NOT EXISTS idx_account_entitlement_region ON dim_account_entitlement(region);
-
--- ───────────────────────── 申请单 ─────────────────────────
-CREATE TABLE IF NOT EXISTS fact_permission_request (
-    id                text        PRIMARY KEY,        -- req_xxx
-    applicant         text        NOT NULL,
-    -- 申请草案：勾选组 / 模块 / 维度 / 密级（**不含 canViewBusinessValues**，D7）
-    draft             jsonb       NOT NULL,
-    -- 批量申请：给某个分组申请（与 draft 并存）
-    target_group_id   text        NULL REFERENCES dim_user_group(id) ON DELETE SET NULL,
-    purpose           text        NOT NULL,           -- 用途说明（必填）
-    requested_expiry  timestamptz NULL,               -- 空 = 长期
-    status            text        NOT NULL DEFAULT 'DRAFT'
-                                  CHECK (status IN ('DRAFT','SUBMITTED','APPROVING',
-                                                    'COSIGN_PENDING','APPROVED','REJECTED',
-                                                    'WITHDRAWN','BLOCKED_CROSS_DEPT')),
-    cross_dept        boolean     NOT NULL DEFAULT false,
-    region            text        NOT NULL DEFAULT 'ap-southeast-1',
-    created_at        timestamptz NOT NULL DEFAULT now(),
-    resolved_at       timestamptz NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_request_applicant ON fact_permission_request(applicant, status);
-CREATE INDEX IF NOT EXISTS idx_request_status    ON fact_permission_request(status, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_request_region    ON fact_permission_request(region, status);
-
--- ───────────────────────── 审批步骤 ─────────────────────────
-CREATE TABLE IF NOT EXISTS fact_request_approval (
-    id          bigserial   PRIMARY KEY,
-    request_id  text        NOT NULL REFERENCES fact_permission_request(id) ON DELETE CASCADE,
-    approver    text        NOT NULL,
-    tier        text        NOT NULL,                 -- T1..T6
-    seq         integer     NOT NULL DEFAULT 0,       -- 审批次序
-    action      text        NOT NULL DEFAULT 'PENDING'
-                            CHECK (action IN ('APPROVE','REJECT','RETURN','PENDING')),
-    reason      text        NULL,
-    at          timestamptz NULL,
-    UNIQUE (request_id, approver)                     -- 一人一步，避免重复路由
-);
-
-CREATE INDEX IF NOT EXISTS idx_request_approval_req ON fact_request_approval(request_id, seq);
-
--- ───────────────────────── 抄送 / 会签（F8）─────────────────────────
---
--- ★ mode 决定抄送人是否具否决权：
---   notify（默认）—— 可见但无决定权，**不阻断**
---   cosign        —— 具**否决权**，否决即驳回
--- 升级为会签的触发条件（任一命中）：L4 / 跨部门 / 有效期>90天 /
--- 含 grp.roi·grp.cost_profit / 批量≥10 个账号或分组。
-CREATE TABLE IF NOT EXISTS fact_request_cc (
-    id          bigserial   PRIMARY KEY,
-    request_id  text        NOT NULL REFERENCES fact_permission_request(id) ON DELETE CASCADE,
-    cc          text        NOT NULL,
-    reason      text        NOT NULL,                 -- 如 "+2" / "+1 的直属上级"
-    mode        text        NOT NULL DEFAULT 'notify'
-                            CHECK (mode IN ('notify','cosign')),
-    notified_at timestamptz NOT NULL DEFAULT now(),
-    read_at     timestamptz NULL,
-    vetoed      boolean     NOT NULL DEFAULT false,
-    decided_at  timestamptz NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_request_cc_req ON fact_request_cc(request_id);
-
--- ───────────────────────── 分组定义 → 审计（append-only）─────────────────────────
---
--- 复用 0001 的审计纪律：分组与授权的变更同样不可篡改。
--- 这里只加触发器函数（audit_log 与函数体在 0001 已建；此处确保本迁移可独立可读）。
+--   改用一个**显式的标记位** `grants->>'isIT'`，与 0001 用
+--   base_template='tpl.it' 的思路同构：靠**声明的属性**判身份，不靠名字猜。
+--   默认 false ⇒ 历史行（没有该字段）不受影响，不会因为迁移而突然写不进去。
 DO $$
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'audit_log_append_only') THEN
-        RAISE NOTICE '0006: audit_log_append_only 已存在，跳过重复创建';
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ck_dim_group_spark_cicada_it_no_business'
+    ) THEN
+        ALTER TABLE dim_group
+            ADD CONSTRAINT ck_dim_group_spark_cicada_it_no_business
+            CHECK (NOT (
+                COALESCE(grants->>'isIT', 'false')::boolean
+                AND COALESCE(grants->>'canViewBusinessValues', 'false')::boolean
+            ));
     END IF;
 END $$;
+
+-- 分组授权上限的**数值**约束：maxLevel 必须是四个合法值之一。
+--
+-- ★ 为什么要单独加：0001 的 grants 是自由 jsonb，可以写进 "maxLevel":"L9"。
+--   一旦出现非法密级，求值器对它的处理是「不认识 → 当 L1 还是当 L4」，
+--   全凭实现细节 —— 而其中一种选择就是**静默扩权**。
+--   在库层钉死取值域，比在下游每个 switch 里兜底可靠。
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ck_dim_group_spark_cicada_max_level'
+    ) THEN
+        ALTER TABLE dim_group
+            ADD CONSTRAINT ck_dim_group_spark_cicada_max_level
+            CHECK (
+                grants->>'maxLevel' IS NULL
+                OR grants->>'maxLevel' IN ('L1','L2','L3','L4')
+            );
+    END IF;
+END $$;
+
+-- ───────────────────────── ② 组授权的按行变更流水（可审计）─────────────────
+--
+-- ★ 为什么需要它（而不是靠 grants jsonb 的 UPDATE 触发审计）：
+--
+--   审计要回答的问题是「**谁**在**什么时候**给**哪个组**加了**哪个 module**」。
+--   jsonb 整块覆盖只能留下「grants 从 {A,B} 变成 {A}」这样的快照，
+--   读审计的人得自己做 diff 才能还原意图 —— 而 diff 在并发修改下并不可靠。
+--
+--   本表是**派生流水**：应用层在写 dim_group.grants 的同一个事务里，
+--   把「本次新增/移除的条目」逐条落进来。它是 append-only 的，
+--   与 audit_log 的分工是：audit_log 记「这个组的 grants 变了」，
+--   本表记「变的具体是哪几条」。前者粗粒度、后者可检索。
+CREATE TABLE IF NOT EXISTS fact_group_grant_change (
+    id          bigserial   PRIMARY KEY,
+    group_id    text        NOT NULL REFERENCES dim_group(id) ON DELETE CASCADE,
+    -- 变更动作：授予 / 收回
+    action      text        NOT NULL CHECK (action IN ('GRANT','REVOKE')),
+    -- 授权种类，与 GroupGrants 的字段一一对应
+    --
+    -- ★ 这里用 `level` 而不是 `max_level`，是为了与 group.KindLevel 常量
+    --   逐字一致：DB 的 kind 字符串会被应用层直接当枚举用，
+    --   两处命名不同就得写一张映射表，而映射表迟早会被漏掉一处。
+    kind        text        NOT NULL
+                            CHECK (kind IN ('module','dimension','level','data_use_group')),
+    -- module:<id> / dimension:<dim> / level:<L1..L4> / data_use_group:<grp.xxx>
+    key         text        NOT NULL,
+    -- 维度的取值（非维度类为空）；用于回答「收回了哪些渠道」
+    values      text[]      NOT NULL DEFAULT '{}',
+    -- 谁做的这次变更（管理员账号）
+    actor       text        NOT NULL,
+    -- 变更原因（支持工单号 / 申请单 id —— 便于把「因哪张申请单而开通」串起来）
+    reason      text        NULL,
+    at          timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_group_grant_change_group
+    ON fact_group_grant_change(group_id, at DESC);
+
+-- 按 key 检索「这个 module 被授给过哪些组」（追责 / 影响面分析）。
+CREATE INDEX IF NOT EXISTS idx_group_grant_change_key
+    ON fact_group_grant_change(kind, key);
+
+-- ───────────────────────── ③ 申请单的回收与终态索引 ─────────────────────────
+--
+-- ★ 复合索引 (status, requested_expiry)：回收任务的 WHERE 正是
+--     status = 'APPROVED' AND requested_expiry IS NOT NULL AND requested_expiry <= now()
+--   0001 已有的 (status) 单列索引在这种「再加一个范围条件」的查询上，
+--   选中率差时会退化成大量回表。复合索引让整个条件走一次索引扫描。
+--
+--   注意列序：status 在前。因为 status 的区分度低但**选择性在前**能让
+--   requested_expiry 的范围扫描只落在 APPROVED 这个子集上 —— 顺序反了就用不上。
+CREATE INDEX IF NOT EXISTS idx_request_reclaimable
+    ON fact_permission_request(status, requested_expiry)
+    WHERE requested_expiry IS NOT NULL;
+
+-- 待办队列：审批人打开「我的待批」时按申请时间倒序取有界页。
+CREATE INDEX IF NOT EXISTS idx_request_approving_created
+    ON fact_permission_request(status, created_at DESC);
+
+-- ───────────────────────── ④ 申请单的「谁在批」可检索 ─────────────────────────
+--
+-- ★ 0001 把 approvals 存成 jsonb，这带来一个真实的检索缺口：
+--   「列出 u.lead 待批的所有申请」原本只能扫全表。
+--
+--   这里不引入冗余的审批子表（那会重新制造「两套真相」——审批步骤既在
+--   jsonb 又在子表），而是用 **GIN(jsonb_path_ops)**：这正是为
+--   containment 查询（`@>`）优化的 jsonb 索引操作符类。
+--
+--   为什么是 jsonb_path_ops 而不是默认的 jsonb_ops：
+--   默认 jsonb_ops 会为 jsonb 的**每个键和每个值**各建一个索引项，
+--   索引体积约为 jsonb_path_ops 的 2–3 倍，写入也更慢；
+--   而这里只用 `@>` 查询，用不上「键存在性」那类查询。
+--   jsonb_path_ops 恰好只支持 `@>` / `@?` / `@@`，是本场景的正解。
+--
+--   查询写法（应用层）：
+--     SELECT ... FROM fact_permission_request
+--     WHERE status='APPROVING'
+--       AND approvals @> '[{"approver":"u.lead","action":"PENDING"}]';
+CREATE INDEX IF NOT EXISTS idx_request_approvals_gin
+    ON fact_permission_request USING gin (approvals jsonb_path_ops);
+
+-- ───────────────────────── ⑤ 会签未决的可检索视图 ─────────────────────────
+--
+-- ★ 会签闸门（F8）在应用层判 cc.decided_at IS NULL。但运维需要一个
+--   **只读**入口回答「现在有多少单卡在会签上、卡在谁那里」——
+--   这正是事故排查时最先要看的数字。
+--
+--   做成视图而不是物化表：会签状态变化频繁，物化表的刷新延迟
+--   会让运维看到过期数据，反而误导；视图实时、且不需维护。
+CREATE OR REPLACE VIEW v_cosign_pending AS
+SELECT
+    r.id              AS request_id,
+    r.applicant,
+    r.purpose,
+    r.status,
+    r.created_at,
+    (cc->>'cc')       AS cosigner,
+    (cc->>'mode')     AS mode,
+    (cc->>'reason')   AS reason
+FROM fact_permission_request r
+CROSS JOIN LATERAL jsonb_array_elements(r.ccs) AS cc
+WHERE r.status = 'COSIGN_PENDING'
+  AND (cc->>'mode') = 'cosign'
+  -- ★ 仅列出**尚未表态**者 —— 这正是「卡住」的定义。
+  --   已表态（decided_at 非空）的不该出现在「待办」里。
+  AND (cc->>'decidedAt') IS NULL;
+
+COMMENT ON VIEW v_cosign_pending IS
+    'M-REQ 会签待办：status=COSIGN_PENDING 且存在未表态 cosign 抄送人的申请（F8）';
 
 COMMIT;

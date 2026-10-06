@@ -183,8 +183,35 @@ func (m *Migrator) DryRun(ctx context.Context, migs []Migration) (MigrateResult,
 	return res, nil
 }
 
-// Up 应用所有未执行的迁移。每个迁移在独立事务内执行。
+// migrationLockKey 是 pg_advisory_lock 的键（任意常量，全局唯一即可）。
+//
+// ★ 为什么必须上锁（真实事故，本仓库踩过）：
+//   `go test ./...` 并行跑多个包，每个包各自 NewMigrator + Up —— 于是
+//   同一时刻有 N 个 migrator 在同一个库上跑同一批迁移。它们都读到
+//   「0003 尚未应用」，然后**同时**执行 CREATE TABLE / INSERT 记账：
+//     - CREATE TABLE 撞 "duplicate key value violates unique constraint
+//       pg_class_relname_nsp_index"
+//     - 记账撞 "schema_migrations_pkey"
+//   而这不是「测试环境专有的怪现象」—— 生产同样会出现：多实例滚动发布时
+//   两个进程同时启动、或 CI 并行 job 指向同一张测试库，都一样会撞。
+//
+//   加锁比「让调用方保证串行」可靠：那是把并发正确性外包给每个调用点，
+//   而调用点会越来越多（CLI、测试、迁移 Job、多副本启动）。
 func (m *Migrator) Up(ctx context.Context, migs []Migration) (MigrateResult, error) {
+	// 会话级咨询锁：连接池会保证 acquire 与 release 落在**同一条连接**上，
+	// 因此必须显式加/解锁，且成对出现。
+	conn, err := m.pool.Acquire(ctx)
+	if err != nil {
+		return MigrateResult{}, fmt.Errorf("db: 获取迁移锁连接失败: %w", err)
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLockKey); err != nil {
+		return MigrateResult{}, fmt.Errorf("db: 获取迁移咨询锁失败: %w", err)
+	}
+	// 解锁失败不改变结果 —— 连接归还时锁会自动释放；这里只需尽力而为。
+	defer func() { _, _ = conn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, migrationLockKey) }()
+
 	applied, err := m.Applied(ctx)
 	if err != nil {
 		return MigrateResult{}, err
@@ -206,6 +233,12 @@ func (m *Migrator) Up(ctx context.Context, migs []Migration) (MigrateResult, err
 	}
 	return res, nil
 }
+
+// migrationLockKey 迁移咨询锁的键值（任意常量，全仓库一致即可）。
+//
+// ★ 取一个**固定常量**而非随机数：随机数会让不同的 migrator 拿到不同的锁，
+//   等于没上锁。这个数字本身无意义，只要各处一致。
+const migrationLockKey int64 = 0x5C_D1_CA_DA_5E_ED /* spark-cicada-seed */
 
 // applyOne 在单事务内执行一个迁移并记账。
 func (m *Migrator) applyOne(ctx context.Context, mg Migration) error {
