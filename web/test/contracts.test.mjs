@@ -35,6 +35,7 @@ const PAIRS = [
   { dir: "query-state", ifaces: ["TimeRange", "FilterClause", "DimSelection", "OrderClause", "PageClause", "PrecomputeHint", "QueryState"] },
   { dir: "data-contract", ifaces: ["ColumnDef", "LevelSummary", "AlgoTrace", "DataGap", "DataContract"] },
   { dir: "view-template", ifaces: ["ViewTemplate", "ColumnPref", "LayoutPref"] },
+  { dir: "pnl", ifaces: ["CaliberMeta", "PnlLineDef", "PnlLine", "PnlStatement"] },
 ];
 
 for (const { dir, ifaces } of PAIRS) {
@@ -73,4 +74,29 @@ test("契约版本号一致", () => {
   const tvTruth = tTruth.match(/VIEW_TEMPLATE_VERSION\s*=\s*"([^"]+)"/)?.[1];
   const tvMirror = tMirror.match(/VIEW_TEMPLATE_VERSION\s*=\s*"([^"]+)"/)?.[1];
   assert.equal(tvMirror, tvTruth, "ViewTemplate 版本号漂移");
+
+  const pTruth = readFileSync(join(REPO, "contracts", "pnl.ts"), "utf8");
+  const pMirror = readFileSync(join(WEB, "src", "contracts", "pnl.ts"), "utf8");
+  const pvTruth = pTruth.match(/PNL_CONTRACT_VERSION\s*=\s*"([^"]+)"/)?.[1];
+  const pvMirror = pMirror.match(/PNL_CONTRACT_VERSION\s*=\s*"([^"]+)"/)?.[1];
+  assert.equal(pvMirror, pvTruth, "PnL 契约版本号漂移");
+});
+
+/**
+ * ★ 口径不变量必须**在契约层**就写死，而不是散在实现里。
+ *
+ * 「net_revenue 两口径相同」这条如果只存在于某个函数的注释里，
+ * 下一代维护者会在别处复制一份「自己的口径表」——然后两处漂移。
+ * 这里直接盯住三张表：CALIBER_INVARIANT_LINES / DISCOUNT_TARGET_LINE / 默认口径。
+ */
+test("★ P&L 口径契约：不变量行 / 折扣归属 / 模块默认（D10）", () => {
+  const truth = readFileSync(join(REPO, "contracts", "pnl.ts"), "utf8");
+  const mirror = readFileSync(join(WEB, "src", "contracts", "pnl.ts"), "utf8");
+  for (const [name, src] of [["真源", truth], ["镜像", mirror]]) {
+    assert.match(src, /CALIBER_INVARIANT_LINES[^=]*=\s*\[[^\]]*"net_revenue"/, `${name} 未把 net_revenue 列为口径不变量`);
+    assert.match(src, /A:\s*"marketing"/, `${name} 口径 A 的折扣归属应为 marketing（计入营销费用）`);
+    assert.match(src, /B:\s*"seller_discount"/, `${name} 口径 B 的折扣归属应为 seller_discount（收入抵减）`);
+    assert.match(src, /"module\.report":\s*"A"/, `${name} 经营报表默认口径应为 A（运营口径）`);
+    assert.match(src, /"module\.pnl":\s*"B"/, `${name} P&L 默认口径应为 B（财务口径，D10 分模块各自默认）`);
+  }
 });

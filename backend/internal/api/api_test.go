@@ -10,9 +10,9 @@ import (
 
 func docWith(cols []contracts.ColumnDef, rows []contracts.Row) *contracts.DataContract {
 	return &contracts.DataContract{
-		V:         contracts.DataContractVersion,
-		Columns:   cols,
-		Rows:      rows,
+		V:          contracts.DataContractVersion,
+		Columns:    cols,
+		Rows:       rows,
 		Aggregates: map[string]*float64{},
 	}
 }

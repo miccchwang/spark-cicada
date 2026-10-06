@@ -122,6 +122,23 @@ func main() {
 	mux.HandleFunc("/api/admin/algorithms", adminAlgoHandler(dp))
 	mux.HandleFunc("/api/admin/modules", adminModulesHandler(dp))
 
+	// ── M-PNL：口径元数据与切换 ──
+	//
+	// ★ 刻意**不放在 `if dp.dbReady` 里**：
+	//   口径清单与元数据是**静态契约**（来自 contracts/pnl.ts 与 docs/03 §4.3），
+	//   不依赖数据库。降级模式下仍应能回答「有哪些口径、默认是哪个」——
+	//   否则用户在库还没起来时连「为什么报表是这个口径」都查不到。
+	//   切换类请求在无库时**照样成功**，但会如实回报 audited=false
+	//   （口径是展示偏好，不是安全边界；不因审计不可用就剥夺用户能力）。
+	{
+		var auditor api.CaliberAuditor
+		if dp.caliberAudit != nil {
+			auditor = dp.caliberAudit
+		}
+		pnlH := &api.PnlHandlers{Auditor: auditor}
+		pnlH.Routes(mux)
+	}
+
 	// ── M-GROUP / M-REQ（组授权 + 申请流）与 M-TEMPLATE（模板中心）──
 	//
 	// ★ 二者共用同一套「管理员判定」，注入同一个 isAdmin 函数 ——

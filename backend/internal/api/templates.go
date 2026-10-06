@@ -3,20 +3,21 @@
 // ══════════════════════════════════════════════════════════════════════════
 // ★ 本层要防守的是「谁能读/改哪个模板」——与 groups.go 同源的风险：
 //
-//   1. **身份一律取自请求头 X-Spark-Account**，绝不接受 body 里的 owner。
-//      模板的 owner 决定了它在个人档下的可见范围；若 body 里的 owner 生效，
-//      任何人都能伪造「这是张三的模板」，进而在张三的模板列表里塞条目，
-//      或冒名把别人的模板改档。
+//  1. **身份一律取自请求头 X-Spark-Account**，绝不接受 body 里的 owner。
+//     模板的 owner 决定了它在个人档下的可见范围；若 body 里的 owner 生效，
+//     任何人都能伪造「这是张三的模板」，进而在张三的模板列表里塞条目，
+//     或冒名把别人的模板改档。
 //
-//   2. **改/删/设默认前先判归属**。CanWrite 比 CanRead 严：
-//      能「看」别人的团队模板，不等于能「改」。尤其 system 档模板
-//      一次改动会改变所有人的默认视图。
+//  2. **改/删/设默认前先判归属**。CanWrite 比 CanRead 严：
+//     能「看」别人的团队模板，不等于能「改」。尤其 system 档模板
+//     一次改动会改变所有人的默认视图。
 //
-//   3. **套用（apply）会改变可见数据，必须留痕**：套用写 audit_log，
-//      事后能回答「谁在何时套用了哪个口径」。
+//  3. **套用（apply）会改变可见数据，必须留痕**：套用写 audit_log，
+//     事后能回答「谁在何时套用了哪个口径」。
 //
-//   4. **模板永不含权限**。套用后能否拿到数据，仍由 /api/query 的门控决定。
-//      本层只回模板内容（怎么看），不回数据（能看什么）。
+//  4. **模板永不含权限**。套用后能否拿到数据，仍由 /api/query 的门控决定。
+//     本层只回模板内容（怎么看），不回数据（能看什么）。
+//
 // ══════════════════════════════════════════════════════════════════════════
 package api
 
@@ -31,7 +32,8 @@ import (
 // TemplateService 是 templatestore 提供给接口层的最小能力集。
 //
 // ★ 与 GroupService 同一纪律：用接口声明依赖，接口层因此不依赖 pgx，
-//   可以只用内存替身做 HTTP 层单测（测鉴权与参数校验，不必拖真库）。
+//
+//	可以只用内存替身做 HTTP 层单测（测鉴权与参数校验，不必拖真库）。
 type TemplateService interface {
 	// ResolveViewer 组装可见性判断所需的上下文（组、部门、是否管理员）。
 	ResolveViewer(ctx context.Context, account string, isAdmin func(string) bool) (template.Viewer, error)
@@ -131,7 +133,8 @@ func (h *TemplateHandlers) handleGetTemplate(w http.ResponseWriter, r *http.Requ
 // 返回该页应自动套用的默认模板；没有则返回 `{"template": null}`。
 //
 // ★ 返回 null 而不是随便挑一个：没有默认就不套用，
-//   否则用户会莫名被套上一个不属于自己口径的视图。
+//
+//	否则用户会莫名被套上一个不属于自己口径的视图。
 func (h *TemplateHandlers) handleDefaultTemplate(w http.ResponseWriter, r *http.Request) {
 	actor, ok := h.actor(w, r)
 	if !ok {
@@ -226,7 +229,8 @@ func (h *TemplateHandlers) handleSaveTemplate(w http.ResponseWriter, r *http.Req
 // 请求体：{ "id": "..." }
 //
 // ★ 套用前校验可见性；套用后累加使用次数并写审计（口径变更必须留痕）。
-//   本接口**不返回数据** —— 只确认套用；数据仍由 /api/query 取。
+//
+//	本接口**不返回数据** —— 只确认套用；数据仍由 /api/query 取。
 func (h *TemplateHandlers) handleApplyTemplate(w http.ResponseWriter, r *http.Request) {
 	actor, ok := h.actor(w, r)
 	if !ok {
@@ -365,8 +369,9 @@ func (h *TemplateHandlers) readable(ctx context.Context, t *template.Template, v
 // isSupervisor 判断是否「主管及以上」。
 //
 // ★ 做成可注入点：组织关系解析（D9 矩阵）会演进，接口层不该硬编码。
-//   默认实现保守返回 false（只有管理员能在 CanSetScope 里过关），
-//   避免「因为不知道谁是主管，就默认所有人都是」的提权。
+//
+//	默认实现保守返回 false（只有管理员能在 CanSetScope 里过关），
+//	避免「因为不知道谁是主管，就默认所有人都是」的提权。
 func (h *TemplateHandlers) isSupervisor(_ context.Context, account string) bool {
 	if h.IsSupervisor != nil {
 		return h.IsSupervisor(account)

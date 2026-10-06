@@ -6,21 +6,22 @@
 // ══════════════════════════════════════════════════════════════════════════
 // ★ 本层最需要防守的不是「功能对不对」，而是「谁能调这个接口」。
 //
-//   这是整个权限体系里**权力最集中**的一组接口：改一个组的 grants，
-//   就等于一次性给一批人扩权。因此三条纪律：
+//	这是整个权限体系里**权力最集中**的一组接口：改一个组的 grants，
+//	就等于一次性给一批人扩权。因此三条纪律：
 //
-//   1. **身份一律取自请求头，绝不接受请求体里的 account。**
-//      若 body 里带的 `actor` 生效，任何登录用户都能伪装成管理员去改别人的权限
-//      —— 这是最经典的越权（IDOR）。所有写接口的 actor 都从
-//      `X-Spark-Account` 取，body 里即使带了也被忽略。
+//	1. **身份一律取自请求头，绝不接受请求体里的 account。**
+//	   若 body 里带的 `actor` 生效，任何登录用户都能伪装成管理员去改别人的权限
+//	   —— 这是最经典的越权（IDOR）。所有写接口的 actor 都从
+//	   `X-Spark-Account` 取，body 里即使带了也被忽略。
 //
-//   2. **写操作先验「他是这个组的 owner，或者是全局管理员」。**
-//      仅靠「已登录」是不够的。
+//	2. **写操作先验「他是这个组的 owner，或者是全局管理员」。**
+//	   仅靠「已登录」是不够的。
 //
-//   3. **申请人只能撤回自己单；审批人必须是路由算出来的那个人。**
-//      前者由 req.Withdraw 内部保证（比对 Applicant），后者由
-//      req.Approve 内部按 Approvals 匹配 —— 接口层不重复实现，
-//      只负责把「当前登录人」如实传进去。
+//	3. **申请人只能撤回自己单；审批人必须是路由算出来的那个人。**
+//	   前者由 req.Withdraw 内部保证（比对 Applicant），后者由
+//	   req.Approve 内部按 Approvals 匹配 —— 接口层不重复实现，
+//	   只负责把「当前登录人」如实传进去。
+//
 // ══════════════════════════════════════════════════════════════════════════
 package api
 
@@ -37,8 +38,9 @@ import (
 // GroupService 是 groupstore 提供给接口层的最小能力集。
 //
 // ★ 用接口（而非直接依赖 *groupstore.Store）声明依赖：
-//   接口层因此不依赖 pgx，可以只用内存替身做 HTTP 层单测 ——
-//   HTTP 层要测的是「鉴权与参数校验」，不必每次都拖一个真库起来。
+//
+//	接口层因此不依赖 pgx，可以只用内存替身做 HTTP 层单测 ——
+//	HTTP 层要测的是「鉴权与参数校验」，不必每次都拖一个真库起来。
 type GroupService interface {
 	LoadGroup(ctx context.Context, id string) (*group.Group, error)
 	LoadGroupsFor(ctx context.Context, account string) ([]*group.Group, []group.Membership, error)
@@ -255,7 +257,8 @@ func (h *GroupHandlers) handleRemoveMembership(w http.ResponseWriter, r *http.Re
 // 请求体：{ "id": "...", "draft": {...}, "purpose": "...", "requestedExpiry": "..." }
 //
 // ★ 申请人取自请求头，**不接受 body 里的 applicant** —— 否则任何登录用户
-//   都能以他人名义提交申请（申请人决定了路由到谁的上级）。
+//
+//	都能以他人名义提交申请（申请人决定了路由到谁的上级）。
 func (h *GroupHandlers) handleSubmitRequest(w http.ResponseWriter, r *http.Request) {
 	actor, ok := h.actor(w, r)
 	if !ok {
@@ -469,7 +472,8 @@ func (h *GroupHandlers) handleMyPending(w http.ResponseWriter, r *http.Request) 
 // handleGetRequest GET /api/requests?id=
 //
 // ★ 可见性：只有申请人本人、审批人、会签人可读 ——
-//   申请单里含 purpose 与 draft，属于内部信息，不应任意用户可枚举。
+//
+//	申请单里含 purpose 与 draft，属于内部信息，不应任意用户可枚举。
 func (h *GroupHandlers) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 	actor, ok := h.actor(w, r)
 	if !ok {
@@ -489,8 +493,9 @@ func (h *GroupHandlers) handleGetRequest(w http.ResponseWriter, r *http.Request)
 // Routes 注册 M-GROUP / M-REQ 的全部路由。
 //
 // ★ 路由集中在一处声明（而不是散落在各 handler 里各自判断路径）：
-//   这样「这个接口到底暴露了哪些端点」是一个**可审计的列表** ——
-//   权限系统里，多暴露一个写接口就是多一个攻击面，必须一眼可查。
+//
+//	这样「这个接口到底暴露了哪些端点」是一个**可审计的列表** ——
+//	权限系统里，多暴露一个写接口就是多一个攻击面，必须一眼可查。
 //
 // 用 Go 1.22+ 的 method+path 模式（`POST /api/x`），比手写 switch 更清晰，
 // 也让「方法不对」由框架直接返回 405，不必每个 handler 自己判。

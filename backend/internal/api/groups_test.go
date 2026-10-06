@@ -3,10 +3,10 @@
 // 本文件测的**不是**业务逻辑（那在 group / req 包里已穷举），
 // 而是接口层**独有的**那几类风险：
 //
-//   1. 越权：能不能伪装成别人？（body 里塞 account / applicant）
-//   2. 鉴权：非本组管理员能不能改组？非本审批人能不能批？
-//   3. 信息泄露：别人能不能读到不该看的申请单 / 组定义？
-//   4. 参数校验：必填缺失时是否明确 4xx，而不是 500 或静默成功？
+//  1. 越权：能不能伪装成别人？（body 里塞 account / applicant）
+//  2. 鉴权：非本组管理员能不能改组？非本审批人能不能批？
+//  3. 信息泄露：别人能不能读到不该看的申请单 / 组定义？
+//  4. 参数校验：必填缺失时是否明确 4xx，而不是 500 或静默成功？
 //
 // 用内存替身而非真库：这些断言与 SQL 无关，拖一个 Postgres 起来只会
 // 让测试变慢、变脆，且淹没了「这层到底在防什么」的意图。
@@ -267,7 +267,7 @@ func TestHTTP_SubmitRequest_MissingIdentity(t *testing.T) {
 func TestHTTP_SubmitRequest_PurposeRequired(t *testing.T) {
 	h, svc := newTestServer(t)
 	w := do(h.handleSubmitRequest, http.MethodPost, "/api/requests", "u.staff", map[string]any{
-		"id": "req.nopurpose",
+		"id":    "req.nopurpose",
 		"draft": map[string]any{"modules": []string{"module.report"}, "maxLevel": "L1"},
 	})
 	if w.Code != http.StatusBadRequest {
@@ -462,9 +462,9 @@ func TestHTTP_GetRequest_Visibility(t *testing.T) {
 		account string
 		want    int
 	}{
-		{"u.staff", http.StatusOK},    // 申请人
-		{"u.lead", http.StatusOK},     // 审批人
-		{"u.cc", http.StatusOK},       // 抄送人
+		{"u.staff", http.StatusOK},        // 申请人
+		{"u.lead", http.StatusOK},         // 审批人
+		{"u.cc", http.StatusOK},           // 抄送人
 		{"u.other", http.StatusForbidden}, // 无关者
 	}
 	for _, c := range cases {

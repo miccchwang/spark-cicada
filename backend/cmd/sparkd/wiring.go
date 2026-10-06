@@ -39,6 +39,9 @@ type dataPlane struct {
 	// nil 表示库未就绪（对应接口按 503 fail-closed，不返回编造数据）。
 	groups    *groupstore.Store
 	templates *templatestore.Store
+	// caliberAudit：M-PNL 口径切换的审计落库（append-only）。
+	// nil 表示库未就绪 —— 此时口径仍可切换，但接口会如实回报「未留痕」。
+	caliberAudit *store.CaliberAuditStore
 	// dbReady 表示真库已就绪（迁移已应用、注册表已加载）。
 	dbReady bool
 	// dbDegradeReason 在 dbReady=false 时说明**为什么**降级。
@@ -118,6 +121,8 @@ func buildDataPlane(ctx context.Context) *dataPlane {
 	// M-GROUP/M-REQ 与 M-TEMPLATE 的持久化（与 store 同池）
 	p.groups = groupstore.New(pool)
 	p.templates = templatestore.New(pool)
+	// 口径切换审计复用同一连接池（audit_log 是 append-only，只 INSERT）
+	p.caliberAudit = store.NewCaliberAuditStore(pool)
 	p.dbReady = true
 	return p
 }
