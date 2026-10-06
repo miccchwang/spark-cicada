@@ -111,6 +111,24 @@ const (
 	OriginTemp       GrantOrigin = "TEMP"
 )
 
+// GrantRecord 授权来源记录（与 contracts/entitlement.ts 的 GrantRecord 对齐）。
+//
+// ★ 存在的意义：契约 v1.2 把 `grants` 列为 Entitlement 的正式字段，用于「审计 +
+// 校验不溢出」，但 v1.2 前服务端**完全没有对应结构** —— 结果是授权从哪来、
+// 谁授的、上界是谁，在服务端无从得知；`source.fromApprovedRequests` /
+// `source.fromDelegations` 两个字段因此**恒为空**，看着有、实则从不填。
+// 本结构补齐这一层，并由 Resolve 如实分层。
+type GrantRecord struct {
+	Origin GrantOrigin `json:"origin"`
+	// GrantedBy 授出者账号；TEMPLATE/GROUP 可为系统。
+	GrantedBy string `json:"grantedBy"`
+	// UpperBoundRef 授出者自身在该 scope 的上界（用于校验不溢出）。
+	UpperBoundRef string `json:"upperBoundRef,omitempty"`
+	At            string `json:"at,omitempty"`
+	// RequestID 关联的申请单 ID（Origin=REQUEST_APPROVED 时）。
+	RequestID string `json:"requestId,omitempty"`
+}
+
 // Entitlement 账号授权项（与 contracts/entitlement.ts 对齐）。
 type Entitlement struct {
 	Account                 string             `json:"account"`
@@ -124,6 +142,8 @@ type Entitlement struct {
 	FieldOverrides          []FieldOverride    `json:"fieldOverrides,omitempty"`
 	CanViewBusinessValues   bool               `json:"canViewBusinessValues"`
 	TempGrants              []TempGrant        `json:"tempGrants,omitempty"`
+	// Grants 授权来源记录（审计用）；按 origin 分层进 EntitlementView.Source。
+	Grants                  []GrantRecord      `json:"grants,omitempty"`
 }
 
 // FieldOverride 逐字段覆写。
@@ -256,6 +276,40 @@ func (r *Resolver) Resolve(e *Entitlement, groupGrants []*Entitlement) *Entitlem
 		}
 	}
 
+	// ─────────── 来源分层（审计）───────────
+	// 契约 v1.2 的 EntitlementView.source 有 7 个桶。此前只有 3 个被填充
+	// （template / group / grant），另外 2 个 —— fromApprovedRequests 与
+	// fromDelegations —— **恒为空数组**：字段存在、接口不报错、但永远是 []，
+	// 排障时看不出「这条权限是上次申请批下来的」。
+	// 现按 e.Grants 的 origin 如实分层，并对未知来源显式标注（不静默丢弃）。
+	for _, g := range e.Grants {
+		switch g.Origin {
+		case OriginRequest:
+			view.Source.FromApproved = append(
+				view.Source.FromApproved, describeGrant(g, "request:"))
+		case OriginSupervisor:
+			view.Source.FromDelegation = append(
+				view.Source.FromDelegation, describeGrant(g, "delegate:"))
+		case OriginTemplate:
+			view.Source.FromTemplate = append(
+				view.Source.FromTemplate, describeGrant(g, "template:"))
+		case OriginGroup:
+			view.Source.FromGroups = append(
+				view.Source.FromGroups, describeGrant(g, "group:"))
+		case OriginAdminCheck:
+			view.Source.FromGrant = append(
+				view.Source.FromGrant, describeGrant(g, "grant:"))
+		case OriginTemp:
+			view.Source.FromTemp = append(
+				view.Source.FromTemp, describeGrant(g, "temp:"))
+		default:
+			// 未知来源既不丢弃也不冒充：显式落到 grant 桶并保留原样标识，
+			// 避免「新来源加进来但 source 里查无此人」的静默黑洞。
+			view.Source.FromGrant = append(view.Source.FromGrant,
+				"unknown:"+string(g.Origin)+":"+g.GrantedBy)
+		}
+	}
+
 	// ─────────── 应用 DENY（优先，最高优先级） ───────────
 	for m := range deniedModules {
 		delete(modEnabled, m)
@@ -319,6 +373,19 @@ func (r *Resolver) now() time.Time {
 		return r.Now()
 	}
 	return time.Now()
+}
+
+// describeGrant 渲染一条来源记录为可读标识：
+// `<prefix><授出者>[@<申请单ID>]`。requestId 存在时带上，便于排障时直接跳单。
+func describeGrant(g GrantRecord, prefix string) string {
+	by := g.GrantedBy
+	if by == "" {
+		by = "system"
+	}
+	if g.RequestID != "" {
+		return prefix + by + "@" + g.RequestID
+	}
+	return prefix + by
 }
 
 // isIT 判定是否 IT 模板（D7：IT 恒不可见业务数值）。
