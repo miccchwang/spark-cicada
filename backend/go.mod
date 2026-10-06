@@ -2,7 +2,10 @@ module github.com/miccchwang/spark-cicada/backend
 
 go 1.27
 
-require github.com/jackc/pgx/v5 v5.11.0
+require (
+	github.com/jackc/pgx/v5 v5.11.0
+	gopkg.in/yaml.v3 v3.0.1
+)
 
 require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect

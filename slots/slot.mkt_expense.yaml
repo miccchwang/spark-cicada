@@ -1,0 +1,12 @@
+# slots/slot.mkt_expense.yaml —— 市场费用数据槽
+id: slot.mkt_expense
+name: 市场费用
+source_kind: api
+source_ref: marketing.api
+key_strategy: spu
+coverage_gate: 0.80
+freshness: 1d
+permission: L4
+status: MISSING                 # docs/03 §2.2：预埋槽，暂无权威来源
+notes: |
+  预埋槽（docs/03 §7「待补充项」）。未接入前依赖它的算法一律 skip。

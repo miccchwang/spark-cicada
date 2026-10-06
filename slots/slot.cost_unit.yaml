@@ -1,0 +1,13 @@
+# slots/slot.cost_unit.yaml —— 单件成本数据槽
+id: slot.cost_unit
+name: 单件成本
+source_kind: master_table
+source_ref: cost_master.v2
+key_strategy: barcode_then_sku   # 与 slot.cogs 同源同键口径
+coverage_gate: 0.80
+freshness: 7d
+permission: L4
+status: AVAILABLE
+notes: |
+  algo.cogs 的乘数项。成本主数据按固定列位解析；表头变化须显式失败。
+  未命中保留空值（显示 —），禁止用 0 或均价替代。

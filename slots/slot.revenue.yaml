@@ -1,0 +1,12 @@
+# slots/slot.revenue.yaml —— 收入/GMV 数据槽
+id: slot.revenue
+name: 收入/GMV
+source_kind: derived
+source_ref: channel_sales
+key_strategy: store_sku
+coverage_gate: 0.95
+freshness: 1d
+permission: L3
+status: AVAILABLE
+notes: |
+  渠道流水派生（docs/03 §2.2）。用于 algo.gp / algo.gmp / algo.rev。

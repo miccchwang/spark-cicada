@@ -1,0 +1,13 @@
+# slots/slot.product_id.yaml —— 产品 ID 数据槽
+# 数据槽只回答「数据从哪来」；算法只回答「怎么算」。
+id: slot.product_id
+name: 产品 ID
+source_kind: master_table
+source_ref: product_master
+key_strategy: direct
+coverage_gate: 1.00            # 主数据必须完整，缺失即不可用
+freshness: 1d
+permission: L1
+status: AVAILABLE
+notes: |
+  产品主数据（docs/03 §2.2）。主数据缺失不允许估算补齐。

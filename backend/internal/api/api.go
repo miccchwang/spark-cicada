@@ -141,6 +141,12 @@ type Server struct {
 	Resolve  func(account string) *authz.EntitlementView
 	Policy   FieldPolicy
 	BuildDoc func(rs *query.ResultSet) *contracts.DataContract
+	// ★ 出站契约守卫（G2 默认收起 / G3 不补 0）。
+	//
+	// 为 nil 时**不做**出站校验 —— 但生产接线（cmd/sparkd/wiring.go）必须注入，
+	// 否则 G2/G3 的判定函数又回到「没有生产调用点」的状态。
+	// 测试里显式置 nil 表示「本用例不覆盖出站契约校验」。
+	ContractGuard func(dc *contracts.DataContract) error
 }
 
 // QueryHandler 处理 POST /api/query。
@@ -175,6 +181,15 @@ func (s *Server) QueryHandler() http.HandlerFunc {
 		doc := s.BuildDoc(rs)
 		// ★ fail-closed 门控：未授权字段在序列化前剔除
 		doc = Gate(doc, view, s.Policy)
+		// ★ G2/G3 出站契约守卫：默认收起 / 不补 0。
+		//   违规即拒（不把脏契约渲染给用户）。这是 gate.CheckDefaultCollapsed /
+		//   CheckNoZeroImputation 在真实生产路径上的调用点。
+		if s.ContractGuard != nil {
+			if err := s.ContractGuard(doc); err != nil {
+				http.Error(w, "contract guard rejected: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(doc)

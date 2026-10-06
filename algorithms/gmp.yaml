@@ -7,7 +7,9 @@ unit: percent
 permission: L3
 depends_on_slots:
   - slot.revenue
-  - slot.gp
+  - slot.gross_profit   # ★ 2026-10-07 修正：原写 slot.gp —— 但 gp 是**算法**(algo.gp)而非数据槽，
+                        #   且公式 gp/rev 的分子是**金额(THB)**。算法当数据源是分类错误（G4 引用完整性会拦）。
+                        #   此处改为真正的数据槽 slot.gross_profit（毛利额）。
 writes_bucket: pnl_sku_month
 missing_policy: skip
 trace: true

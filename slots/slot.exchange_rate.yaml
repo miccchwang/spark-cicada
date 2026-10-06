@@ -1,0 +1,12 @@
+# slots/slot.exchange_rate.yaml —— 汇率数据槽
+id: slot.exchange_rate
+name: 汇率
+source_kind: api
+source_ref: fx.daily
+key_strategy: date_pair
+coverage_gate: 1.00            # 汇率缺失会让本位币换算失真，必须完整
+freshness: 1d
+permission: L2
+status: AVAILABLE
+notes: |
+  本位币 THB（docs/03 §4.2 rule.fx.base）。

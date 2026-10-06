@@ -1,0 +1,12 @@
+# slots/slot.shipping.yaml —— 快递成本数据槽
+id: slot.shipping
+name: 快递成本
+source_kind: master_table
+source_ref: logistics_master
+key_strategy: sku
+coverage_gate: 0.90
+freshness: 7d
+permission: L4
+status: PARTIAL                 # docs/03 §2.2 / §6：未达 0.90 ⇒ 仅诊断展示
+notes: |
+  当前覆盖率未达标 ⇒ 只做诊断展示，不进 P&L（docs/03 §6 实测结论）。

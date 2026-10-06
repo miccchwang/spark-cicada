@@ -1,0 +1,13 @@
+# slots/slot.ad_spend.yaml —— 广告花费数据槽
+id: slot.ad_spend
+name: 广告花费
+source_kind: api
+source_ref: tiktok.finance.ads
+key_strategy: channel_day
+coverage_gate: 0.90
+freshness: 1d
+permission: L4
+status: PARTIAL                 # docs/03 §2.2：当前部分可用，低于门限
+notes: |
+  广告花费来自 TikTok 财务 API。当前覆盖率未达 0.90 门限 ⇒
+  依赖它的算法会被跳过（不补 0、不摊分）。接入补齐后改 status。

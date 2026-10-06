@@ -1,0 +1,12 @@
+# slots/slot.platform_fee.yaml —— 平台费用数据槽
+id: slot.platform_fee
+name: 平台费用
+source_kind: api
+source_ref: platform_finance
+key_strategy: shop_txn
+coverage_gate: 0.90
+freshness: 1d
+permission: L4
+status: AVAILABLE
+notes: |
+  计提口径由规则集 rule.tk.fee 决定（docs/03 §4.1）；槽只回答数据来源。

@@ -89,6 +89,17 @@ jobs:
         working-directory: backend
         run: go test ./internal/gate/ -run 'TestSQL' -count=1 -v
 
+      # ★ G2/G3/G4/G5 数据槽注册表 + 接线闸门。
+      #   读**真** slots/*.yaml 与 algorithms/*.yaml，过**真** gate 判定函数
+      #   （CheckAlgorithmNoDataSource / CheckSlotsRegistered / DecideCoverage /
+      #    CheckDefaultCollapsed / CheckNoZeroImputation），并用静态扫描钉住
+      #   「这些判定函数必须有非测试调用点」。
+      #   在此之前它们全仓**没有任何生产调用点** ⇒ 四条闸门恒真、YAML 从没被扫过。
+      #   已实测抓到真缺陷：algo.gmp 把算法 algo.gp 当数据槽 slot.gp 依赖（分类错误）。
+      - name: ★ 数据槽注册表闸门（G2/G3/G4/G5 真读 YAML + 接线）
+        working-directory: backend
+        run: go test ./internal/slot/ -count=1 -v
+
       - name: 控制面闸门
         working-directory: backend
         run: go test ./internal/admin/ -count=1 -v

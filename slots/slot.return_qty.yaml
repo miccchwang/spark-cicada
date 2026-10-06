@@ -1,0 +1,12 @@
+# slots/slot.return_qty.yaml —— 退货量数据槽
+id: slot.return_qty
+name: 退货量
+source_kind: derived
+source_ref: channel_sales
+key_strategy: store_sku
+coverage_gate: 0.95
+freshness: 1d
+permission: L2
+status: AVAILABLE
+notes: |
+  渠道流水派生（docs/03 §2.2）。

@@ -1,0 +1,12 @@
+# slots/slot.brand.yaml —— 品牌数据槽
+id: slot.brand
+name: 品牌
+source_kind: master_table
+source_ref: product_master
+key_strategy: direct
+coverage_gate: 1.00
+freshness: 1d
+permission: L1
+status: AVAILABLE
+notes: |
+  品牌维度主数据；用于口径 A/B 的品牌聚合（docs/03 §4.3）。

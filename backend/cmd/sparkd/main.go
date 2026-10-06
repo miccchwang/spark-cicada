@@ -29,6 +29,7 @@ import (
 	"github.com/miccchwang/spark-cicada/backend/internal/gate"
 	"github.com/miccchwang/spark-cicada/backend/internal/query"
 	"github.com/miccchwang/spark-cicada/backend/internal/req"
+	"github.com/miccchwang/spark-cicada/backend/internal/slot"
 )
 
 func main() {
@@ -84,6 +85,10 @@ func main() {
 	srv := &api.Server{
 		Orch:    orch,
 		Resolve: func(account string) *authz.EntitlementView { return resolveFor(resolver, ents, account) },
+		// ★ 出站契约守卫（G2 默认收起 / G3 不补 0）—— 让两条判定函数获得真实生产调用点。
+		//   zeroWhitelist 收纳「真实计算为 0」的字段；当前无此类字段（成本/毛利为 0 属异常），
+		//   故留空 map —— 宁可多拦一次人工确认，也不放行一个静默补零。
+		ContractGuard: slot.NewContractGuard(map[string]bool{}).MustValidContract,
 		Policy: api.FieldPolicy{
 			FieldLevel: map[string]authz.Level{
 				"gp":          authz.L3,

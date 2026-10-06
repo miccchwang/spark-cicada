@@ -1,0 +1,12 @@
+# slots/slot.stock.yaml —— 库存数据槽
+id: slot.stock
+name: 库存
+source_kind: master_table
+source_ref: inventory_master
+key_strategy: sku
+coverage_gate: 0.95
+freshness: 1d
+permission: L2
+status: AVAILABLE
+notes: |
+  库存主表（docs/03 §2.2）。用于 algo.stock_cover / algo.turnover_days。

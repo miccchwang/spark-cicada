@@ -1,0 +1,12 @@
+# slots/slot.barcode.yaml —— 条码数据槽
+id: slot.barcode
+name: 条码
+source_kind: master_table
+source_ref: product_master
+key_strategy: direct
+coverage_gate: 1.00
+freshness: 1d
+permission: L1
+status: AVAILABLE
+notes: |
+  成本匹配的第一优先键（见 slot.cogs 的 barcode_then_sku 策略）。

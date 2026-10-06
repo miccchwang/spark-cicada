@@ -1,0 +1,12 @@
+# slots/slot.qty.yaml —— 销量数据槽
+id: slot.qty
+name: 销量
+source_kind: derived
+source_ref: channel_sales
+key_strategy: store_sku
+coverage_gate: 0.95
+freshness: 1d
+permission: L2
+status: AVAILABLE
+notes: |
+  渠道流水派生（docs/03 §2.2）。
