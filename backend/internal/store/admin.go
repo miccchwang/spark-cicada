@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/miccchwang/spark-cicada/backend/internal/admin"
+	"github.com/miccchwang/spark-cicada/backend/internal/audit"
 	"github.com/miccchwang/spark-cicada/backend/internal/tenant"
 )
 
@@ -271,37 +272,108 @@ func (a *Admin) SeedBucket(ctx context.Context, id string, grain, producedBy []s
 	return nil
 }
 
-// InsertAudit 写审计（append-only；触发器保证不可改）。
-func (a *Admin) InsertAudit(ctx context.Context, actor, action, target string,
-	detail map[string]any, requestID, region string) error {
+// ───────────────────────────── 审计（M-AUDIT 接缝） ─────────────────────────────
 
-	d, err := json.Marshal(detail)
+// pgAuditSink 把 audit.Entry 落到 audit_log（append-only；0001 的触发器兜底）。
+//
+// ★ 为什么让审计经 internal/audit 而不是在这里直接 INSERT：
+//
+//	直接 INSERT 等于 Go 侧对 append-only **没有任何闸门** ——
+//	gate.CheckAuditAppendOnly 就成了只被测试调用的装饰（G10 第六类恒真）。
+//	经 audit.Log 之后，「写审计」这条**真实生产路径**每一步都过闸门：
+//	先校验（脏数据不入 append-only 表）→ 再过 G10 闸门 → 才追加。
+//
+// ★ 租户在**构造期**绑定（沿用本包既有纪律）：Sink 携带 *Admin，
+//   而 *Admin 的 tc 在 NewAdmin/ForTenant 时就定了 ⇒ 不存在「漏传租户」。
+type pgAuditSink struct{ a *Admin }
+
+// Append 追加一条审计（只增不改）。
+func (s pgAuditSink) Append(ctx context.Context, e audit.Entry) error {
+	if s.a == nil || s.a.pool == nil {
+		return fmt.Errorf("store: 审计不可用（连接池未初始化）")
+	}
+	d, err := json.Marshal(e.Detail)
 	if err != nil {
 		d = []byte(`{}`)
 	}
 	// ★ 带 tenant_id（Task #57）：audit_log 在 0011 后开了 RLS，
 	//   不带租户的行在租户档下会被 WITH CHECK 策略拒绝。
 	var tid any
-	if a.tc != nil {
-		tid = a.tc.TenantID
+	if s.a.tc != nil {
+		tid = s.a.tc.TenantID
 	}
-	const q = `INSERT INTO audit_log (actor, action, target, detail, request_id, region, tenant_id)
-	           VALUES ($1,$2,$3,$4,$5,$6,$7)`
-	args := []any{actor, action, nullable(target), d, nullable(requestID), nullable(region), tid}
-	if a.tc == nil {
-		if _, err := a.pool.Exec(ctx, q, args...); err != nil {
+	// ★ at 用 coalesce：Entry 显式带了时间就用它，否则退回库时钟 now()。
+	const q = `INSERT INTO audit_log (at, actor, action, target, detail, request_id, region, tenant_id)
+	           VALUES (coalesce($1::timestamptz, now()),$2,$3,$4,$5,$6,$7,$8)`
+	args := []any{nullableTime(e.At), e.Actor, e.Action,
+		nullable(e.Target), d, nullable(e.RequestID), nullable(e.Region), tid}
+	if s.a.tc == nil {
+		if _, err := s.a.pool.Exec(ctx, q, args...); err != nil {
 			return fmt.Errorf("store: 写审计失败: %w", err)
 		}
 		return nil
 	}
 	// 租户档：先 SET LOCAL app.tenant_id 再插入，否则策略拒绝。
-	if err := tenant.InTenantTx(ctx, a.pool, *a.tc, func(ctx context.Context, tx pgx.Tx) error {
+	if err := tenant.InTenantTx(ctx, s.a.pool, *s.a.tc, func(ctx context.Context, tx pgx.Tx) error {
 		_, e := tx.Exec(ctx, q, args...)
 		return e
 	}); err != nil {
 		return fmt.Errorf("store: 写审计失败: %w", err)
 	}
 	return nil
+}
+
+// Count 返回当前可见的审计行数（供回滚护栏比对，G12）。
+func (s pgAuditSink) Count(ctx context.Context) (int, error) {
+	if s.a == nil || s.a.pool == nil {
+		return 0, fmt.Errorf("store: 审计不可用（连接池未初始化）")
+	}
+	q := `SELECT count(*) FROM audit_log`
+	var args []any
+	// 显式按租户过滤（与主会话的 tenant 显式化纪律一致）：特权通道绕过 RLS，
+	// 不显式过滤会跨租户计数。
+	if s.a.tc != nil {
+		q += ` WHERE tenant_id = $1`
+		args = append(args, s.a.tc.TenantID)
+	}
+	var n int
+	if err := s.a.pool.QueryRow(ctx, q, args...).Scan(&n); err != nil {
+		return 0, fmt.Errorf("store: 统计审计行数: %w", err)
+	}
+	return n, nil
+}
+
+// nullableTime 零值时间转 NULL（让库侧默认值/coalesce 生效）。
+func nullableTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t
+}
+
+// AuditLog 返回绑定本实例租户的审计入口（M-AUDIT）。
+func (a *Admin) AuditLog() *audit.Log {
+	if a == nil {
+		return nil
+	}
+	return audit.NewLog(pgAuditSink{a: a})
+}
+
+// InsertAudit 写审计（append-only；触发器保证不可改）。
+//
+// ★ 经 audit.Log：校验 → G10 闸门（gate.CheckAuditAppendOnly）→ 追加。
+//   `gate.CheckAuditAppendOnly` 在此处获得**真实生产调用点**。
+func (a *Admin) InsertAudit(ctx context.Context, actor, action, target string,
+	detail map[string]any, requestID, region string) error {
+
+	log := a.AuditLog()
+	if log == nil {
+		return fmt.Errorf("store: 审计不可用（Admin 未初始化）")
+	}
+	return log.Record(ctx, audit.Entry{
+		Actor: actor, Action: action, Target: target,
+		Detail: detail, RequestID: requestID, Region: region,
+	})
 }
 
 // AuditSink 返回一个 admin.AuditFunc，绑定到本 Postgres 实例。

@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/miccchwang/spark-cicada/backend/internal/audit"
 	"github.com/miccchwang/spark-cicada/backend/internal/gate"
 )
 
@@ -302,11 +303,26 @@ var (
 	ErrCrossRegionRollback = errors.New("dr: 禁止跨地域回滚")
 	// ErrAuditTouched 回滚触动了审计表。
 	ErrAuditTouched = errors.New("dr: 回滚触动了审计表（append-only 被破坏）")
+	// ErrAuditNotExcluded 回滚策略的排除清单里没有审计表。
+	//
+	// ★ 为什么这条错误必须存在：PlanRollback 接受**调用方传入**的策略。
+	//
+	//	默认策略排除了 audit_log，但策略可从配置加载 —— 漏掉 audit_log 时，
+	//	回滚会把审计表一起带走，而 Go 侧原本没有任何地方会拦（只有 DB 触发器兜底）。
+	//	「回滚不动审计」若只靠 VerifyRollbackAudit（事后比对行数），
+	//	等到发现时审计已经被回滚了。
+	ErrAuditNotExcluded = errors.New("dr: 回滚策略必须排除审计表（append-only 永不回滚）")
 )
 
 // PlanRollback 校验回滚前置条件，返回**永不回滚**的表清单。
 //
-// 纪律：仅 T1、本地域、窗口内（180 天且不落在未来）、二次确认、回滚前先快照。
+// 纪律：仅 T1、本地域、窗口内（180 天且不落在未来）、二次确认、回滚前先快照，
+// **且排除清单必须包含审计表**（audit.Table）。
+//
+// ★ 最后一条是 2026-10-07 补的：策略由调用方传入，此前只把 p.ExcludedTables
+// 原样返回、**不检查**它是否真的含 audit_log。配置漏一项 ⇒ 回滚带走审计表。
+// 现在缺了就拒（ErrAuditNotExcluded），把「回滚不动审计」从**事后比对**
+// 提到**事前拒绝**。
 func PlanRollback(c *Cluster, p RollbackPolicy, r RollbackRequest, now time.Time) ([]string, error) {
 	if c == nil || c.Primary == nil {
 		return nil, errors.New("dr: PlanRollback 需要集群")
@@ -334,6 +350,10 @@ func PlanRollback(c *Cluster, p RollbackPolicy, r RollbackRequest, now time.Time
 	if target.Before(earliest) {
 		return nil, fmt.Errorf("%w：target=%s earliest=%s",
 			ErrRollbackWindowExceeded, target.Format("2006-01-02"), earliest.Format("2006-01-02"))
+	}
+	// ★ 事前拒绝：排除清单必须含审计表，否则回滚会把 append-only 的审计一起带走。
+	if err := audit.EnsureExcludedFromRollback(p.ExcludedTables); err != nil {
+		return nil, fmt.Errorf("%w：%v", ErrAuditNotExcluded, err)
 	}
 	return append([]string(nil), p.ExcludedTables...), nil
 }
