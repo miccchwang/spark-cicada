@@ -37,6 +37,7 @@ const PAIRS = [
   { dir: "view-template", ifaces: ["ViewTemplate", "ColumnPref", "LayoutPref"] },
   { dir: "pnl", ifaces: ["CaliberMeta", "PnlLineDef", "PnlLine", "PnlStatement"] },
   { dir: "strategy-choice", ifaces: ["StrategyChoice", "ChoiceOption", "ImpactPreview", "StrategyHistoryEntry"] },
+  { dir: "tenant", ifaces: ["Tenant", "TenantQuota", "TenantContext", "TenantHint"] },
 ];
 
 for (const { dir, ifaces } of PAIRS) {
@@ -87,6 +88,68 @@ test("契约版本号一致", () => {
   const svTruth = sTruth.match(/STRATEGY_CHOICE_VERSION\s*=\s*"([^"]+)"/)?.[1];
   const svMirror = sMirror.match(/STRATEGY_CHOICE_VERSION\s*=\s*"([^"]+)"/)?.[1];
   assert.equal(svMirror, svTruth, "StrategyChoice 契约版本号漂移");
+
+  const tnTruth = readFileSync(join(REPO, "contracts", "tenant.ts"), "utf8");
+  const tnMirror = readFileSync(join(WEB, "src", "contracts", "tenant.ts"), "utf8");
+  const tenTruth = tnTruth.match(/TENANT_CONTRACT_VERSION\s*=\s*"([^"]+)"/)?.[1];
+  const tenMirror = tnMirror.match(/TENANT_CONTRACT_VERSION\s*=\s*"([^"]+)"/)?.[1];
+  assert.equal(tenMirror, tenTruth, "Tenant 契约版本号漂移");
+});
+
+/**
+ * ★★ 多租户的 fail-closed 纪律必须在**契约层**锁死。
+ *
+ * 越权最常见的样子不是「绕过了权限判断」，而是有人写了个新 handler
+ * 忘了带租户条件，或者查询失败时走了兜底分支 —— 而兜底分支查的是全表。
+ * 若这条纪律只活在某个解析器的实现里，下一代维护者会「顺手」加一个
+ * 「回退到默认租户」的便利分支。那正是本契约要禁止的。
+ */
+test("★ 多租户契约：解析结果必须显式区分 resolved/rejected（不得回退默认租户）", () => {
+  const truth = readFileSync(join(REPO, "contracts", "tenant.ts"), "utf8");
+  const mirror = readFileSync(join(WEB, "src", "contracts", "tenant.ts"), "utf8");
+  for (const [name, src] of [["真源", truth], ["镜像", mirror]]) {
+    // 解析结果必须是判别联合，且两种形态都在
+    assert.match(
+      src,
+      /export type TenantResolution\s*=[\s\S]*?kind:\s*"resolved"[\s\S]*?kind:\s*"rejected"/,
+      `${name} TenantResolution 必须同时含 resolved / rejected 两种形态`,
+    );
+    // 拒绝原因必须齐全（缺哪一个都会让某类失败变成静默放行）
+    for (const reason of ["missing", "malformed", "not_found", "not_active", "quota_exceeded", "internal"]) {
+      assert.match(
+        src,
+        new RegExp(`"${reason}"`),
+        `${name} TenantRejectReason 缺少 "${reason}"`,
+      );
+    }
+    // 提示优先级：claim 必须先于 host（host 是用户可控输入）
+    const prec = src.match(/TENANT_HINT_PRECEDENCE[^=]*=\s*\[([\s\S]*?)\]/)?.[1] ?? "";
+    const order = [...prec.matchAll(/"(claim|header|host|envDefault)"/g)].map((m) => m[1]);
+    assert.deepEqual(
+      order,
+      ["claim", "header", "host", "envDefault"],
+      `${name} 提示优先级必须为 claim > header > host > envDefault`,
+    );
+    // 两档隔离必须都在（少一档会让某类客户无法合规上线）
+    assert.match(src, /"shared"/, `${name} 缺少 shared 档`);
+    assert.match(src, /"dedicated"/, `${name} 缺少 dedicated 档`);
+    // ★ 缓存键必须强制带租户 —— 漏租户的缓存是最隐蔽的串租
+    assert.match(
+      src,
+      /tenantCacheKey\(\s*tenantId/,
+      `${name} tenantCacheKey 必须以 tenantId 为第一参数`,
+    );
+    // ★ 不得出现「默认租户」类兜底。
+    //   注意：这里只禁**默认租户 ID**，不禁 "DEFAULT_TENANT_QUOTA"
+    //   （配额有合理默认值；租户身份没有）。
+    for (const forbidden of ["defaultTenantId", "fallbackTenant", "DEFAULT_TENANT_ID"]) {
+      assert.doesNotMatch(
+        src,
+        new RegExp(forbidden, "i"),
+        `${name} 不应存在默认租户兜底 "${forbidden}" —— 解析失败必须拒绝服务`,
+      );
+    }
+  }
 });
 
 /**
