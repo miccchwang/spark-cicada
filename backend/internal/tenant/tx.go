@@ -157,9 +157,29 @@ func QueryRowInTenant(ctx context.Context, pool *pgxpool.Pool, tc TenantContext,
 	})
 }
 
-// QueryInTenant 是 InTenantTx 的便捷封装：在租户事务里跑一条查询并收集所有行。
+// QueryInTenant 是 InTenantTx 的便捷封装：在租户事务里跑一条查询，
+// 并把**尚未推进的**游标交给 scanFn。
 //
-// scanFn 对每一行调用一次，负责 Scan 到调用方的切片里。
+// ══════════════════════════════════════════════════════════════════════════
+// ★★★ 游标契约（本次真实缺陷的根因，务必读懂再改）：
+//
+//	scanFn 收到的 rows 游标**停在第一行之前**，调用方必须**自己**写
+//
+//	    for rows.Next() { ... rows.Scan(...) }
+//
+//	本函数**不**替调用方推进游标。这与 templatestore.qRows 的契约一致，
+//	两侧必须同形 —— 若这里先 `for rows.Next()` 推进一轮、scanFn 里再推进
+//	一轮，就变成「每外层一次跳一行」：**恰好一行时读到 0 行**，且**不报错**。
+//
+//	★ 这个错误为什么难发现：
+//	   · 行数为 0 与「游标被吃光」在返回值上完全同形（都是空结果集）；
+//	   · `count(*)` 这类「回调里只 Scan 不 Next」的调用**照常工作**，
+//	     于是同一个 store 里一半查询对、一半查询空，看起来像 RLS 或
+//	     计划缓存的问题（本次就误判成 pgx 计划缓存 × RLS，走了很长弯路）。
+//	   · 只有「恰好 1 行」才 100% 暴露；多行时表现为**静默丢一半**。
+//
+//	⇒ 一句话：**游标只能被推进一次，且必须由回调推进。**
+// ══════════════════════════════════════════════════════════════════════════
 func QueryInTenant(ctx context.Context, pool *pgxpool.Pool, tc TenantContext,
 	sql string, args []any, scanFn func(rows pgx.Rows) error) error {
 	return InTenantTx(ctx, pool, tc, func(ctx context.Context, tx pgx.Tx) error {
@@ -168,11 +188,13 @@ func QueryInTenant(ctx context.Context, pool *pgxpool.Pool, tc TenantContext,
 			return err
 		}
 		defer rows.Close()
-		for rows.Next() {
-			if err := scanFn(rows); err != nil {
-				return err
-			}
+		// ★ 只把游标交给回调，不在此处 Next()：见上方游标契约。
+		if err := scanFn(rows); err != nil {
+			return err
 		}
+		// ★ rows.Err() 必须在回调返回后**无条件**检查：
+		//   回调可能从没调用 Next()（例如「期望至多一行」却要报错时提前返回），
+		//   此时查询错误只会体现在 rows.Err() 上，漏检就是把错误当空结果。
 		return rows.Err()
 	})
 }

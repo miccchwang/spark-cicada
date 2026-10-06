@@ -32,16 +32,190 @@ import (
 	"sort"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/miccchwang/spark-cicada/backend/internal/template"
+	"github.com/miccchwang/spark-cicada/backend/internal/tenant"
 )
 
 // Store 模板的读写入口。
-type Store struct{ pool *pgxpool.Pool }
+//
+// ══════════════════════════════════════════════════════════════════════════
+// ★★ 租户上下文（Task #57）
+//
+//	本 store 的所有 SQL 都作用于 `dim_view_template` / `dim_view_template_share`，
+//	这两张表在 0011 迁移后都开了 RLS（策略读 `rls_tenant_id()`）。
+//	但 **RLS 只在会话变量被设置时才过滤** —— 若 store 直接走连接池，
+//	`app.tenant_id` 停在哨兵值，策略就过滤掉**所有**行（fail-closed 但不可用）；
+//	或者更糟：若有人把哨兵默认值改成一个真租户，就会跨租户可见。
+//
+//	因此本 store 有两种构造方式：
+//	  · New(pool)            —— **平台级/单租户**：不施加租户，RLS 未启用。
+//	                            仅用于单租户部署与迁移/运维路径。
+//	  · NewForTenant(pool,tc) —— **多租户**：每次操作都在 tenant.InTenantTx 内，
+//	                            先 SET LOCAL app.tenant_id，再由 RLS 过滤。
+//
+//	★ 为什么不给每个方法都加一个 tc 参数（更"显式"的做法）：
+//	  那会让 8 个方法 × 2 档 = 16 条签名，且每个调用点都要传一遍 ——
+//	  漏传一处就是一次静默越权，而且编译器不会报错（因为参数可空）。
+//	  把租户**绑在 store 实例上**，则「有没有租户」在构造时就确定，
+//	  调用点无从漏传。这与 InTenantTx「让漏掉 apply 成为不可能」是同一思路。
+//
+//	★ 但绑定也带来一个新风险：**同实例跨租户复用**。
+//	  故 NewForTenant 返回的实例持有固定 tc，不提供任何「改租户」的方法 ——
+//	  要换租户就换实例。这样「一个实例服务两租户」在类型上不可表达。
+// ══════════════════════════════════════════════════════════════════════════
+type Store struct {
+	pool *pgxpool.Pool
+	// tc 为 nil ⇒ 平台级（不施加租户，走裸池）；非 nil ⇒ 每次操作包租户事务。
+	tc *tenant.TenantContext
+}
 
-// New 用已有连接池构造。
+// New 用已有连接池构造**平台级** store（不施加租户）。
+//
+// ★ 仅用于单租户部署与运维路径。多租户读写下必须用 NewForTenant，
+//   否则 RLS 不会过滤（表已开 RLS ⇒ 裸池下会看到 0 行或取决于默认值）。
 func New(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
+
+// NewForTenant 构造**绑定租户**的 store：所有操作都在该租户的事务内执行。
+//
+// ★ tc 的 Tier 决定施加方式（shared ⇒ app.tenant_id；dedicated ⇒ search_path），
+//   但**本 store 不感知档位差异** —— 差异全部由 tenant.InTenantTx 处理。
+//   这正是「档位是存储细节、不是业务分支」这条铁律的落地。
+//
+// ★ 入参校验交给 tenant.InTenantTx（每方法入口都会校验一次）。
+//   这里不重复校验：重复会让「校验规则」出现两份，迟早漂移。
+func NewForTenant(pool *pgxpool.Pool, tc tenant.TenantContext) *Store {
+	return &Store{pool: pool, tc: &tc}
+}
+
+// TenantBound 报告本实例是否绑定了租户（供 api 层做装配期自检）。
+//
+// ★ 用途：装配期断言「多租户配置下拿到的是绑定实例」。
+//	这类断言应当在**启动时**失败，而不是等第一次查询返回空结果才发现。
+func (s *Store) TenantBound() bool { return s != nil && s.tc != nil }
+
+// ───────────────────────────── 租户感知的池访问 ─────────────────────────────
+//
+// ★ 下面三个 helper 是本 store 唯一的池访问入口。
+//   所有方法都必须经它们 —— 直接写 s.pool 就等于绕过租户施加。
+//   （可用 grep 校验：本文件除这三个 helper 外不应出现 `s.pool.`）
+
+// qRows 执行一条「取多行」的查询（租户感知），把**未推进的**游标交给 scan。
+//
+// ══════════════════════════════════════════════════════════════════════════
+// ★★★ 游标契约（务必读懂再改 —— 这里出过真实的静默丢行缺陷）：
+//
+//	scan 收到的 rows **停在第一行之前**，必须**自己**写推进循环：
+//
+//	    for rows.Next() { rows.Scan(...) }
+//
+//	本方法的职责只是「在租户事务内取到游标 + 保证 rows 被关闭 + 返回 rows.Err()」。
+//	**绝不**在调用 scan 之前替它推进游标 —— 否则 scan 里再推一轮就变成
+//	「每外层一次跳一行」，**恰好一行时读到 0 行且不报错**。
+//
+//	★ 反面案例（本次缺陷）：tenant.QueryInTenant 曾先 `for rows.Next()`
+//	  推进一轮再调回调，而本包的 Load/LoadByPage/loadShares 回调又推进一轮，
+//	  于是「有 WHERE 的单行读」全部返回 0 行。症状与 RLS 失效、
+//	  计划缓存污染完全同形（都表现为空结果集），极难定位。
+//	  ⇒ **游标只能被推进一次，且必须由回调推进。**
+// ══════════════════════════════════════════════════════════════════════════
+//
+// ★ 这是本 store 唯一的**读**入口。所有单行读也走它（配 qOne）：
+//
+//	为什么不另外提供 qRow：单行读若返回 pgx.Row，事务必须在**扫描之后**
+//	才能提交 —— 而调用方拿到 Row 时 InTenantTx 已经返回并提交了事务，
+//	SET LOCAL 随之失效。这个生命周期错位极其隐蔽（查询可能仍返回正确结果，
+//	因为数据已经读进 pgx 缓冲），但一旦查询被延迟执行就会漏掉租户约束。
+//	统一走「物化到回调里」消除了这个时序问题。
+func (s *Store) qRows(ctx context.Context, sql string,
+	args []any, scan func(pgx.Rows) error) error {
+	if s.tc == nil {
+		rows, err := s.pool.Query(ctx, sql, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		if err := scan(rows); err != nil {
+			return err
+		}
+		return rows.Err()
+	}
+	return tenant.QueryInTenant(ctx, s.pool, *s.tc, sql, args, scan)
+}
+
+// qOne 执行一条**期望 0 或 1 行**的查询（租户感知），把唯一一行交给 scanRow。
+//
+// ★ scanRow 的契约与 qRows 的 scan **不同**（这是刻意的分层）：
+//
+//	qRows.scan —— 游标停在第一行之前，**回调自己**写 for rows.Next()。
+//	qOne.scanRow —— 游标**已经停在那一行上**（由本方法推进），
+//	                故 scanRow 里直接 rows.Scan(...) 即可，**不要**再 Next()。
+//
+//	★ 分层的意义：让「期望 0/1 行」的语义在本方法里**只有一份**实现
+//	  （多行时报错、0 行时返回 ErrNoRows），调用方不必各自重复这段判断。
+//
+// 返回 pgx.ErrNoRows（若结果为空）—— 与 pgx.QueryRow 的行为一致，
+// 便于上层沿用 errors.Is(err, pgx.ErrNoRows) 的判断。
+func (s *Store) qOne(ctx context.Context, sql string, args []any,
+	scanRow func(pgx.Rows) error) error {
+	n := 0
+	err := s.qRows(ctx, sql, args, func(rows pgx.Rows) error {
+		for rows.Next() {
+			n++
+			if n > 1 {
+				return fmt.Errorf("templatestore: 期望至多 1 行，实际更多")
+			}
+			if err := scanRow(rows); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+// exec 执行一条写语句（租户感知）。
+func (s *Store) exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if s.tc == nil {
+		return s.pool.Exec(ctx, sql, args...)
+	}
+	var tag pgconn.CommandTag
+	err := tenant.InTenantTx(ctx, s.pool, *s.tc,
+		func(ctx context.Context, tx pgx.Tx) error {
+			t, err := tx.Exec(ctx, sql, args...)
+			tag = t
+			return err
+		})
+	return tag, err
+}
+
+// inTx 在**租户事务**内执行 fn；平台档下则开一个普通事务。
+//
+// ★ 这是 Save / BumpUse / SetDefault 这类「多条语句必须同事务」的入口。
+//	租户档下不能「先开普通事务、再设租户变量」—— 见 tx.go 的说明：
+//	设置与使用必须在同一事务，否则 SET LOCAL 已随前一个事务失效。
+func (s *Store) inTx(ctx context.Context, fn func(ctx context.Context, tx pgx.Tx) error) error {
+	if s.tc == nil {
+		tx, err := s.pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if err := fn(ctx, tx); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}
+	return tenant.InTenantTx(ctx, s.pool, *s.tc, fn)
+}
 
 // ───────────────────────────── 读 ─────────────────────────────
 
@@ -50,8 +224,16 @@ const cols = `id, name, scope, owner, page, query_state, columns, layout,
 
 // Load 读回单个模板（含分享对象）。
 func (s *Store) Load(ctx context.Context, id string) (*template.Template, error) {
-	row := s.pool.QueryRow(ctx, `SELECT `+cols+` FROM dim_view_template WHERE id = $1`, id)
-	t, err := scanTemplate(row)
+	var t *template.Template
+	err := s.qOne(ctx, `SELECT `+cols+` FROM dim_view_template WHERE id = $1`, []any{id},
+		func(rows pgx.Rows) error {
+			tt, err := scanTemplate(rows)
+			if err != nil {
+				return err
+			}
+			t = tt
+			return nil
+		})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("templatestore: %w: %s", template.ErrNotFound, id)
@@ -70,32 +252,32 @@ func (s *Store) Load(ctx context.Context, id string) (*template.Template, error)
 //
 // ★ 只取 personal（本人） + team + system 三档的全部行，
 //   把过滤权交给 template.CanRead。见包注释的取舍说明。
+//
+// ★ 本方法的「多读」是**租户内**的多读：RLS 已把范围限在自己租户，
+//   纯函数再从中筛可见性。两层各管一件事，不重叠。
 func (s *Store) LoadByPage(ctx context.Context, page string, limit int) ([]*template.Template, error) {
 	if limit <= 0 {
 		limit = 500
 	}
-	rows, err := s.pool.Query(ctx, `
+	out := []*template.Template{}
+	ids := []string{}
+	err := s.qRows(ctx, `
 		SELECT `+cols+` FROM dim_view_template
 		WHERE page = $1
 		ORDER BY updated_at DESC
-		LIMIT $2`, page, limit)
+		LIMIT $2`, []any{page, limit}, func(rows pgx.Rows) error {
+		for rows.Next() {
+			t, err := scanTemplate(rows)
+			if err != nil {
+				return fmt.Errorf("templatestore: 扫描模板: %w", err)
+			}
+			out = append(out, t)
+			ids = append(ids, t.ID)
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("templatestore: 列模板 %s: %w", page, err)
-	}
-	defer rows.Close()
-
-	out := []*template.Template{}
-	ids := []string{}
-	for rows.Next() {
-		t, err := scanTemplate(rows)
-		if err != nil {
-			return nil, fmt.Errorf("templatestore: 扫描模板: %w", err)
-		}
-		out = append(out, t)
-		ids = append(ids, t.ID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("templatestore: 遍历模板: %w", err)
 	}
 	// 批量补 shares（一次查全部，避免 N+1）
 	shareMap, err := s.loadSharesBatch(ctx, ids)
@@ -116,7 +298,8 @@ func (s *Store) LoadByPage(ctx context.Context, page string, limit int) ([]*temp
 // 「查不到部门」不应当让整个列表接口挂掉）。
 func (s *Store) OwnerDept(ctx context.Context, account string) (string, error) {
 	var dept *string
-	err := s.pool.QueryRow(ctx, `SELECT primary_dept FROM dim_org WHERE account = $1`, account).Scan(&dept)
+	err := s.qOne(ctx, `SELECT primary_dept FROM dim_org WHERE account = $1`, []any{account},
+		func(rows pgx.Rows) error { return rows.Scan(&dept) })
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return "", nil
@@ -146,21 +329,20 @@ func (s *Store) ResolveViewer(ctx context.Context, account string, isAdmin func(
 		v.IsSystemAdmin = isAdmin(account)
 	}
 	// 组：一次查全部（含 owner 身份，owner 也是组内角色）
-	rows, err := s.pool.Query(ctx, `SELECT group_id FROM dim_group_member WHERE account = $1`, account)
+	v.Groups = []string{}
+	err := s.qRows(ctx, `SELECT group_id FROM dim_group_member WHERE account = $1`,
+		[]any{account}, func(rows pgx.Rows) error {
+			for rows.Next() {
+				var g string
+				if err := rows.Scan(&g); err != nil {
+					return fmt.Errorf("templatestore: 扫描组: %w", err)
+				}
+				v.Groups = append(v.Groups, g)
+			}
+			return nil
+		})
 	if err != nil {
 		return v, fmt.Errorf("templatestore: 读组: %w", err)
-	}
-	defer rows.Close()
-	v.Groups = []string{}
-	for rows.Next() {
-		var g string
-		if err := rows.Scan(&g); err != nil {
-			return v, fmt.Errorf("templatestore: 扫描组: %w", err)
-		}
-		v.Groups = append(v.Groups, g)
-	}
-	if err := rows.Err(); err != nil {
-		return v, fmt.Errorf("templatestore: 遍历组: %w", err)
 	}
 	// 部门
 	dept, err := s.OwnerDept(ctx, account)
@@ -226,6 +408,17 @@ func (s *Store) Save(ctx context.Context, t *template.Template, actor string) er
 	if t.Version == "" {
 		t.Version = template.Version
 	}
+	// ★ 事务入口统一走 s.inTx：租户档下它会先 SET LOCAL app.tenant_id，
+	//   再在**同一事务**里跑 saveInTx 的所有语句。
+	//   若这里直接 s.pool.Begin 再往下跑，RLS 会话变量根本没设 ——
+	//   等于在写入路径上绕过租户（表已开 RLS，写入要么被拒要么落到哨兵）。
+	return s.inTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		return s.saveInTx(ctx, tx, t)
+	})
+}
+
+// saveInTx 是 Save 的事务体（拆出来以便租户档复用同一段 SQL）。
+func (s *Store) saveInTx(ctx context.Context, tx pgx.Tx, t *template.Template) error {
 	queryState := t.QueryState
 	if len(queryState) == 0 {
 		queryState = []byte(`{}`)
@@ -238,12 +431,6 @@ func (s *Store) Save(ctx context.Context, t *template.Template, actor string) er
 	if err != nil {
 		return fmt.Errorf("templatestore: 编码布局: %w", err)
 	}
-
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("templatestore: 开启事务: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
 
 	// ★ 「设默认」的唯一性由部分唯一索引保证；upsert 时若把 is_default 置 true，
 	//   必须先在**同一事务**里清掉同 (scope,owner,page) 下的旧默认，
@@ -260,8 +447,8 @@ func (s *Store) Save(ctx context.Context, t *template.Template, actor string) er
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO dim_view_template
 			(id, name, scope, owner, page, query_state, columns, layout,
-			 use_count, is_default, template_ver, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, now(), now())
+			 use_count, is_default, template_ver, created_at, updated_at, tenant_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, now(), now(), $12)
 		ON CONFLICT (id) DO UPDATE SET
 			name         = EXCLUDED.name,
 			scope        = EXCLUDED.scope,
@@ -274,7 +461,7 @@ func (s *Store) Save(ctx context.Context, t *template.Template, actor string) er
 			updated_at   = now()`,
 		t.ID, t.Name, string(t.Scope), t.Owner, t.Page,
 		queryState, colsJSON, layoutJSON,
-		t.UseCount, t.IsDefault, t.Version); err != nil {
+		t.UseCount, t.IsDefault, t.Version, tenantIDOrNil(s.tc)); err != nil {
 		return fmt.Errorf("templatestore: 写模板 %s: %w", t.ID, err)
 	}
 
@@ -284,17 +471,29 @@ func (s *Store) Save(ctx context.Context, t *template.Template, actor string) er
 	}
 	for _, sh := range t.Shares {
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO dim_view_template_share (template_id, subject_kind, subject_id)
-			VALUES ($1,$2,$3)
-			ON CONFLICT DO NOTHING`, t.ID, sh.SubjectKind, sh.SubjectID); err != nil {
+			INSERT INTO dim_view_template_share (template_id, subject_kind, subject_id, tenant_id)
+			VALUES ($1,$2,$3,$4)
+			ON CONFLICT DO NOTHING`, t.ID, sh.SubjectKind, sh.SubjectID, tenantIDOrNil(s.tc)); err != nil {
 			return fmt.Errorf("templatestore: 写分享: %w", err)
 		}
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("templatestore: 提交: %w", err)
-	}
 	return nil
+}
+
+// tenantIDOrNil 返回 tenant_id 列的写入值。
+//
+// ★ 平台档（未绑租户）返回 nil ⇒ 列写 NULL。
+//
+//	NULL 行在 RLS 下对**所有租户不可见**（`NULL = uuid` 求值为 NULL）。
+//	这是刻意的：平台级模板不应被任意租户看到。
+//	若将来需要「平台模板对所有租户可见」，那是**另一套策略**
+//	（例如再加一条 `OR tenant_id IS NULL` 的 policy），而不是在写入端
+//	编一个租户 uuid —— 那会把平台数据伪装成某个租户的私有数据。
+func tenantIDOrNil(tc *tenant.TenantContext) any {
+	if tc == nil {
+		return nil
+	}
+	return tc.TenantID
 }
 
 // Delete 删除模板（分享由 ON DELETE CASCADE 带走）。
@@ -313,7 +512,7 @@ func (s *Store) Delete(ctx context.Context, id, owner string, isAdmin bool) (boo
 		sql = `DELETE FROM dim_view_template WHERE id = $1`
 		args = []any{id}
 	}
-	tag, err := s.pool.Exec(ctx, sql, args...)
+	tag, err := s.exec(ctx, sql, args...)
 	if err != nil {
 		return false, fmt.Errorf("templatestore: 删模板 %s: %w", id, err)
 	}
@@ -328,27 +527,26 @@ func (s *Store) Delete(ctx context.Context, id, owner string, isAdmin bool) (boo
 //
 // ★ 同时写 audit_log（沿用 0001 的 append-only 表）：
 //   模板是「批量改口径」的载体，套用行为必须留痕，事后能查「谁在何时套过」。
+//
+// ★ 审计行必须带 tenant_id（Task #57）：audit_log 在 0011 后开了 RLS，
+//   不带租户的审计行在 RLS 下对所有租户不可见 —— 等于**审计留痕但查不到**，
+//   比不记更糟（会让人误以为没有这条记录）。
+//   注意：加租户**不是**为了把它藏起来，而是让它归属于产生它的租户。
 func (s *Store) BumpUse(ctx context.Context, id, actor string) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("templatestore: 开启事务: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	if _, err := tx.Exec(ctx,
-		`UPDATE dim_view_template SET use_count = use_count + 1, updated_at = now() WHERE id = $1`, id); err != nil {
-		return fmt.Errorf("templatestore: 累加使用次数: %w", err)
-	}
-	detail, _ := json.Marshal(map[string]string{"templateId": id})
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO audit_log (actor, action, target, detail)
-		VALUES ($1, 'view_template.apply', $2, $3)`, actor, id, detail); err != nil {
-		return fmt.Errorf("templatestore: 记审计: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("templatestore: 提交: %w", err)
-	}
-	return nil
+	return s.inTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx,
+			`UPDATE dim_view_template SET use_count = use_count + 1, updated_at = now() WHERE id = $1`, id); err != nil {
+			return fmt.Errorf("templatestore: 累加使用次数: %w", err)
+		}
+		detail, _ := json.Marshal(map[string]string{"templateId": id})
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO audit_log (actor, action, target, detail, tenant_id)
+			VALUES ($1, 'view_template.apply', $2, $3, $4)`,
+			actor, id, detail, tenantIDOrNil(s.tc)); err != nil {
+			return fmt.Errorf("templatestore: 记审计: %w", err)
+		}
+		return nil
+	})
 }
 
 // SetDefault 把某模板设为「本页默认」。
@@ -356,35 +554,28 @@ func (s *Store) BumpUse(ctx context.Context, id, actor string) error {
 // ★ 两步（清旧 + 置新）在同一事务：并发下也不可能出现两个默认
 //   （部分唯一索引是最后一道保险）。
 func (s *Store) SetDefault(ctx context.Context, id string) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("templatestore: 开启事务: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	var scope, owner, page string
-	err = tx.QueryRow(ctx,
-		`SELECT scope, owner, page FROM dim_view_template WHERE id = $1 FOR UPDATE`, id).
-		Scan(&scope, &owner, &page)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("templatestore: %w: %s", template.ErrNotFound, id)
+	return s.inTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		var scope, owner, page string
+		err := tx.QueryRow(ctx,
+			`SELECT scope, owner, page FROM dim_view_template WHERE id = $1 FOR UPDATE`, id).
+			Scan(&scope, &owner, &page)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("templatestore: %w: %s", template.ErrNotFound, id)
+			}
+			return fmt.Errorf("templatestore: 读模板 %s: %w", id, err)
 		}
-		return fmt.Errorf("templatestore: 读模板 %s: %w", id, err)
-	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE dim_view_template SET is_default = false, updated_at = now()
-		WHERE scope = $1 AND owner = $2 AND page = $3 AND is_default`, scope, owner, page); err != nil {
-		return fmt.Errorf("templatestore: 清除旧默认: %w", err)
-	}
-	if _, err := tx.Exec(ctx,
-		`UPDATE dim_view_template SET is_default = true, updated_at = now() WHERE id = $1`, id); err != nil {
-		return fmt.Errorf("templatestore: 置默认: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("templatestore: 提交: %w", err)
-	}
-	return nil
+		if _, err := tx.Exec(ctx, `
+			UPDATE dim_view_template SET is_default = false, updated_at = now()
+			WHERE scope = $1 AND owner = $2 AND page = $3 AND is_default`, scope, owner, page); err != nil {
+			return fmt.Errorf("templatestore: 清除旧默认: %w", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE dim_view_template SET is_default = true, updated_at = now() WHERE id = $1`, id); err != nil {
+			return fmt.Errorf("templatestore: 置默认: %w", err)
+		}
+		return nil
+	})
 }
 
 // ───────────────────────────── 扫描 / 帮手 ─────────────────────────────
@@ -462,22 +653,24 @@ type shareRow struct {
 }
 
 func (s *Store) loadShares(ctx context.Context, templateID string) ([]template.Share, error) {
-	rows, err := s.pool.Query(ctx, `
+	out := []template.Share{}
+	err := s.qRows(ctx, `
 		SELECT subject_kind, subject_id FROM dim_view_template_share
-		WHERE template_id = $1 ORDER BY subject_kind, subject_id`, templateID)
+		WHERE template_id = $1 ORDER BY subject_kind, subject_id`, []any{templateID},
+		func(rows pgx.Rows) error {
+			for rows.Next() {
+				var sh template.Share
+				if err := rows.Scan(&sh.SubjectKind, &sh.SubjectID); err != nil {
+					return err
+				}
+				out = append(out, sh)
+			}
+			return nil
+		})
 	if err != nil {
 		return nil, fmt.Errorf("templatestore: 读分享 %s: %w", templateID, err)
 	}
-	defer rows.Close()
-	out := []template.Share{}
-	for rows.Next() {
-		var sh template.Share
-		if err := rows.Scan(&sh.SubjectKind, &sh.SubjectID); err != nil {
-			return nil, fmt.Errorf("templatestore: 扫描分享: %w", err)
-		}
-		out = append(out, sh)
-	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func (s *Store) loadSharesBatch(ctx context.Context, ids []string) (map[string][]template.Share, error) {
@@ -485,23 +678,25 @@ func (s *Store) loadSharesBatch(ctx context.Context, ids []string) (map[string][
 	if len(ids) == 0 {
 		return out, nil
 	}
-	rows, err := s.pool.Query(ctx, `
+	err := s.qRows(ctx, `
 		SELECT template_id, subject_kind, subject_id FROM dim_view_template_share
-		WHERE template_id = ANY($1) ORDER BY template_id, subject_kind, subject_id`, ids)
+		WHERE template_id = ANY($1) ORDER BY template_id, subject_kind, subject_id`, []any{ids},
+		func(rows pgx.Rows) error {
+			for rows.Next() {
+				var r shareRow
+				if err := rows.Scan(&r.templateID, &r.subjectKind, &r.subjectID); err != nil {
+					return err
+				}
+				out[r.templateID] = append(out[r.templateID], template.Share{
+					SubjectKind: r.subjectKind, SubjectID: r.subjectID,
+				})
+			}
+			return nil
+		})
 	if err != nil {
 		return nil, fmt.Errorf("templatestore: 批量读分享: %w", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var r shareRow
-		if err := rows.Scan(&r.templateID, &r.subjectKind, &r.subjectID); err != nil {
-			return nil, fmt.Errorf("templatestore: 扫描分享: %w", err)
-		}
-		out[r.templateID] = append(out[r.templateID], template.Share{
-			SubjectKind: r.subjectKind, SubjectID: r.subjectID,
-		})
-	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // deptsOf 批量取多个账号的主部门。
@@ -510,25 +705,25 @@ func (s *Store) deptsOf(ctx context.Context, accounts []string) (map[string]stri
 	if len(accounts) == 0 {
 		return out, nil
 	}
-	rows, err := s.pool.Query(ctx, `SELECT account, primary_dept FROM dim_org WHERE account = ANY($1)`, accounts)
-	if err != nil {
-		return nil, fmt.Errorf("templatestore: 批量读部门: %w", err)
-	}
-	defer rows.Close()
 	type kv struct{ a, d string }
 	var kvs []kv
-	for rows.Next() {
-		var a string
-		var d *string
-		if err := rows.Scan(&a, &d); err != nil {
-			return nil, fmt.Errorf("templatestore: 扫描部门: %w", err)
-		}
-		if d != nil {
-			kvs = append(kvs, kv{a, *d})
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("templatestore: 遍历部门: %w", err)
+	err := s.qRows(ctx,
+		`SELECT account, primary_dept FROM dim_org WHERE account = ANY($1)`, []any{accounts},
+		func(rows pgx.Rows) error {
+			for rows.Next() {
+				var a string
+				var d *string
+				if err := rows.Scan(&a, &d); err != nil {
+					return err
+				}
+				if d != nil {
+					kvs = append(kvs, kv{a, *d})
+				}
+			}
+			return nil
+		})
+	if err != nil {
+		return nil, fmt.Errorf("templatestore: 批量读部门: %w", err)
 	}
 	// 稳定写入（并对 key 排序，避免 map 迭代顺序影响后续判断——虽然这里不影响结果）
 	sort.Slice(kvs, func(i, j int) bool { return kvs[i].a < kvs[j].a })

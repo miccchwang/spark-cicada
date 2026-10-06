@@ -65,6 +65,95 @@ type TemplateHandlers struct {
 	//   一个看组织链路 D9），且都会演进。留空时保守返回 false ——
 	//   绝不能因为「不知道谁是主管」就默认所有人都是（那是提权）。
 	IsSupervisor func(account string) bool
+
+	// ★★ ForTenant 返回**绑定到指定租户**的服务实现（多租户部署必填）。
+	//
+	// ════════════════════════════════════════════════════════════════════
+	// 为什么放在接口层而不是 store 内部「自动感知当前租户」：
+	//
+	//	租户来源是**请求**（经 X-Spark-Tenant 头 → 认证中间件 → context），
+	//	不是进程全局状态。若 store 去猜「当前租户」，就必然依赖某种
+	//	global/goroutine-local —— 那在并发下会串租户（一个请求改成 B 租户，
+	//	另一个正跑 A 的请求跟着变成 B）。这是最经典的多租户事故。
+	//
+	//	故本层在**每个请求内**显式解析一次租户，取绑定实例。
+	//	空值 ⇒ 单租户部署（用 Svc 自身）。
+	//
+	// 契约：ForTenant(tenantID) 对同一 tenantID 应返回等价实例；返回 nil 视为
+	//	「该租户不可用」，本层按 503 处理（不是 500 —— 这是部署/配置问题）。
+	// ════════════════════════════════════════════════════════════════════
+	ForTenant func(tenantID string) TemplateService
+}
+
+// svc 解析本次请求应当使用的服务实例。
+//
+// ★ 单一入口：所有 handler 都必须经它取 Svc，绝不直接用 h.Svc。
+//
+//	若 handler 直接 h.Svc，多租户下就会用**未绑定租户**的实例读写 ——
+//	RLS 会把它当成无租户会话，写入落到哨兵/空租户，读到 0 行。
+//	这类 bug 在单租户测试里完全看不见。
+func (h *TemplateHandlers) svc(w http.ResponseWriter, r *http.Request) (TemplateService, bool) {
+	tid := TenantIDFromRequest(r)
+	if tid == "" {
+		// 单租户部署：没有租户头 ⇒ 用基实例。
+		// ★ 若部署配了 ForTenant（多租户）却拿不到租户，不能退回基实例 ——
+		//   那等于静默降级到「无租户」通道。下面显式拒绝。
+		if h.ForTenant == nil {
+			return h.Svc, true
+		}
+		writeErr(w, http.StatusBadRequest, "缺少租户标识")
+		return nil, false
+	}
+	if h.ForTenant == nil {
+		// 单租户部署收到租户头：忽略租户（基实例即该租户）。
+		return h.Svc, true
+	}
+	svc := h.ForTenant(tid)
+	if svc == nil {
+		writeErr(w, http.StatusServiceUnavailable, "租户不可用")
+		return nil, false
+	}
+	return svc, true
+}
+
+// writeErr 与 http.Error 语义一致，抽出来只为让租户解析的失败路径可读
+// （并给将来统一错误体留一个收口点）。
+func writeErr(w http.ResponseWriter, code int, msg string) {
+	http.Error(w, msg, code)
+}
+
+// tenantHeader 是租户标识的请求头名。
+//
+// ★ 与 X-Spark-Account 同层：都是**请求身份**的一部分，由前置认证中间件
+//   校验/注入。二者缺一不可 —— 账号回答「你是谁」，租户回答「你在谁的数据里」。
+//
+//	注意：本包**不**校验租户是否合法/是否存在（那是租户注册表 + 认证层的职责）；
+//	这里只做「取到就往下传」。租户是否可用由 ForTenant 返回 nil 体现。
+const tenantHeader = "X-Spark-Tenant"
+
+// TenantIDFromRequest 取本次请求的租户标识；空串表示未提供（单租户部署）。
+//
+// ★ 先查 context，再查头：认证中间件若已把租户解析进 context，
+//   就以 context 为准（头可被客户端伪造，context 是中间件校验过的）。
+func TenantIDFromRequest(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	if v, ok := r.Context().Value(tenantCtxKey{}).(string); ok && v != "" {
+		return v
+	}
+	return r.Header.Get(tenantHeader)
+}
+
+// tenantCtxKey 是本包 context 中租户值的键类型。
+//
+// ★ 用私有空结构体而非字符串：避免与其它包放进 context 的同名键相撞
+//   （string 键在不同包间会冲突，且 staticcheck SA1029 会报）。
+type tenantCtxKey struct{}
+
+// WithTenantID 把租户标识放入 context（供认证中间件使用）。
+func WithTenantID(ctx context.Context, tenantID string) context.Context {
+	return context.WithValue(ctx, tenantCtxKey{}, tenantID)
 }
 
 // ───────────────────────────── 读 ─────────────────────────────
@@ -77,17 +166,21 @@ func (h *TemplateHandlers) handleListTemplates(w http.ResponseWriter, r *http.Re
 	if !ok {
 		return
 	}
+	svc, ok := h.svc(w, r)
+	if !ok {
+		return
+	}
 	page := r.URL.Query().Get("page")
 	if page == "" {
 		http.Error(w, "missing page", http.StatusBadRequest)
 		return
 	}
-	v, err := h.Svc.ResolveViewer(r.Context(), actor, h.IsAdmin)
+	v, err := svc.ResolveViewer(r.Context(), actor, h.IsAdmin)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	list, err := h.Svc.VisibleFor(r.Context(), v, page)
+	list, err := svc.VisibleFor(r.Context(), v, page)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -106,22 +199,26 @@ func (h *TemplateHandlers) handleGetTemplate(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
+	svc, ok := h.svc(w, r)
+	if !ok {
+		return
+	}
 	id := r.URL.Query().Get("id")
 	if id == "" {
 		http.Error(w, "missing id", http.StatusBadRequest)
 		return
 	}
-	t, err := h.Svc.Load(r.Context(), id)
+	t, err := svc.Load(r.Context(), id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	v, err := h.Svc.ResolveViewer(r.Context(), actor, h.IsAdmin)
+	v, err := svc.ResolveViewer(r.Context(), actor, h.IsAdmin)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if !h.readable(r.Context(), t, v) {
+	if !h.readable(r.Context(), svc, t, v) {
 		http.Error(w, "forbidden: 无权访问该模板", http.StatusForbidden)
 		return
 	}
@@ -140,17 +237,21 @@ func (h *TemplateHandlers) handleDefaultTemplate(w http.ResponseWriter, r *http.
 	if !ok {
 		return
 	}
+	svc, ok := h.svc(w, r)
+	if !ok {
+		return
+	}
 	page := r.URL.Query().Get("page")
 	if page == "" {
 		http.Error(w, "missing page", http.StatusBadRequest)
 		return
 	}
-	v, err := h.Svc.ResolveViewer(r.Context(), actor, h.IsAdmin)
+	v, err := svc.ResolveViewer(r.Context(), actor, h.IsAdmin)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	list, err := h.Svc.VisibleFor(r.Context(), v, page)
+	list, err := svc.VisibleFor(r.Context(), v, page)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -172,6 +273,10 @@ func (h *TemplateHandlers) handleSaveTemplate(w http.ResponseWriter, r *http.Req
 	if !ok {
 		return
 	}
+	svc, ok := h.svc(w, r)
+	if !ok {
+		return
+	}
 	var body template.Template
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid body: "+err.Error(), http.StatusBadRequest)
@@ -184,7 +289,7 @@ func (h *TemplateHandlers) handleSaveTemplate(w http.ResponseWriter, r *http.Req
 	// ★ 身份覆盖：不接受 body 里的 owner
 	body.Owner = actor
 
-	v, err := h.Svc.ResolveViewer(r.Context(), actor, h.IsAdmin)
+	v, err := svc.ResolveViewer(r.Context(), actor, h.IsAdmin)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -192,7 +297,7 @@ func (h *TemplateHandlers) handleSaveTemplate(w http.ResponseWriter, r *http.Req
 
 	// 已存在的模板 ⇒ 必须是可写者（owner 或管理员）
 	// 不存在的 ⇒ 视为新建，但新建 system 档需要管理员权限（CanSetScope）。
-	existing, lerr := h.Svc.Load(r.Context(), body.ID)
+	existing, lerr := svc.Load(r.Context(), body.ID)
 	if lerr == nil && existing != nil {
 		if !template.CanWrite(existing, v) {
 			http.Error(w, "forbidden: 无权修改该模板", http.StatusForbidden)
@@ -218,7 +323,7 @@ func (h *TemplateHandlers) handleSaveTemplate(w http.ResponseWriter, r *http.Req
 		writeJSON(w, map[string]any{"ok": false, "problems": problems})
 		return
 	}
-	if err := h.Svc.Save(r.Context(), &body, actor); err != nil {
+	if err := svc.Save(r.Context(), &body, actor); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -236,6 +341,10 @@ func (h *TemplateHandlers) handleApplyTemplate(w http.ResponseWriter, r *http.Re
 	if !ok {
 		return
 	}
+	svc, ok := h.svc(w, r)
+	if !ok {
+		return
+	}
 	var body struct {
 		ID string `json:"id"`
 	}
@@ -243,21 +352,21 @@ func (h *TemplateHandlers) handleApplyTemplate(w http.ResponseWriter, r *http.Re
 		http.Error(w, "invalid body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	t, err := h.Svc.Load(r.Context(), body.ID)
+	t, err := svc.Load(r.Context(), body.ID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	v, err := h.Svc.ResolveViewer(r.Context(), actor, h.IsAdmin)
+	v, err := svc.ResolveViewer(r.Context(), actor, h.IsAdmin)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if !h.readable(r.Context(), t, v) {
+	if !h.readable(r.Context(), svc, t, v) {
 		http.Error(w, "forbidden: 无权套用该模板", http.StatusForbidden)
 		return
 	}
-	if err := h.Svc.BumpUse(r.Context(), t.ID, actor); err != nil {
+	if err := svc.BumpUse(r.Context(), t.ID, actor); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -272,6 +381,10 @@ func (h *TemplateHandlers) handleSetDefaultTemplate(w http.ResponseWriter, r *ht
 	if !ok {
 		return
 	}
+	svc, ok := h.svc(w, r)
+	if !ok {
+		return
+	}
 	var body struct {
 		ID string `json:"id"`
 	}
@@ -279,12 +392,12 @@ func (h *TemplateHandlers) handleSetDefaultTemplate(w http.ResponseWriter, r *ht
 		http.Error(w, "invalid body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	t, err := h.Svc.Load(r.Context(), body.ID)
+	t, err := svc.Load(r.Context(), body.ID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	v, err := h.Svc.ResolveViewer(r.Context(), actor, h.IsAdmin)
+	v, err := svc.ResolveViewer(r.Context(), actor, h.IsAdmin)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -294,7 +407,7 @@ func (h *TemplateHandlers) handleSetDefaultTemplate(w http.ResponseWriter, r *ht
 		http.Error(w, "forbidden: 无权设置该模板为默认", http.StatusForbidden)
 		return
 	}
-	if err := h.Svc.SetDefault(r.Context(), t.ID); err != nil {
+	if err := svc.SetDefault(r.Context(), t.ID); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -307,13 +420,17 @@ func (h *TemplateHandlers) handleDeleteTemplate(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
+	svc, ok := h.svc(w, r)
+	if !ok {
+		return
+	}
 	id := r.URL.Query().Get("id")
 	if id == "" {
 		http.Error(w, "missing id", http.StatusBadRequest)
 		return
 	}
 	isAdmin := h.IsAdmin != nil && h.IsAdmin(actor)
-	deleted, err := h.Svc.Delete(r.Context(), id, actor, isAdmin)
+	deleted, err := svc.Delete(r.Context(), id, actor, isAdmin)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -351,12 +468,18 @@ func (h *TemplateHandlers) actor(w http.ResponseWriter, r *http.Request) (string
 }
 
 // readable 综合判断可见性：team 档无显式分享时需要 owner 部门上下文。
-func (h *TemplateHandlers) readable(ctx context.Context, t *template.Template, v template.Viewer) bool {
+//
+// ★ svc 必须由调用方传入（而不是用 h.Svc）：
+//
+//	多租户下 OwnerDept 也受 RLS 过滤 —— 用未绑定租户的实例查部门会拿到空值，
+//	于是 team 档模板对同部门同事**静默不可见**（fail-closed 但不正确）。
+//	让调用方传入"本次请求的实例"，这个坑在类型上就不存在。
+func (h *TemplateHandlers) readable(ctx context.Context, svc TemplateService, t *template.Template, v template.Viewer) bool {
 	if template.CanRead(t, v) {
 		return true
 	}
 	if t.Scope == template.ScopeTeam && len(t.Shares) == 0 {
-		dept, err := h.Svc.OwnerDept(ctx, t.Owner)
+		dept, err := svc.OwnerDept(ctx, t.Owner)
 		if err != nil {
 			// 查不到部门 ⇒ 保守拒绝（fail-closed），不因 IO 失败而放行
 			return false

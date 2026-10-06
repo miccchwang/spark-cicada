@@ -17,15 +17,30 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/miccchwang/spark-cicada/backend/internal/admin"
+	"github.com/miccchwang/spark-cicada/backend/internal/tenant"
 )
 
 // Admin 是 admin.Store 的 Postgres 实现。
 type Admin struct {
 	pool *pgxpool.Pool
+	// tc 绑定租户（Task #57）。nil ⇒ 平台级审计（tenant_id = NULL）。
+	//
+	// ★ 平台治理操作（管槽/管账号/管算法）本质是**平台级**的，
+	//   默认 nil 是正确语义：平台审计不应被任一租户看到。
+	//   一旦本实例用于租户内操作，必须用 ForTenant 取绑定实例。
+	tc *tenant.TenantContext
 }
 
-// NewAdmin 用已连接池构造。
+// NewAdmin 用已连接池构造（平台级）。
 func NewAdmin(pool *pgxpool.Pool) *Admin { return &Admin{pool: pool} }
+
+// ForTenant 返回绑定到 tc 的**新**实例（不修改接收者，避免串租户）。
+func (a *Admin) ForTenant(tc tenant.TenantContext) *Admin {
+	if a == nil {
+		return nil
+	}
+	return &Admin{pool: a.pool, tc: &tc}
+}
 
 // ───────────────────────────── 槽 ─────────────────────────────
 
@@ -264,11 +279,26 @@ func (a *Admin) InsertAudit(ctx context.Context, actor, action, target string,
 	if err != nil {
 		d = []byte(`{}`)
 	}
-	_, err = a.pool.Exec(ctx, `
-		INSERT INTO audit_log (actor, action, target, detail, request_id, region)
-		VALUES ($1,$2,$3,$4,$5,$6)`,
-		actor, action, nullable(target), d, nullable(requestID), nullable(region))
-	if err != nil {
+	// ★ 带 tenant_id（Task #57）：audit_log 在 0011 后开了 RLS，
+	//   不带租户的行在租户档下会被 WITH CHECK 策略拒绝。
+	var tid any
+	if a.tc != nil {
+		tid = a.tc.TenantID
+	}
+	const q = `INSERT INTO audit_log (actor, action, target, detail, request_id, region, tenant_id)
+	           VALUES ($1,$2,$3,$4,$5,$6,$7)`
+	args := []any{actor, action, nullable(target), d, nullable(requestID), nullable(region), tid}
+	if a.tc == nil {
+		if _, err := a.pool.Exec(ctx, q, args...); err != nil {
+			return fmt.Errorf("store: 写审计失败: %w", err)
+		}
+		return nil
+	}
+	// 租户档：先 SET LOCAL app.tenant_id 再插入，否则策略拒绝。
+	if err := tenant.InTenantTx(ctx, a.pool, *a.tc, func(ctx context.Context, tx pgx.Tx) error {
+		_, e := tx.Exec(ctx, q, args...)
+		return e
+	}); err != nil {
 		return fmt.Errorf("store: 写审计失败: %w", err)
 	}
 	return nil

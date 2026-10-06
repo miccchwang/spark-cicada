@@ -339,17 +339,16 @@ func TestStatusServeable_只有active可服务(t *testing.T) {
 
 func strp(s string) *string { return &s }
 
-// tenantCacheKeyForTest 复刻契约里的 tenantCacheKey 规则（Go 侧无 TS 函数）。
+// tenantCacheKeyForTest 是 TenantCacheKey 的别名（Task #57 后 Go 侧已有真实现）。
 //
-// ★ 这里刻意**重新实现**而不是省略：契约里 tenantCacheKey 的行为
+// ★ 历史：本 helper 曾**重新实现**契约规则，因为没有 Go 侧实现。
+//   Task #57 引入了 tenant.TenantCacheKey（与 contracts/tenant.ts 的
+//   tenantCacheKey 同构）后，保留一份「复刻」就成了**第三份真相** ——
+//   真实现改了而复刻没改，测试会绿着放过漂移。
+//   故此处直接转发到真实现：测试作用于生产代码，漂移不可能发生。
 //
-//	（租户在最前、无租户返回空串）是安全属性，应当有对应断言。
-//	若两边规则漂移，本测试会失败，从而暴露「前端按 A 拼键、后端按 B 拼键」
-//	这种会导致缓存串租的错位。
+// ★ 与 TS 契约的一致性改由 cachekey_test.go 的
+//   TestTenantCacheKey_分隔符与TS契约同构 看护（钉住 U+001F）。
 func tenantCacheKeyForTest(tenantID string, parts ...string) string {
-	if tenantID == "" {
-		return ""
-	}
-	all := append([]string{tenantID}, parts...)
-	return strings.Join(all, "\u001f")
+	return TenantCacheKey(tenantID, parts...)
 }

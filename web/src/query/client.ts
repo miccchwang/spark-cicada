@@ -17,6 +17,7 @@
 
 import { DATA_CONTRACT_VERSION, type DataContract } from "../contracts/data-contract.js";
 import type { QueryState } from "../contracts/query-state.js";
+import { tenantCacheKey } from "../contracts/tenant.js";
 
 /** 查询失败时抛出的结构化错误（供 UI 精确展示原因）。 */
 export class QueryError extends Error {
@@ -61,6 +62,19 @@ export interface QueryClientOptions {
   baseUrl?: string;
   /** 身份注入（生产由网关/SSO 注入；开发期用）。 */
   account?: string;
+  /**
+   * 租户标识（多租户部署必填）。
+   *
+   * ★★ 为什么它必须参与**缓存键**（Task #57）：
+   *
+   *   本地缓存若只以 queryHash 为键，同一浏览器在「切换租户」后
+   *   （或同一 SPA 内嵌多个租户视图时）会命中**上一个租户**的结果 ——
+   *   这是纯前端的串租户，后端再严的 RLS 也拦不住（请求根本没发出去）。
+   *   症状是「切了租户还看到旧数据」，且刷新即好，极难复现。
+   *
+   * ★ 空租户 ⇒ 缓存键为空 ⇒ 不缓存（fail-closed），与后端契约一致。
+   */
+  tenantId?: string;
   /** 自定义 fetch（测试注入）。 */
   fetchImpl?: typeof fetch;
 }
@@ -69,13 +83,15 @@ export interface QueryClientOptions {
 export class QueryClient {
   private readonly baseUrl: string;
   private readonly account: string;
+  private readonly tenantId: string;
   private readonly fetchImpl: typeof fetch;
-  /** queryHash → DataContract 缓存（与后端缓存键同源，保证幂等）。 */
+  /** 租户前缀 + queryHash → DataContract 缓存（与后端缓存键同源，保证幂等）。 */
   private readonly cache = new Map<string, DataContract>();
 
   constructor(opts: QueryClientOptions = {}) {
     this.baseUrl = opts.baseUrl ?? "";
     this.account = opts.account ?? "";
+    this.tenantId = opts.tenantId ?? "";
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
   }
 
@@ -95,13 +111,18 @@ export class QueryClient {
    * @param cacheKey  可选：由 qs 规范化得到的哈希（用于本地缓存）
    */
   async run(qs: QueryState, cacheKey?: string): Promise<DataContract> {
-    if (cacheKey) {
-      const hit = this.cache.get(cacheKey);
+    // ★ 缓存键 = 租户前缀 + qs 哈希。租户为空 ⇒ 键为空 ⇒ 不读也不写缓存。
+    //   这一行是前端串租户的唯一防线，绝不可省成 cacheKey 直接使用。
+    const scopedKey = cacheKey ? tenantCacheKey(this.tenantId, cacheKey) : "";
+
+    if (scopedKey) {
+      const hit = this.cache.get(scopedKey);
       if (hit) return hit;
     }
 
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (this.account) headers["X-Spark-Account"] = this.account;
+    if (this.tenantId) headers["X-Spark-Tenant"] = this.tenantId;
 
     let res: Response;
     try {
@@ -138,7 +159,7 @@ export class QueryClient {
       );
     }
 
-    if (cacheKey) this.cache.set(cacheKey, dc);
+    if (scopedKey) this.cache.set(scopedKey, dc);
     return dc;
   }
 

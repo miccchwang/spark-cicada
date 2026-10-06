@@ -159,6 +159,9 @@ func main() {
 			Svc:          dp.templates,
 			IsAdmin:      isAdmin,
 			IsSupervisor: dp.isSupervisorFunc(),
+			// ★ 多租户：按请求头解析租户，取绑定租户的 store 实例。
+			//   库未就绪时 dp.tenants==nil ⇒ 返回 nil ⇒ 403，绝不回退无租户通道。
+			ForTenant: dp.templatesForTenant,
 		}
 		tplH.Routes(mux)
 

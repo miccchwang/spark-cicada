@@ -42,16 +42,65 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/miccchwang/spark-cicada/backend/internal/strategy"
+	"github.com/miccchwang/spark-cicada/backend/internal/tenant"
 )
 
 // StrategyStore 策略实验室的持久化实现。
 type StrategyStore struct {
 	pool *pgxpool.Pool
+	// tc 绑定租户（Task #57）。nil ⇒ 平台级（审计写 tenant_id = NULL）。
+	//
+	// ★ 策略实验室改的是**口径/规则集**，直接影响同一份数据被算成什么，
+	//   其审计必须归属到触发它的租户 —— 否则租户档下要么被 RLS 拒绝，
+	//   要么（更糟）落到一个谁都看不见的 NULL 行上，等于审计静默失效。
+	tc *tenant.TenantContext
 }
 
-// NewStrategyStore 构造。
+// NewStrategyStore 构造（平台级）。
 func NewStrategyStore(pool *pgxpool.Pool) *StrategyStore {
 	return &StrategyStore{pool: pool}
+}
+
+// ForTenant 返回绑定到 tc 的**新**实例（不修改接收者，避免串租户）。
+func (s *StrategyStore) ForTenant(tc tenant.TenantContext) *StrategyStore {
+	if s == nil {
+		return nil
+	}
+	return &StrategyStore{pool: s.pool, tc: &tc}
+}
+
+// tenantIDOrNil 返回 tenant_id 列的写入值。
+func (s *StrategyStore) tenantIDOrNil() any {
+	if s.tc == nil {
+		return nil
+	}
+	return s.tc.TenantID
+}
+
+// inTx 在（租户感知的）事务内执行 fn。
+//
+// ★ 平台档 ⇒ 普通 pgx 事务；租户档 ⇒ tenant.InTenantTx（先 SET LOCAL app.tenant_id）。
+//
+//	为什么做成 helper：Decide / Rollback 里有多条语句必须同事务
+//	（历史 + 当前值 + 桶 STALE）。若各写一份 Begin，只要一处漏掉
+//	租户施加，那条路径就在 RLS 下静默失效 —— 而漏掉的往往正是
+//	最少被覆盖的（回滚路径）。
+func (s *StrategyStore) inTx(ctx context.Context, fn func(ctx context.Context, tx pgx.Tx) error) error {
+	if s.tc == nil {
+		tx, err := s.pool.Begin(ctx)
+		if err != nil {
+			return fmt.Errorf("store: 开启事务失败: %w", err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }() // 已提交时 Rollback 是 no-op
+		if err := fn(ctx, tx); err != nil {
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("store: 提交事务失败: %w", err)
+		}
+		return nil
+	}
+	return tenant.InTenantTx(ctx, s.pool, *s.tc, fn)
 }
 
 // choicePrefix 选型卡在 registry_rule_set 里的 id 前缀。
@@ -352,11 +401,26 @@ func (s *StrategyStore) Decide(ctx context.Context, c *strategy.Choice, target s
 		reversible = o.Reversible
 	}
 
-	tx, err := s.pool.Begin(ctx)
+	// ★ 事务入口走 s.inTx：租户档下它会先 SET LOCAL app.tenant_id，
+	//   再在同一事务里跑下面的审计/更新/STALE 三条语句。
+	//   若这里直接 s.pool.Begin，RLS 会话变量根本没设 —— 审计 INSERT 会被
+	//   audit_log 的 WITH CHECK 策略拒绝（或落到哨兵），决策路径整条失效。
+	var entry strategy.HistoryEntry
+	err := s.inTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		entry, err = s.decideInTx(ctx, tx, c, target, kind, actor, snapshotHash, changed, reversible, affected)
+		return err
+	})
 	if err != nil {
-		return strategy.HistoryEntry{}, fmt.Errorf("store: 开启事务失败: %w", err)
+		return strategy.HistoryEntry{}, err
 	}
-	defer func() { _ = tx.Rollback(ctx) }() // 已提交时 Rollback 是 no-op
+	return entry, nil
+}
+
+// decideInTx 是 Decide 的事务体（拆出来以便租户档复用同一段逻辑）。
+func (s *StrategyStore) decideInTx(ctx context.Context, tx pgx.Tx,
+	c *strategy.Choice, target string, kind strategy.ActionKind, actor, snapshotHash string,
+	changed, reversible bool, affected []string) (strategy.HistoryEntry, error) {
 
 	// ① 历史（append-only）
 	detail, err := json.Marshal(map[string]any{
@@ -375,10 +439,10 @@ func (s *StrategyStore) Decide(ctx context.Context, c *strategy.Choice, target s
 	var auditID int64
 	var at time.Time
 	if err := tx.QueryRow(ctx, `
-		INSERT INTO audit_log (actor, action, target, detail)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO audit_log (actor, action, target, detail, tenant_id)
+		VALUES ($1, $2, $3, $4, $5)
 		RETURNING id, at`,
-		actor, strategy.AuditActionDecide, c.ID, detail).Scan(&auditID, &at); err != nil {
+		actor, strategy.AuditActionDecide, c.ID, detail, s.tenantIDOrNil()).Scan(&auditID, &at); err != nil {
 		return strategy.HistoryEntry{}, fmt.Errorf("store: 写策略历史失败: %w", err)
 	}
 
@@ -406,10 +470,6 @@ func (s *StrategyStore) Decide(ctx context.Context, c *strategy.Choice, target s
 				return strategy.HistoryEntry{}, fmt.Errorf("store: 标记桶 %s STALE 失败: %w", b, err)
 			}
 		}
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return strategy.HistoryEntry{}, fmt.Errorf("store: 提交决策失败: %w", err)
 	}
 
 	return strategy.HistoryEntry{
@@ -446,11 +506,22 @@ func (s *StrategyStore) Rollback(ctx context.Context, plan strategy.RollbackPlan
 	if s == nil || s.pool == nil {
 		return strategy.HistoryEntry{}, fmt.Errorf("store: 策略实验室不可用（连接池未初始化）")
 	}
-	tx, err := s.pool.Begin(ctx)
+	// ★ 同 Decide：事务入口走 s.inTx，租户档下先 SET LOCAL app.tenant_id。
+	var entry strategy.HistoryEntry
+	err := s.inTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		var e error
+		entry, e = s.rollbackInTx(ctx, tx, plan, actor)
+		return e
+	})
 	if err != nil {
-		return strategy.HistoryEntry{}, fmt.Errorf("store: 开启事务失败: %w", err)
+		return strategy.HistoryEntry{}, err
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	return entry, nil
+}
+
+// rollbackInTx 是 Rollback 的事务体。
+func (s *StrategyStore) rollbackInTx(ctx context.Context, tx pgx.Tx,
+	plan strategy.RollbackPlan, actor string) (strategy.HistoryEntry, error) {
 
 	detail, err := json.Marshal(map[string]any{
 		"choiceId": plan.ChoiceID,
@@ -474,10 +545,10 @@ func (s *StrategyStore) Rollback(ctx context.Context, plan strategy.RollbackPlan
 	var auditID int64
 	var at time.Time
 	if err := tx.QueryRow(ctx, `
-		INSERT INTO audit_log (actor, action, target, detail)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO audit_log (actor, action, target, detail, tenant_id)
+		VALUES ($1, $2, $3, $4, $5)
 		RETURNING id, at`,
-		actor, strategy.AuditActionRollback, plan.ChoiceID, detail).Scan(&auditID, &at); err != nil {
+		actor, strategy.AuditActionRollback, plan.ChoiceID, detail, s.tenantIDOrNil()).Scan(&auditID, &at); err != nil {
 		return strategy.HistoryEntry{}, fmt.Errorf("store: 写回滚历史失败: %w", err)
 	}
 
@@ -501,9 +572,7 @@ func (s *StrategyStore) Rollback(ctx context.Context, plan strategy.RollbackPlan
 		}
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return strategy.HistoryEntry{}, fmt.Errorf("store: 提交回滚失败: %w", err)
-	}
+	// ★ 事务提交由外层 s.inTx 负责（平台档/租户档统一），此处不再 Commit。
 	return strategy.HistoryEntry{
 		ID:              fmt.Sprintf("audit-%d", auditID),
 		ChoiceID:        plan.ChoiceID,
@@ -545,9 +614,19 @@ func (s *StrategyStore) RecordStrategyChange(ctx context.Context, actor, action,
 	if err != nil {
 		d = []byte(`{}`)
 	}
-	if _, err := s.pool.Exec(ctx, `
-		INSERT INTO audit_log (actor, action, target, detail)
-		VALUES ($1, $2, $3, $4)`, actor, action, nullable(target), d); err != nil {
+	const q = `INSERT INTO audit_log (actor, action, target, detail, tenant_id)
+	           VALUES ($1, $2, $3, $4, $5)`
+	args := []any{actor, action, nullable(target), d, s.tenantIDOrNil()}
+	if s.tc == nil {
+		if _, err := s.pool.Exec(ctx, q, args...); err != nil {
+			return fmt.Errorf("store: 写策略审计失败: %w", err)
+		}
+		return nil
+	}
+	if err := tenant.InTenantTx(ctx, s.pool, *s.tc, func(ctx context.Context, tx pgx.Tx) error {
+		_, e := tx.Exec(ctx, q, args...)
+		return e
+	}); err != nil {
 		return fmt.Errorf("store: 写策略审计失败: %w", err)
 	}
 	return nil

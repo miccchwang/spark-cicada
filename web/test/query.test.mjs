@@ -120,7 +120,8 @@ test("成功路径：返回 DataContract 且缓存生效", async () => {
     calls++;
     return { ok: true, status: 200, async text() { return OK_DC; } };
   };
-  const c = new Q.QueryClient({ fetchImpl: counting });
+  // ★ 必须传 tenantId：无租户 ⇒ 缓存键为空 ⇒ 不缓存（fail-closed 契约）。
+  const c = new Q.QueryClient({ fetchImpl: counting, tenantId: "t-1" });
   const a = await c.run(QS, "key1");
   const b = await c.run(QS, "key1");
   assert.equal(a.v, "1.0");
@@ -129,6 +130,47 @@ test("成功路径：返回 DataContract 且缓存生效", async () => {
   c.clearCache();
   await c.run(QS, "key1");
   assert.equal(calls, 2, "清缓存后应重新请求");
+});
+
+test("★★ 无租户时不得缓存（fail-closed）", async () => {
+  let calls = 0;
+  const counting = async () => {
+    calls++;
+    return { ok: true, status: 200, async text() { return OK_DC; } };
+  };
+  const c = new Q.QueryClient({ fetchImpl: counting }); // 无 tenantId
+  await c.run(QS, "key1");
+  await c.run(QS, "key1");
+  assert.equal(calls, 2, "无租户时缓存键为空，两次都应真实请求（不得复用）");
+});
+
+test("★★ 不同租户不得共享缓存条目（跨租户污染）", async () => {
+  let calls = 0;
+  const counting = async () => {
+    calls++;
+    return { ok: true, status: 200, async text() { return OK_DC; } };
+  };
+  const a = new Q.QueryClient({ fetchImpl: counting, tenantId: "t-A" });
+  const b = new Q.QueryClient({ fetchImpl: counting, tenantId: "t-B" });
+  await a.run(QS, "same-hash");
+  await b.run(QS, "same-hash");
+  assert.equal(calls, 2, "两个租户即使 queryHash 相同也必须各自请求");
+
+  // 同一实例内也应分租户隔离 —— 但实例绑定租户后无法改，故这里只验证键不同。
+  const a2 = new Q.QueryClient({ fetchImpl: counting, tenantId: "t-A" });
+  await a2.run(QS, "same-hash");
+  assert.equal(calls, 3, "换实例（同租户）仍是冷缓存，需重新请求");
+});
+
+test("★ 租户经请求头注入 X-Spark-Tenant", async () => {
+  let seenHeaders = {};
+  const spy = async (_url, init) => {
+    seenHeaders = init?.headers ?? {};
+    return { ok: true, status: 200, async text() { return OK_DC; } };
+  };
+  const c = new Q.QueryClient({ fetchImpl: spy, tenantId: "t-9" });
+  await c.run(QS);
+  assert.equal(seenHeaders["X-Spark-Tenant"], "t-9", "租户应走请求头");
 });
 
 test("身份经请求头注入，不写入 URL（G11）", async () => {

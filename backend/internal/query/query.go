@@ -19,6 +19,7 @@ import (
 
 	"github.com/miccchwang/spark-cicada/backend/internal/compute"
 	"github.com/miccchwang/spark-cicada/backend/internal/contracts"
+	"github.com/miccchwang/spark-cicada/backend/internal/tenant"
 )
 
 // ErrNoBucket 表示未找到可用预计算桶（须回退到实时计算或拒绝）。
@@ -73,6 +74,14 @@ type SlotStatus struct {
 }
 
 // Cache 是结果缓存抽象（Redis 实现）。
+//
+// ★★ key 必须由 tenant.CacheKeyForQuery / tenant.TenantCacheKey 构造。
+//
+//	实现方**不得**对 key 做任何「去掉前缀」「按内容重算」的处理：
+//	一旦实现把租户前缀剥离（例如为了「按查询内容去重」），
+//	多租户隔离就在缓存层被悄悄拆掉 —— 而调用方完全看不出来。
+//	本接口是「可注入的接缝」，接缝处的纪律必须写在类型上，
+//	不能只写在某个实现的注释里。
 type Cache interface {
 	Get(ctx context.Context, key string) (*ResultSet, bool)
 	Set(ctx context.Context, key string, rs *ResultSet, ttl time.Duration) error
@@ -101,7 +110,45 @@ type Policy struct {
 // Run 执行一次查询。
 //
 // 幂等保证：相同 QueryState ⇒ 相同 queryHash ⇒ 相同 ResultSet（闸门 G1）。
+//
+// ★★ 本方法**不感知租户**，因此**不得**用于多租户读路径。
+//
+//	缓存键只是 QueryState 的哈希 ⇒ 两家租户发同样查询会命中同一条目
+//	⇒ B 读到 A 的数字（不报错、不可复现，见 tenant/cachekey.go 的说明）。
+//	多租户调用点必须用 RunInTenant。
+//
+//	之所以仍保留它：平台级/单租户部署（如 CI 闸门、离线计算）确实
+//	没有租户概念，强行要求传租户只会让它们造一个假 uuid —— 那更糟。
+//	但保留的同时必须在文档与命名上把「不该用在哪」说清楚。
 func (o *Orchestrator) Run(ctx context.Context, q contracts.QueryState) (*ResultSet, error) {
+	return o.run(ctx, q, "")
+}
+
+// RunInTenant 执行一次**租户隔离**的查询。
+//
+// ★ 与 Run 的唯一差别是缓存键带上租户前缀（tenant.TenantCacheKey）。
+//
+//	为什么不把租户塞进 QueryState 的哈希：
+//	  ① QueryState 是**前端契约**（contracts/query-state.ts），
+//	     加入租户字段会污染契约语义、并通过镜像机制扩散到前端；
+//	  ② 哈希是「查询内容的指纹」，而租户是「访问主体的身份」——
+//	     两者不同性质，混在一起会让「同内容不同租户」看起来不同内容，
+//	     破坏 G1 闸门「相同 QueryState ⇒ 相同 queryHash」的不变量。
+//	故租户作为**键的前缀维度**，而不是哈希的输入。
+//
+// ★ tenantID 为空 ⇒ fail-closed：不读写缓存，直接穿透到数据源。
+//
+//	宁可每次真查，也不要「所有未标租户的查询共享一条缓存」。
+func (o *Orchestrator) RunInTenant(ctx context.Context, tenantID string, q contracts.QueryState) (*ResultSet, error) {
+	if tenantID == "" {
+		// ★ 注意这里传的是空前缀 ⇒ run 内部会跳过缓存（见 run 的实现）。
+		return o.run(ctx, q, "")
+	}
+	return o.run(ctx, q, tenantID)
+}
+
+// run 是 Run / RunInTenant 的共同实现。tenantID 为空 ⇒ 禁用缓存。
+func (o *Orchestrator) run(ctx context.Context, q contracts.QueryState, tenantID string) (*ResultSet, error) {
 	if q.V == "" {
 		q.V = contracts.QueryStateVersion
 	}
@@ -110,9 +157,13 @@ func (o *Orchestrator) Run(ctx context.Context, q contracts.QueryState) (*Result
 		return nil, fmt.Errorf("query: hash: %w", err)
 	}
 
+	// ★★ 缓存键：租户优先。无租户 ⇒ 空键 ⇒ 下面两个条件都不成立 ⇒ 不缓存。
+	cacheKey := tenant.CacheKeyForQuery(tenantID, hash)
+	cacheOn := o.Cache != nil && cacheKey != ""
+
 	// 1) 缓存
-	if o.Cache != nil {
-		if rs, ok := o.Cache.Get(ctx, hash); ok && rs != nil {
+	if cacheOn {
+		if rs, ok := o.Cache.Get(ctx, cacheKey); ok && rs != nil {
 			return rs, nil
 		}
 	}
@@ -195,9 +246,9 @@ func (o *Orchestrator) Run(ctx context.Context, q contracts.QueryState) (*Result
 		})
 	}
 
-	// 7) 缓存
-	if o.Cache != nil {
-		_ = o.Cache.Set(ctx, hash, rs, o.Policy.CacheTTL)
+	// 7) 缓存（仅在有租户键时写入 —— 见 cacheOn 的说明）
+	if cacheOn {
+		_ = o.Cache.Set(ctx, cacheKey, rs, o.Policy.CacheTTL)
 	}
 	return rs, nil
 }

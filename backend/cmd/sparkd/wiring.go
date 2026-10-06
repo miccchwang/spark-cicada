@@ -15,10 +15,12 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/miccchwang/spark-cicada/backend/internal/admin"
+	"github.com/miccchwang/spark-cicada/backend/internal/api"
 	"github.com/miccchwang/spark-cicada/backend/internal/authz"
 	"github.com/miccchwang/spark-cicada/backend/internal/chain"
 	"github.com/miccchwang/spark-cicada/backend/internal/db"
@@ -26,6 +28,7 @@ import (
 	"github.com/miccchwang/spark-cicada/backend/internal/groupstore"
 	"github.com/miccchwang/spark-cicada/backend/internal/store"
 	"github.com/miccchwang/spark-cicada/backend/internal/templatestore"
+	"github.com/miccchwang/spark-cicada/backend/internal/tenant"
 )
 
 // dataPlane 打包运行时数据面依赖（可为部分降级）。
@@ -41,6 +44,11 @@ type dataPlane struct {
 	// nil 表示库未就绪（对应接口按 503 fail-closed，不返回编造数据）。
 	groups    *groupstore.Store
 	templates *templatestore.Store
+	// tenants：租户注册表（dim_tenant 只读）。
+	//
+	// ★ 库未就绪时为 nil ⇒ 租户解析一律拒绝（fail-closed），
+	//   退回单租户行为。绝不用"注册表不可用所以放行"。
+	tenants *tenant.Registry
 	// caliberAudit：M-PNL 口径切换的审计落库（append-only）。
 	// nil 表示库未就绪 —— 此时口径仍可切换，但接口会如实回报「未留痕」。
 	caliberAudit *store.CaliberAuditStore
@@ -129,6 +137,8 @@ func buildDataPlane(ctx context.Context) *dataPlane {
 	// M-GROUP/M-REQ 与 M-TEMPLATE 的持久化（与 store 同池）
 	p.groups = groupstore.New(pool)
 	p.templates = templatestore.New(pool)
+	// ★ 租户注册表（Task #57）。短 TTL 缓存：见 tenant.NewRegistryWithCache 注释。
+	p.tenants = tenant.NewRegistryWithCache(pool, tenantRegistryCacheTTL)
 	// 口径切换审计复用同一连接池（audit_log 是 append-only，只 INSERT）
 	p.caliberAudit = store.NewCaliberAuditStore(pool)
 	// M-STRATEGY：选型卡读 registry_rule_set，历史读/写 audit_log（同一池）
@@ -305,6 +315,78 @@ func (p *dataPlane) isAdminFunc() func(string) bool {
 		}
 		return false
 	}
+}
+
+// ───────────────────────────── 租户解析（Task #57）─────────────────────────────
+
+// tenantRegistryCacheTTL 是租户元数据缓存的存活时间。
+//
+// ★ 取值权衡：这是「每请求都要解析一次租户」与「停用一家租户多久生效」之间的取舍。
+//
+//	30s 意味着：一个停用操作最多滞后 30s 生效。
+//	对停用（anti-fraud / 欠费）来说，30s 是可接受的；对一个**必须要即时**的
+//	动作（例如强制下线），应当改走 Invalidate() 主动失效或缩短 TTL。
+//
+//	绝不用"永久缓存"：那样停用只会在进程重启时生效，等于停用功能失效。
+const tenantRegistryCacheTTL = 30 * time.Second
+
+// tenantResolver 返回本进程的租户解析器（库未就绪时为 nil）。
+func (p *dataPlane) tenantResolver() *tenant.Resolver {
+	if p.tenants == nil {
+		return nil
+	}
+	return p.tenants.ResolverFor()
+}
+
+// resolveTenantFromRequest 从一次请求解析租户上下文。
+//
+// ★ 返回 (Resolution, error)：
+//   - error 非 nil ⇒ **基础设施故障**（注册表不可达），上层应回 503；
+//   - Resolution.Allowed()==false ⇒ 租户层面拒绝，上层按原因映射 4xx；
+//   - 否则 Resolution.Context() 给出租户上下文，调用方据此取绑定租户的 store。
+//
+// ★ 头来源：X-Spark-Tenant 与 X-Spark-Account 同层（请求身份）。
+//
+//	这里**只**认 header/claim，不认 host（DisallowHost=true，见 Resolver 注释）。
+//
+// ★ 单租户部署（tenants==nil）返回 Rejected(ReasonInternal) 且 error 为 nil ——
+//
+//	调用方必须自行区分「部署是单租户」与「解析失败」。注意不要把它当成
+//	"解析失败所以回 503"：单租户部署下**所有**请求都会走到这里。
+func (p *dataPlane) resolveTenantFromRequest(ctx context.Context, h tenant.Hint) (tenant.Resolution, error) {
+	if p.tenants == nil {
+		// 注册表未就绪（无库 / 单租户部署）：显式拒绝，绝不回退默认租户。
+		return tenant.Rejected(tenant.ReasonInternal), nil
+	}
+	return p.tenants.ContextFor(ctx, h)
+}
+
+// templatesForTenant 返回**绑定到指定租户**的模板服务（供 api.TemplateHandlers.ForTenant）。
+//
+// ★ 关键不变量：返回的 store 持有固定 tc，**不随请求变**。
+//
+//	若这里返回的是共享实例并在 handler 里改它的租户，并发请求会串租户。
+//	因此本方法每次调用都构造一个新实例（成本极低：只包一个结构体指针 + 池引用）。
+//
+// ★ 租户记录必须有效才绑定；无效 ⇒ 返回 nil，由 api 层回 503。
+//
+//	这里复用了注册表（带 TTL 缓存），因此热路径上不产生额外查询。
+func (p *dataPlane) templatesForTenant(tenantID string) api.TemplateService {
+	if p.templates == nil || p.tenants == nil {
+		return nil
+	}
+	// 解析租户（用同一条注册表，保证档位/状态判据与请求解析完全一致）。
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	res, err := p.tenants.ContextFor(ctx, tenant.Hint{Header: tenantID})
+	if err != nil || !res.Allowed() {
+		return nil
+	}
+	tc, err := res.Context()
+	if err != nil {
+		return nil
+	}
+	return templatestore.NewForTenant(p.pool, tc)
 }
 
 // baseTemplateOf 取某账号的基座模板 id。

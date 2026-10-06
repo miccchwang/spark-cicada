@@ -397,6 +397,95 @@ func TestDedicated_search_path生效(t *testing.T) {
 	}
 }
 
+// ───────────────────────────── 游标契约（QueryInTenant） ─────────────────────────────
+
+// TestQueryInTenant_游标契约不能替回调推进 —— 真实静默丢行缺陷的回归护栏。
+//
+// ══════════════════════════════════════════════════════════════════════════
+// ★★ 本测试源自一次**真实且极难定位**的缺陷（Task #57）：
+//
+//	QueryInTenant 曾先 `for rows.Next()` 推进游标一圈，再把 rows 交给回调；
+//	而 templatestore 的调用方（Load / LoadByPage / loadShares …）回调里
+//	**又推进一圈**。于是：
+//	  · 恰好 1 行时 → 内层发现游标已耗尽 → 返回 **0 行**（看起来像"查不到"）；
+//	  · 多行时 → **每读一行跳一行**，静默丢一半。
+//
+//	这个缺陷的可怕之处：
+//	  · **不报错**，空结果集与"确实没有数据"完全同形；
+//	  · `count(*)` 这类「回调里只 Scan 不 Next」的调用**照常工作**，
+//	    于是同一个 store 里一半查询对、一半查询空；
+//	  · 症状与「RLS 未生效」「pgx 计划缓存被污染」高度相似，
+//	    排查时极易走偏（本次就误判成计划缓存问题，绕了很长的路）。
+//
+//	⇒ 契约：**游标只能被推进一次，且必须由回调推进。**
+//	  QueryInTenant 把**未推进的**游标交给回调。
+// ══════════════════════════════════════════════════════════════════════════
+//
+// ★ 为什么用**真库 + 真多行**测：
+//
+//	这条性质只在「结果 >1 行」时才区分得开「契约正确」与「各推一圈」：
+//	  契约正确 → 3 行全读到；
+//	  各推一圈 → 只读到 2 行（或 1 行时读到 0 行）。
+//	用 mock/monkey patch 测不出这个差异 —— 必须有真的游标行为。
+func TestQueryInTenant_游标契约不能替回调推进(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	schema, err := SchemaNameFor(uidAlpha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = pool.Exec(ctx, `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
+	if _, err := pool.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatalf("建 schema 失败：%v", err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`) })
+
+	tc := TenantContext{
+		TenantID: uidAlpha, Tier: TierDedicated,
+		SchemaName: &schema, RLSTenantID: uidAlpha,
+	}
+	if err := ExecInTenant(ctx, pool, tc,
+		`CREATE TABLE probe_multi (v int)`); err != nil {
+		t.Fatalf("建表失败：%v", err)
+	}
+	for i := 1; i <= 3; i++ {
+		if err := InTenantTx(ctx, pool, tc, func(ctx context.Context, tx pgx.Tx) error {
+			_, e := tx.Exec(ctx, `INSERT INTO probe_multi (v) VALUES ($1)`, i)
+			return e
+		}); err != nil {
+			t.Fatalf("插入 %d 失败：%v", i, err)
+		}
+	}
+
+	// 回调**自己**推进游标（这是契约要求的写法）
+	var got []int
+	err = QueryInTenant(ctx, pool, tc, `SELECT v FROM probe_multi ORDER BY v`, nil,
+		func(rows pgx.Rows) error {
+			for rows.Next() {
+				var v int
+				if e := rows.Scan(&v); e != nil {
+					return e
+				}
+				got = append(got, v)
+			}
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("QueryInTenant 失败：%v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("★ 契约被破坏：应读到 3 行，实际读到 %d 行（%v）—— "+
+			"若 QueryInTenant 替回调推进了游标，就会出现「读数减半 / 单行读成 0 行」的静默丢行",
+			len(got), got)
+	}
+	for i, v := range got {
+		if v != i+1 {
+			t.Fatalf("行序/内容不对：got=%v", got)
+		}
+	}
+}
+
 // ───────────────────────────── 辅助 ─────────────────────────────
 
 // ───────────────────────────── ★★ 超级用户绕过 RLS（真实事故的回归钉） ─────────────────────────────
