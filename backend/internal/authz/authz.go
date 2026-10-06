@@ -18,6 +18,7 @@
 package authz
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -115,6 +116,62 @@ const (
 	OriginSupervisor GrantOrigin = "SUPERVISOR_DELEGATE"
 	OriginRequest    GrantOrigin = "REQUEST_APPROVED"
 	OriginTemp       GrantOrigin = "TEMP"
+)
+
+// DelegationRequest 一次「上级代授」（D13）的输入。
+//
+// ★ 存在的意义：`CheckDelegationNoOverflow` 断言的是 `DelegationAllowed(granter, grantee)`
+// 的**返回值**，而生产侧此前**根本没有任何代码会构造这份授权** ——
+// `authz.DelegationAllowed` 的唯一非测试调用点就是那条断言本身，
+// 于是「代授不溢出自身范围」在实现侧同样**恒真**：没有代授路径，自然从不溢出。
+// 本结构把「代授」变成一条真实可执行、且能落审计与来源分层的路径。
+type DelegationRequest struct {
+	// Granter 授出者账号。
+	Granter string `json:"granter"`
+	// Grantee 被授人账号。
+	Grantee string `json:"grantee"`
+	// Scope 被授出的内容（**只能收窄**，不得超出 Granter 自身权限）。
+	Scope DelegationScope `json:"scope"`
+	// DelegateAll true = 按 Granter 当前求值结果**整体**代授。
+	// 此时审计留痕的 Scope 也取求值后的实际集合（同族祖先全展开），
+	// 便于事后核对「到底授出去了什么」。
+	DelegateAll bool `json:"delegateAll"`
+	// At 代授发生时间（RFC3339；留痕用）。
+	At string `json:"at,omitempty"`
+}
+
+// DelegationScope 代授内容（模块 / 密级 / 维度 / 勾选组 / 业务数值）。
+type DelegationScope struct {
+	Modules               []string           `json:"modules,omitempty"`
+	MaxLevel              Level              `json:"maxLevel,omitempty"`
+	Dimensions            []DimensionGrant   `json:"dimensions,omitempty"`
+	DataUseGroups         []GroupScopeGrant  `json:"dataUseGroups,omitempty"`
+	CanViewBusinessValues bool               `json:"canViewBusinessValues,omitempty"`
+}
+
+// Delegation 代授落库后的结果，供调用方落 Entitlement.Grants 与审计。
+type Delegation struct {
+	Granter string `json:"granter"`
+	Grantee string `json:"grantee"`
+	// Record 授权来源记录（Origin=SUPERVISOR_DELEGATE），
+	// 其 UpperBoundRef 记授出者账号、GrantedBy 记具体执行人。
+	Record GrantRecord `json:"record"`
+	// Scope 实际授出的范围（DelegateAll 时已展开为具体集合）。
+	Scope DelegationScope `json:"scope"`
+}
+
+// DelegationError 代授被拒的原因。
+type DelegationError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+func (e *DelegationError) Error() string { return e.Code + ": " + e.Message }
+
+// 代授拒绝码。
+const (
+	ErrCodeDelegationOverflow = "DELEGATION_OVERFLOW"
+	ErrCodeSameAccount        = "SAME_ACCOUNT"
 )
 
 // GrantRecord 授权来源记录（与 contracts/entitlement.ts 的 GrantRecord 对齐）。
@@ -580,4 +637,217 @@ func DelegationAllowed(granter, grantee *EntitlementView) bool {
 		}
 	}
 	return true
+}
+
+// ScopeOverflow 校验「代授范围 ⊆ 授出者自身范围」（D13 核心不变量）。
+//
+// 与 DelegationAllowed 的分工：
+//   - DelegationAllowed 吃两份 EntitlementView，适合已有求值结果时快速判定；
+//   - ScopeOverflow 吃「授出者求值结果 + 代授草案 Scope」，适合**落库前**用
+//     同一套口径复判，避免「先落库、后校验」的窗口期。
+//
+// 返回违规明细（空 = 全部合法），每条都带 docs/01 §13.3 的约束名。
+func ScopeOverflow(granter *EntitlementView, s DelegationScope) []string {
+	if granter == nil {
+		return []string{"授出者求值结果为空，无法证明不溢出"}
+	}
+	var v []string
+
+	// ① 业务数值：授出者自己看不见，就不得授出
+	if s.CanViewBusinessValues && !granter.CanViewBusinessValues {
+		v = append(v, "业务数值可见性溢出：授出者不可见业务数值，不得授出")
+	}
+
+	// ② 密级不得溢出
+	if levelRank[s.MaxLevel] > levelRank[granter.MaxLevel] {
+		v = append(v, fmt.Sprintf("密级溢出：授出 %s > 自身 %s", s.MaxLevel, granter.MaxLevel))
+	}
+
+	// ③ 模块不得溢出
+	own := map[string]bool{}
+	for _, m := range granter.Modules {
+		own[m] = true
+	}
+	for _, m := range s.Modules {
+		if !own[m] {
+			v = append(v, "模块溢出：授出 "+m+"（授出者自身未持有）")
+		}
+	}
+
+	// ④ 维度不得溢出
+	for _, d := range s.Dimensions {
+		gVals, ok := granter.Dimensions[d.Dim]
+		if !ok {
+			v = append(v, "维度溢出：授出者在该维度无任何取值（"+d.Dim+"）")
+			continue
+		}
+		v = append(v, dimensionOverflow(d.Dim, gVals, d.Values)...)
+	}
+
+	// ⑤ 勾选组：组必须在授出者已生效组内；组级密级/模块/字段同样不得更宽。
+	ownGroups := map[DataUseGroup]*GroupScopeGrant{}
+	for i := range granter.GroupScopes {
+		ownGroups[DataUseGroup(granter.GroupScopes[i].Group)] = &granter.GroupScopes[i]
+	}
+	ownGroupSet := map[DataUseGroup]bool{}
+	for _, g := range granter.DataUseGroups {
+		ownGroupSet[g] = true
+	}
+	for _, g := range s.DataUseGroups {
+		key := DataUseGroup(g.Group)
+		if !ownGroupSet[key] {
+			v = append(v, "勾选组溢出：授出 "+g.Group+"（授出者自身未持有该组）")
+			continue
+		}
+		ownG := ownGroups[key]
+		if ownG == nil {
+			continue // 授出者未声明组级限定 ⇒ 无上界可溢出
+		}
+		// 组内密级：授出者对该组声明了更严的 ScopedLevel 时不得超过它
+		if ownG.ScopedLevel != "" && levelRank[g.MaxLevel] > levelRank[ownG.ScopedLevel] {
+			v = append(v, fmt.Sprintf(
+				"组内密级溢出：%s 授出 %s > 自身 %s", g.Group, g.MaxLevel, ownG.ScopedLevel))
+		}
+		// 字段 / 模块：空 = 组内全部；只允许收窄
+		v = append(v, groupSubsetOverflow(g.Group, "字段", ownG.Fields, g.Fields)...)
+		v = append(v, groupSubsetOverflow(g.Group, "模块", ownG.ScopedModules, g.ScopedModules)...)
+		// 组内 DENY 只增不减：授出者被 DENY 的字段不得借代授洗白
+		denied := map[string]bool{}
+		for _, f := range ownG.Denied {
+			denied[f] = true
+		}
+		granted := map[string]bool{}
+		for _, f := range g.Fields {
+			granted[f] = true
+		}
+		var washed []string
+		for f := range denied {
+			if granted[f] {
+				washed = append(washed, f)
+			}
+		}
+		sort.Strings(washed)
+		for _, f := range washed {
+			v = append(v, "组内 DENY 被翻案："+g.Group+"/"+f)
+		}
+	}
+	return v
+}
+
+// dimensionOverflow 判定「请求的维度取值是否超出授出者持有」。
+func dimensionOverflow(dim string, own, want []string) []string {
+	allowed := map[string]bool{}
+	for _, v := range own {
+		allowed[v] = true
+	}
+	if allowed["*"] {
+		return nil // 授出者持全部
+	}
+	var extra []string
+	for _, w := range want {
+		if !allowed[w] {
+			extra = append(extra, w)
+		}
+	}
+	sort.Strings(extra)
+	var v []string
+	for _, e := range extra {
+		v = append(v, "维度溢出："+dim+"="+e+"（授出者未持有）")
+	}
+	return v
+}
+
+// groupSubsetOverflow 判定组内子集（字段 / 模块）是否超出；空 = 组内全部。
+func groupSubsetOverflow(group, kind string, own, want []string) []string {
+	if len(own) == 0 || len(want) == 0 {
+		return nil // 任一方为空 ⇒ 「全部」，不存在收窄溢出
+	}
+	allowed := map[string]bool{}
+	for _, x := range own {
+		allowed[x] = true
+	}
+	var extra []string
+	for _, x := range want {
+		if !allowed[x] {
+			extra = append(extra, x)
+		}
+	}
+	sort.Strings(extra)
+	var v []string
+	for _, e := range extra {
+		v = append(v, "组内"+kind+"溢出："+group+"/"+e)
+	}
+	return v
+}
+
+// Delegate 执行一次「上级代授」（D13）。
+//
+// 纪律（三条，缺一不可）：
+//  1. **先证明不溢出，再落库**：溢出即拒，且**不返回任何结果**（调用方无从落库）。
+//  2. **按求值结果代授，不按原始声明代授**：授出者自身被 DENY / 组依赖未满足的
+//     内容，不会因为「模板里写了」就被授出去 —— 一律先 Resolve 取上界。
+//  3. **留痕可溯源**：返回 GrantRecord（Origin=SUPERVISOR_DELEGATE、
+//     UpperBoundRef=授出者账号），经 e.Grants 进入 source.fromDelegations。
+//
+// 自己授自己：直接拒（docs/01 §13.3「同级账号互不可见」）。
+func (r *Resolver) Delegate(req DelegationRequest, granter *Entitlement, groupGrants []*Entitlement) (*Delegation, error) {
+	if req.Granter == "" || req.Grantee == "" {
+		return nil, &DelegationError{ErrCodeSameAccount, "授出者/被授人账号不得为空"}
+	}
+	if strings.EqualFold(req.Granter, req.Grantee) {
+		return nil, &DelegationError{ErrCodeSameAccount, "不得给自己代授"}
+	}
+	if granter == nil {
+		return nil, &DelegationError{ErrCodeDelegationOverflow, "授出者不存在"}
+	}
+
+	// ★ 一律按**求值结果**作为上界：原始声明里的 DENY / 未满足依赖都不算数。
+	view := r.Resolve(granter, groupGrants)
+
+	scope := req.Scope
+	if req.DelegateAll {
+		// 留痕必须记「实际生效的集合」，而非原始声明：
+		// 否则审计看到的是「打算授出的」而不是「真的授出的」。
+		scope = scopeFromView(view)
+	}
+	if overflow := ScopeOverflow(view, scope); len(overflow) > 0 {
+		return nil, &DelegationError{
+			ErrCodeDelegationOverflow,
+			fmt.Sprintf("代授范围超出 %s 自身权限：%s", req.Granter, strings.Join(overflow, "; ")),
+		}
+	}
+
+	rec := GrantRecord{
+		Origin:        OriginSupervisor,
+		GrantedBy:     req.Granter,
+		UpperBoundRef: req.Granter,
+		At:            req.At,
+		ModuleIDs:     append([]string(nil), scope.Modules...),
+	}
+	for _, g := range scope.DataUseGroups {
+		rec.GroupIDs = append(rec.GroupIDs, g.Group)
+	}
+	sort.Strings(rec.GroupIDs)
+
+	return &Delegation{Granter: req.Granter, Grantee: req.Grantee, Record: rec, Scope: scope}, nil
+}
+
+// scopeFromView 把授出者的求值结果展开成可留痕的具体范围。
+func scopeFromView(v *EntitlementView) DelegationScope {
+	s := DelegationScope{
+		Modules:               append([]string(nil), v.Modules...),
+		MaxLevel:              v.MaxLevel,
+		CanViewBusinessValues: v.CanViewBusinessValues,
+	}
+	for dim, vals := range v.Dimensions {
+		s.Dimensions = append(s.Dimensions, DimensionGrant{
+			Dim:                dim,
+			Values:             append([]string(nil), vals...),
+			IncludeDescendants: true,
+		})
+	}
+	sort.Slice(s.Dimensions, func(i, j int) bool { return s.Dimensions[i].Dim < s.Dimensions[j].Dim })
+	s.DataUseGroups = append(s.DataUseGroups, v.GroupScopes...)
+	sort.Slice(s.DataUseGroups, func(i, j int) bool { return s.DataUseGroups[i].Group < s.DataUseGroups[j].Group })
+	return s
 }

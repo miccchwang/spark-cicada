@@ -207,8 +207,68 @@ export type ResolveEntitlement = (
 /**
  * 授权上界校验（D13 核心不变量）。
  * 返回 true 表示 grantee 的权限集合 ⊆ granter 的权限集合，允许授予。
+ *
+ * ⚠️ 注意：这只是**判定**函数，本身不构成一条代授路径。
+ *   若生产侧从不构造 `DelegationRequest`，则「代授不溢出」恒真 ——
+ *   历史缺陷：`DelegationAllowed` 的唯一非测试调用点就是那条闸门断言本身。
+ *   真正的代授路径见 `DelegationRequest` / `DelegationScope`。
  */
 export type CheckDelegationBound = (
   granter: EntitlementView,
   grantee: EntitlementView
 ) => boolean;
+
+/** 代授内容（只能收窄，不得超出授出者自身权限） */
+export interface DelegationScope {
+  modules?: string[];
+  /** 密级上界 */
+  maxLevel?: Level;
+  dimensions?: DimensionGrant[];
+  dataUseGroups?: GroupScopeGrant[];
+  canViewBusinessValues?: boolean;
+}
+
+/**
+ * 一次「上级代授」（D13）。
+ *
+ * 纪律：
+ *  1. **先证明不溢出，再落库**：溢出即拒，且不产出可落库结果。
+ *  2. **按求值结果代授，不按原始声明代授**：授出者自身被 DENY /
+ *     组依赖未满足 / 时间盒已过期的内容，不得借代授洗白。
+ *  3. **留痕可溯源**：产出的 `GrantRecord`（origin=`SUPERVISOR_DELEGATE`、
+ *     upperBoundRef=授出者账号）应挂到被授人 `Entitlement.grants`，
+ *     求值后出现在 `source.fromDelegations`（**不得**混入 fromApprovedRequests）。
+ */
+export interface DelegationRequest {
+  granter: string;
+  grantee: string;
+  /** 被授出的内容；`delegateAll` 为 true 时忽略（取授出者求值结果） */
+  scope?: DelegationScope;
+  /**
+   * true = 按授出者当前**求值结果**整体代授。
+   * 留痕记录的实际范围取求值后的集合（同族祖先全展开），
+   * 而非原始声明 —— 否则审计看到的是「打算授出的」而不是「真的授出的」。
+   */
+  delegateAll?: boolean;
+  /** 代授发生时间（RFC3339；留痕用） */
+  at?: string;
+}
+
+/** 代授落库结果 */
+export interface Delegation {
+  granter: string;
+  grantee: string;
+  /** 授权来源记录，供调用方落 `Entitlement.grants` 与审计 */
+  record: GrantRecord;
+  /** 实际授出的范围（`delegateAll` 时已展开为具体集合） */
+  scope: DelegationScope;
+}
+
+/** 代授拒绝码 */
+export type DelegationErrorCode = "DELEGATION_OVERFLOW" | "SAME_ACCOUNT";
+
+/** 代授被拒原因 */
+export interface DelegationError {
+  code: DelegationErrorCode;
+  message: string;
+}
