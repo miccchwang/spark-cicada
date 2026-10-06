@@ -295,3 +295,304 @@ func TestConfig_LaunchCheckGuardsWindowsToolchain(t *testing.T) {
 			"本机托管工具链会因找不到标准库而失败。", managed, goexeDefault)
 	}
 }
+
+// TestConfig_GearTableMatchesCollectCode 断言**两处**降速档位定义不漂移。
+//
+// 档位表在仓库里存在两次：
+//   1. `sql/migrations/0005_collect_staging.sql` 的 collect_rate_gear 种子（DB 真值）
+//   2. `backend/internal/collect/collect.go` 的 GearTable（代码默认值）
+//
+// 为什么必须钉在一起：采集循环读代码里的档位算间隔，而 DB 里的档位
+// 是给 IT 调优与审计看的。两处一旦漂移，会出现
+// 「日志说退到 4 秒，实际 sleep 8 秒」这类**只有对数才能发现**的偏差，
+// 且会让人对限流分析得出错误结论。
+//
+// 真库集成测试也有一条等价断言（TestIntegration_GearTableMatchesHardcoded），
+// 但那条需要 DSN。本闸门是它的**无库版本**，保证在没有 Postgres 的机器上
+// （包括大部分本地开发）也能拦住漂移。
+func TestConfig_GearTableMatchesCollectCode(t *testing.T) {
+	sh := repoFile(t, "sql/migrations/0005_collect_staging.sql")
+	goSrc := repoFile(t, "backend/internal/collect/collect.go")
+
+	// 1) 从迁移里抓 collect_rate_gear 的 VALUES 元组： (idx, delay_ms, label, recover)
+	block := gearValuesBlock(t, sh)
+	migGears := parseGearTuples(t, block)
+	if len(migGears) == 0 {
+		t.Fatal("迁移 0005 未解析出任何档位元组 —— 解析失败会让本闸门恒真")
+	}
+
+	// 2) 从 Go 源码抓 GearTable 字面量： {0, 500 * time.Millisecond, "...", 5}
+	codeGears := parseGoGearTable(t, goSrc)
+	if len(codeGears) == 0 {
+		t.Fatal("未从 collect.go 解析出 GearTable —— 解析失败会让本闸门恒真")
+	}
+
+	// 3) 逐档比对
+	if len(migGears) != len(codeGears) {
+		t.Fatalf("档位数量不一致：迁移 %d 档 vs 代码 %d 档\n迁移：%v\n代码：%v",
+			len(migGears), len(codeGears), migGears, codeGears)
+	}
+	for i := range migGears {
+		if migGears[i] != codeGears[i] {
+			t.Errorf("档位 %d 漂移：\n  迁移(DB) = %+v\n  代码      = %+v\n"+
+				"两处必须逐字段一致，否则「日志说的档位」与「实际 sleep 的间隔」会对不上。",
+				i, migGears[i], codeGears[i])
+		}
+	}
+
+	// 4) 端点必须覆盖用户要求的 0.5s → 120s
+	first, last := migGears[0], migGears[len(migGears)-1]
+	if first.delayMs != 500 {
+		t.Errorf("首档应为 500ms（0.5 秒），实际 %d ms", first.delayMs)
+	}
+	if last.delayMs != 120000 {
+		t.Errorf("末档应为 120000ms（120 秒封顶），实际 %d ms", last.delayMs)
+	}
+}
+
+// gearEntry 一个档位的可比较形态。
+type gearEntry struct {
+	index        int
+	delayMs      int
+	label        string
+	recoverAfter int
+}
+
+// gearValuesBlock 取出 `INSERT INTO collect_rate_gear ... VALUES` 的元组区。
+func gearValuesBlock(t *testing.T, sql string) string {
+	t.Helper()
+	i := strings.Index(sql, "INSERT INTO collect_rate_gear")
+	if i < 0 {
+		t.Fatal("迁移 0005 未找到 INSERT INTO collect_rate_gear")
+	}
+	rest := sql[i:]
+	j := strings.Index(rest, "VALUES")
+	if j < 0 {
+		t.Fatal("collect_rate_gear 的 INSERT 未找到 VALUES")
+	}
+	rest = rest[j+len("VALUES"):]
+	if k := strings.Index(rest, "ON CONFLICT"); k >= 0 {
+		rest = rest[:k]
+	}
+	return rest
+}
+
+// parseGearTuples 解析形如 `(0, 500, '0.5 秒 · 正常', 5),` 的元组。
+func parseGearTuples(t *testing.T, block string) []gearEntry {
+	t.Helper()
+	var out []gearEntry
+	for _, raw := range strings.Split(block, "),") {
+		s := strings.TrimSpace(raw)
+		s = strings.TrimPrefix(s, "(")
+		s = strings.TrimSuffix(s, ")")
+		if !strings.Contains(s, ",") {
+			continue
+		}
+		parts := splitSimpleCommas(s)
+		if len(parts) < 4 {
+			continue
+		}
+		idx := atoiSafe(parts[0])
+		delay := atoiSafe(parts[1])
+		if idx < 0 || delay <= 0 {
+			continue // 非档位行
+		}
+		label := strings.Trim(strings.TrimSpace(parts[2]), "'")
+		rec := atoiSafe(parts[3])
+		out = append(out, gearEntry{idx, delay, label, rec})
+	}
+	return out
+}
+
+// splitSimpleCommas 按逗号切分，但跳过单引号字面量内部的逗号。
+//
+// 为什么需要：档位 label 是中文文本，内容可能含逗号；
+// 直接 strings.Split 会把一个元组切碎，解析出错误字段。
+func splitSimpleCommas(s string) []string {
+	var out []string
+	var cur strings.Builder
+	inQuote := false
+	for _, r := range s {
+		switch {
+		case r == '\'':
+			inQuote = !inQuote
+			cur.WriteRune(r)
+		case r == ',' && !inQuote:
+			out = append(out, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	if cur.Len() > 0 {
+		out = append(out, cur.String())
+	}
+	return out
+}
+
+// parseGoGearTable 解析 collect.go 里的 GearTable 字面量。
+//
+// 形如： {0, 500 * time.Millisecond, "0.5 秒 · 正常", 5},
+func parseGoGearTable(t *testing.T, src string) []gearEntry {
+	t.Helper()
+	i := strings.Index(src, "var GearTable = []Gear{")
+	if i < 0 {
+		t.Fatal("collect.go 未找到 GearTable 定义")
+	}
+	rest := src[i:]
+	if k := strings.Index(rest, "}\n"); k >= 0 {
+		rest = rest[:k]
+	}
+	var out []gearEntry
+	for _, line := range strings.Split(rest, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "{")
+		line = strings.TrimSuffix(line, "},")
+		line = strings.TrimSuffix(line, "}")
+		parts := splitSimpleCommas(line)
+		if len(parts) < 4 {
+			continue
+		}
+		idx := atoiSafe(parts[0])
+		// 第二字段形如 `500 * time.Millisecond` 或 `1 * time.Second`
+		delay := parseGoDurationMs(parts[1])
+		if idx < 0 || delay <= 0 {
+			continue
+		}
+		label := strings.Trim(strings.TrimSpace(parts[2]), `"`)
+		rec := atoiSafe(parts[3])
+		out = append(out, gearEntry{idx, delay, label, rec})
+	}
+	return out
+}
+
+// parseGoDurationMs 把 `500 * time.Millisecond` / `2 * time.Second` 转成毫秒。
+func parseGoDurationMs(expr string) int {
+	expr = strings.TrimSpace(expr)
+	n := atoiSafe(strings.SplitN(expr, "*", 2)[0])
+	if n <= 0 {
+		return -1
+	}
+	switch {
+	case strings.Contains(expr, "Millisecond"):
+		return n
+	case strings.Contains(expr, "Second"):
+		return n * 1000
+	}
+	return -1
+}
+
+// atoiSafe 宽松取整数前缀；失败返回 -1。
+func atoiSafe(s string) int {
+	s = strings.TrimSpace(s)
+	neg := false
+	if strings.HasPrefix(s, "-") {
+		neg, s = true, s[1:]
+	}
+	n := 0
+	got := false
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			break
+		}
+		n = n*10 + int(r-'0')
+		got = true
+	}
+	if !got {
+		return -1
+	}
+	if neg {
+		return -n
+	}
+	return n
+}
+
+// TestConfig_CIAndLaunchCheckRunCollectStoreSuite 断言 M-COLLECT 的真库集成套件
+// **真的会被 CI 和 launch-check 执行**。
+//
+// 为什么单列一条闸门：
+//   写好了测试却没人跑，与「没写测试」在保护力上是**等价的** ——
+//   甚至更糟：它让人误以为已被覆盖。
+//   本仓库已有一次同型事故：真库套件因环境变量名分叉而被连环 skip，
+//   写好的断言从未真正执行，CI 却全绿（见本文件顶部事故记录）。
+//
+//   因此凡是新增「真库套件」的地方，都要同时在两处注册：
+//     1. `.github/workflows/ci.yml` 的 go 作业（跑 go test 时要带上它）
+//     2. `tools/verify/launch-check.sh` 的真库段（本地/部署机可复现）
+//   只注册一处，就会出现「CI 绿但本地红」或反之。
+func TestConfig_CIAndLaunchCheckRunCollectStoreSuite(t *testing.T) {
+	const suite = "./internal/collectstore/"
+
+	yml := repoFile(t, ".github/workflows/ci.yml")
+	if !strings.Contains(yml, suite) {
+		t.Errorf("CI workflow 未运行 %s 的真库集成套件 —— "+
+			"采集临时仓库（页级原子提交 / 断点续传 / 幂等 / 守卫过闸）将在 CI 上**从未被验证**。\n"+
+			"这一层专门覆盖「只有真库才暴露」的约束（UTF8 编码 / NULL DEFAULT / 类型严格性）。", suite)
+	}
+	if !strings.Contains(yml, "-run Integration") {
+		t.Error("CI 未以 `-run Integration` 过滤真库套件 —— 会把无库的纯逻辑用例一并跑，掩盖真实覆盖")
+	}
+
+	sh := repoFile(t, "tools/verify/launch-check.sh")
+	if !strings.Contains(sh, suite) {
+		t.Errorf("launch-check 的真库段未运行 %s —— "+
+			"部署机上就复现不出 CI 的结论，「退出码可信」这条前提被破坏。", suite)
+	}
+}
+
+// TestParseGearHelpers 自测上面的解析器。
+//
+// 「解析器写错时会给出错误答案而不报错」—— 这比崩溃危险得多：
+// 一个恒返回空的解析器会让闸门**永远通过**。故必须单独自测。
+func TestParseGearHelpers(t *testing.T) {
+	t.Run("parseGoDurationMs", func(t *testing.T) {
+		cases := map[string]int{
+			"500 * time.Millisecond": 500,
+			"120 * time.Second":      120000,
+			"1 * time.Second":        1000,
+			"garbage":                -1,
+			"0 * time.Second":        -1,
+		}
+		for in, want := range cases {
+			if got := parseGoDurationMs(in); got != want {
+				t.Errorf("parseGoDurationMs(%q) = %d，期望 %d", in, got, want)
+			}
+		}
+	})
+
+	t.Run("splitSimpleCommas 不切引号内逗号", func(t *testing.T) {
+		got := splitSimpleCommas("0, 500, 'a, b', 5")
+		if len(got) != 4 {
+			t.Fatalf("应切成 4 段（引号内的逗号不算），实际 %d 段：%v", len(got), got)
+		}
+		if strings.TrimSpace(got[2]) != "'a, b'" {
+			t.Errorf("第 3 段应为 'a, b'，实际 %q", got[2])
+		}
+	})
+
+	t.Run("atoiSafe", func(t *testing.T) {
+		for in, want := range map[string]int{"12": 12, " 7": 7, "-3": -3, "x": -1, "": -1} {
+			if got := atoiSafe(in); got != want {
+				t.Errorf("atoiSafe(%q) = %d，期望 %d", in, got, want)
+			}
+		}
+	})
+
+	t.Run("parseGoGearTable 能真的解析出档位", func(t *testing.T) {
+		src := `var GearTable = []Gear{
+	{0, 500 * time.Millisecond, "正常", 5},
+	{1, 1 * time.Second, "慢", 5},
+}
+`
+		got := parseGoGearTable(t, src)
+		if len(got) != 2 {
+			t.Fatalf("应解析出 2 档，实际 %d：%v", len(got), got)
+		}
+		if got[1].delayMs != 1000 {
+			t.Errorf("第 2 档应为 1000ms，实际 %d", got[1].delayMs)
+		}
+	})
+}

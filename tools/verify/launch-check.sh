@@ -11,7 +11,7 @@
 #   1. Go 构建 + vet
 #   2. 迁移集可加载且校验通过（dry-run）
 #   3. 全部 Go 测试（含 G1–G12 闸门）
-#   4. 真库集成测试（迁移幂等 / NULL≠0 / 审计 append-only / D7）
+#   4. 真库集成测试（迁移幂等 / NULL≠0 / 审计 append-only / D7 / **采集临时仓库**）
 #   4b. ★ 真库数据面端到端：迁移 → sparkd 带 DSN → healthz db=true → /api/query 真读库
 #   5. Rust 内核测试 + selftest
 #   6. 前端分层闸门 + 测试 + 类型检查 + 构建
@@ -154,18 +154,28 @@ else
 fi
 
 # ───────────────────────── 4. 真库段 ─────────────────────────
-step "4. 真库集成（迁移幂等 / NULL 不补 0 / 审计 append-only / D7）"
+step "4. 真库集成（迁移幂等 / NULL 不补 0 / 审计 append-only / D7 / 采集临时仓库）"
 if [ -n "${SPARK_TEST_DB_DSN:-}" ]; then
   if ( cd backend && "$GOEXE" test ./internal/store/ -run Integration -count=1 -v >/tmp/spark-db-test.log 2>&1 ); then
-    ok "真库集成断言全绿"
+    ok "真库集成断言全绿（store）"
   else
-    bad "真库集成断言失败（见 /tmp/spark-db-test.log）"
+    bad "真库集成断言失败（store，见 /tmp/spark-db-test.log）"
     grep -E "^\s*--- (FAIL|PASS)" /tmp/spark-db-test.log | head -20
+  fi
+  # ★ M-COLLECT 临时仓库真库闸门。
+  #   独立成段（而非并进上面那条）：这段覆盖的是**存储引擎语义**类约束
+  #   （UTF8 编码、NULL DEFAULT、类型严格性）—— 已实测抓到两个纯单测测不出的
+  #   生产级缺陷（NUL 字节 / nil 切片）。失败原因必须能一眼定位到这一层。
+  if ( cd backend && "$GOEXE" test ./internal/collectstore/ -run Integration -count=1 -v >/tmp/spark-collect-test.log 2>&1 ); then
+    ok "真库集成断言全绿（采集临时仓库：页级原子提交 / 续传 / 幂等 / 守卫过闸）"
+  else
+    bad "真库集成断言失败（collectstore，见 /tmp/spark-collect-test.log）"
+    grep -E "^\s*--- (FAIL|PASS)" /tmp/spark-collect-test.log | head -20
   fi
 elif [ "${SPARK_REQUIRE_DB:-0}" = "1" ]; then
   bad "SPARK_REQUIRE_DB=1 但未设置 SPARK_TEST_DB_DSN —— 拒绝以「跳过」冒充通过"
 else
-  skip "未设 SPARK_TEST_DB_DSN：真库断言**本轮未执行**（数据面真库行为尚未验证）"
+  skip "未设 SPARK_TEST_DB_DSN：真库断言**本轮未执行**（数据面 + 采集临时仓库行为尚未验证）"
 fi
 
 # ── compute 内核定位（§4b 与 §8 都要用；缺失时先构建）──

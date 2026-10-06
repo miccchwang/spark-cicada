@@ -730,3 +730,269 @@ func TestHasColumn(t *testing.T) {
 		}
 	}
 }
+
+// ───────────────────── M-COLLECT 采集层闸门（0005）─────────────────────
+//
+// 动机：用户明确要求「抓第三方数据/MCP/API 时必须有临时仓库，
+// 不能写死『调用不完全成功就不落库』，要断点续传与自动降速」。
+// 这些要求一旦在重构中被削弱（例如有人把「每页 COMMIT」改成整批提交、
+// 或把幂等 UNIQUE 索引删掉），会造成**配额被烧光却永远采不完**，
+// 甚至在真库时代价极高。因此在迁移文件层面钉死关键结构。
+
+// TestSQL_StagingHasIdempotencyUniqueIndex 断言临时仓库的幂等去重
+// **由数据库强制**（UNIQUE 索引），而非应用层「先查后插」。
+//
+// 为什么必须是索引：应用层先 SELECT 再 INSERT 在并发/重试下有竞态窗口，
+// 会让重复行静默累积 —— 「落表失败重试不产生新上游调用」的要求就落空了。
+func TestSQL_StagingHasIdempotencyUniqueIndex(t *testing.T) {
+	sql := stripSQLComments(readMigration(t, "0005_collect_staging.sql"))
+
+	// 必须是 UNIQUE 索引，且覆盖 (job_id, idem_key)
+	if !strings.Contains(sql, "CREATE UNIQUE INDEX") {
+		t.Fatal("0005 缺少 UNIQUE 索引 —— 幂等去重会退化成应用层约定，" +
+			"并发/重试下产生重复行")
+	}
+	// 定位幂等索引定义，断言其列组合
+	i := strings.Index(sql, "uq_staging_record_idem")
+	if i < 0 {
+		t.Fatal("0005 缺少 uq_staging_record_idem 索引（幂等去重的唯一保障）")
+	}
+	stmt := sql[i:]
+	if k := strings.Index(stmt, ";"); k >= 0 {
+		stmt = stmt[:k]
+	}
+	for _, col := range []string{"job_id", "idem_key"} {
+		if !strings.Contains(stmt, col) {
+			t.Errorf("幂等索引未覆盖 %s —— 去重范围不完整\n%s", col, stmt)
+		}
+	}
+}
+
+// TestSQL_StagingHasResumeState 断言断点续传所需的状态列都在。
+//
+// 断点续传 = 「游标 + 已取页数 + 已落行数 + 档位」四件事同时持久化。
+// 少任何一项，重启后都无法准确续跑（要么重复调用，要么丢页）。
+func TestSQL_StagingHasResumeState(t *testing.T) {
+	sql := readMigration(t, "0005_collect_staging.sql")
+	body := tableBodyFor(t, sql, "collect_job")
+
+	for _, col := range []string{"cursor", "pages_done", "rows_staged", "gear_index", "ok_streak"} {
+		if !hasColumn(body, col) {
+			t.Errorf("collect_job 缺少断点续传状态列 %s —— "+
+				"重启后无法从断点续跑（会重复调用上游或丢页）", col)
+		}
+	}
+
+	// THROTTLED 必须存在且是可续状态：把限流当失败是 KODP 最贵的错误
+	// （一次 429 → 整月重放 → 再次 429 → 永远跑不完）。
+	if !strings.Contains(sql, "'THROTTLED'") {
+		t.Error("collect_job 状态机缺少 THROTTLED —— 限流会被当成失败，" +
+			"导致整批重放并反复撞限流")
+	}
+}
+
+// TestSQL_StagingHasRateGearTable 断言降速档位表存在且覆盖 0.5s→120s 端点。
+//
+// 用户明确要求「从 0.5s 到 120 秒需要有档位自动调整」。
+// 端点缺失（如末档只到 60s）意味着重限流时退避不足，是需求级缺陷。
+func TestSQL_StagingHasRateGearTable(t *testing.T) {
+	sql := readMigration(t, "0005_collect_staging.sql")
+	if !strings.Contains(sql, "CREATE TABLE IF NOT EXISTS collect_rate_gear") {
+		t.Fatal("0005 缺少 collect_rate_gear 档位表 —— 无法实现自动降速")
+	}
+	block := valuesBlockFor(t, sql, "INSERT INTO collect_rate_gear")
+
+	// 首档 500ms、末档 120000ms 必须都在种子里
+	if !strings.Contains(block, "500") {
+		t.Error("档位种子缺少 500ms（0.5 秒起点）")
+	}
+	if !strings.Contains(block, "120000") {
+		t.Error("档位种子缺少 120000ms（120 秒封顶）—— " +
+			"用户明确要求最高档 120 秒，退避不足会持续撞限流")
+	}
+}
+
+// TestSQL_StagingGuardBlocksByDefault 断言守卫表结构能表达「未过闸」。
+//
+// 用户要求「守卫验收数据完整性后过闸」。要能「不过闸」，就必须
+// 有默认未通过的状态 + 未通过原因 + 判定依据快照。
+func TestSQL_StagingGuardBlocksByDefault(t *testing.T) {
+	sql := readMigration(t, "0005_collect_staging.sql")
+
+	if !strings.Contains(sql, "CREATE TABLE IF NOT EXISTS staging_ingest_guard") {
+		t.Fatal("0005 缺少 staging_ingest_guard —— 无法记录过闸判定（准入决策不可审计）")
+	}
+
+	// ★ staging_record 的默认守卫状态必须是 PENDING（未过闸）。
+	//
+	//   这里**不能**用 strings.Contains(body, "'PENDING'") 来断言 ——
+	//   实测发现那是个假断言：body 里的 CHECK 约束
+	//     `CHECK (guard_state IN ('PENDING','PASSED','REJECTED'))`
+	//   本身就一直含有 'PENDING' 字面量，于是**无论 DEFAULT 被改成什么，
+	//   断言都为真**。负向测试（把 DEFAULT 改成 'PASSED'）当场抓住了这个漏洞。
+	//
+	//   这正是「文本闸门必须贴着真正产生效果的语法形态写」的又一条实例：
+	//   要断言的是 **guard_state 列上的 DEFAULT 子句**，而不是这个字面量
+	//   在表体里出现过。
+	body := tableBodyFor(t, sql, "staging_record")
+	def := defaultClauseFor(t, body, "guard_state")
+	if def != "'PENDING'" {
+		t.Errorf("staging_record.guard_state 的默认值必须是 'PENDING'（未过闸），实际 %s\n"+
+			"默认放行等于未过闸数据也能进投影层 —— 守卫形同不存在。", def)
+	}
+
+	// 守卫必须有「通过与否」与「原因」两个字段
+	gbody := tableBodyFor(t, sql, "staging_ingest_guard")
+	for _, col := range []string{"passed", "reasons"} {
+		if !hasColumn(gbody, col) {
+			t.Errorf("staging_ingest_guard 缺少 %s 列 —— 判定无法表达/无法追溯", col)
+		}
+	}
+	// 放行台账必须存在（过闸是可审计事件）
+	if !strings.Contains(sql, "CREATE TABLE IF NOT EXISTS staging_project_release") {
+		t.Error("0005 缺少 staging_project_release —— 放行事件不可审计，" +
+			"事后无法回答「这批数据凭什么被放行」")
+	}
+}
+
+// defaultClauseFor 提取表体中指定列的 DEFAULT 子句字面量。
+//
+// 例：`guard_state text NOT NULL DEFAULT 'PENDING',` → `'PENDING'`
+// 找不到该列的 DEFAULT 时返回 ""（调用方据此判失败 —— 没有 DEFAULT
+// 本身就是问题：插入时不提供该列会直接撞 NOT NULL）。
+//
+// 为什么需要它：断言「某列默认值是 X」必须看**该列自己的 DEFAULT**，
+// 而不是整个表体里是否出现过 X。后者会被 CHECK 约束里的枚举值污染，
+// 成为一个永远为真的假断言（详见 TestSQL_StagingGuardBlocksByDefault 注释）。
+func defaultClauseFor(t *testing.T, body, col string) string {
+	t.Helper()
+	// ★ body 由 splitCreateTables 产出，形如 "( 列定义, 列定义, ... )" ——
+	//   **带有最外层左括号**。若不剥掉，第一个子句会变成 "(guard_state ..."，
+	//   首词成了 "(guard_state"，与列名永不相等 ⇒ 恰好「该表的第一列」
+	//   永远查不到默认值。自测 TestDefaultClauseFor 当场抓住了这一点。
+	body = strings.TrimSpace(body)
+	body = strings.TrimPrefix(body, "(")
+
+	for _, line := range splitTopLevel(body, ',') {
+		// 只认列定义行：首词是列名（去引号），且含 DEFAULT
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		if !strings.Contains(lower, "default") {
+			continue
+		}
+		// 该行的首词必须是目标列名
+		firstWord := lower
+		if k := strings.IndexAny(firstWord, " \t\n"); k >= 0 {
+			firstWord = firstWord[:k]
+		}
+		firstWord = strings.Trim(firstWord, `"`)
+		if firstWord != col {
+			continue
+		}
+		// 取 DEFAULT 之后到行尾（或下一个约束关键字）的字面量
+		i := strings.Index(lower, "default")
+		rest := strings.TrimSpace(trimmed[i+len("default"):])
+		// 到第一个空白/逗号/收尾括号为止即为默认值字面量。
+		// 收尾括号也要算终止符：表体最后一列没有尾随逗号，会是 "…'PENDING')"。
+		if k := strings.IndexAny(rest, " \t\n,)"); k >= 0 {
+			rest = rest[:k]
+		}
+		return rest
+	}
+	return ""
+}
+
+// TestDefaultClauseFor 自测 defaultClauseFor：它决定了「默认值」这类断言的
+// 判据范围，写错会让闸门变成恒真（从而静默失效）。
+//
+// ★ 用例的 body 一律**带最外层左括号**（与 splitCreateTables 的真实产出一致）——
+//   第一版用例没带，于是测试全绿而闸门在真实数据上恒返回空。
+//   「用与生产同形的输入做自测」本身就是一条纪律。
+func TestDefaultClauseFor(t *testing.T) {
+	cases := []struct {
+		name, body, col, want string
+	}{
+		{
+			name: "正常提取（带外层括号，同真实形态）",
+			body: "(guard_state text NOT NULL DEFAULT 'PENDING')",
+			col:  "guard_state", want: "'PENDING'",
+		},
+		{
+			name: "带尾随逗号",
+			body: "(guard_state text NOT NULL DEFAULT 'PENDING',\n id bigserial)",
+			col:  "guard_state", want: "'PENDING'",
+		},
+		{
+			name: "CHECK 里的枚举值不应被误取为默认值",
+			body: "(guard_state text NOT NULL DEFAULT 'PASSED'\n     CHECK (guard_state IN ('PENDING','PASSED')))",
+			col:  "guard_state", want: "'PASSED'",
+		},
+		{
+			name: "该列没有 DEFAULT 时返回空",
+			body: "(guard_state text NOT NULL)",
+			col:  "guard_state", want: "",
+		},
+		{
+			name: "别列的 DEFAULT 不应被认领",
+			body: "(status text DEFAULT 'RUNNING',\n guard_state text NOT NULL DEFAULT 'PENDING')",
+			col:  "guard_state", want: "'PENDING'",
+		},
+		{
+			name: "列不存在时返回空",
+			body: "(id text DEFAULT 'x')",
+			col:  "guard_state", want: "",
+		},
+		{
+			name: "第一列且无逗号（外层括号必须被剥掉）",
+			body: "(a text DEFAULT 'x')",
+			col:  "a", want: "'x'",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := defaultClauseFor(t, c.body, c.col); got != c.want {
+				t.Errorf("defaultClauseFor(%q) = %q，期望 %q", c.col, got, c.want)
+			}
+		})
+	}
+}
+
+// TestSQL_StagingHasRegionColumn 断言采集层分地域（G12）。
+//
+// collect_job / staging_record 都要落 region：临时仓库的数据也要能
+// 按地域隔离与审计（新加坡/美国双地域拓扑）。
+func TestSQL_StagingHasRegionColumn(t *testing.T) {
+	sql := readMigration(t, "0005_collect_staging.sql")
+	for _, tbl := range []string{"collect_job", "staging_record"} {
+		body := tableBodyFor(t, sql, tbl)
+		if !hasColumn(body, "region") {
+			t.Errorf("%s 缺少 region 列（G12 分地域存储/审计）", tbl)
+		}
+	}
+}
+
+// TestSQL_StagingNoHardcodedSecrets 断言采集层迁移无硬编码凭据（G11）。
+//
+// 采集层直接对接第三方 API/MCP，是最容易「顺手把 token 写进种子」的地方 ——
+// 密钥只允许存**引用**（source_ref），不落明文。
+func TestSQL_StagingNoHardcodedSecrets(t *testing.T) {
+	sql := strings.ToLower(readMigration(t, "0005_collect_staging.sql"))
+	for _, bad := range []string{"password =", "password=", "secret_key", "client_secret", "bearer "} {
+		if strings.Contains(sql, bad) {
+			t.Errorf("G11 采集层迁移含疑似硬编码凭据片段：%q（密钥只应存引用）", bad)
+		}
+	}
+}
+
+// tableBodyFor 取出某张 CREATE TABLE 的表体（不含表名与最外层括号）。
+// 与 splitCreateTables 同源，但按表名精确匹配，供本文件的采集层闸门复用。
+func tableBodyFor(t *testing.T, sql, table string) string {
+	t.Helper()
+	for _, tbl := range splitCreateTables(stripSQLComments(sql)) {
+		if tbl.name == table {
+			return tbl.body
+		}
+	}
+	t.Fatalf("未找到表 %s 的定义", table)
+	return ""
+}
