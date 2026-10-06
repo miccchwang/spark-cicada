@@ -161,6 +161,23 @@ func main() {
 			IsSupervisor: dp.isSupervisorFunc(),
 		}
 		tplH.Routes(mux)
+
+		// ── M-STRATEGY：策略实验室 ──
+		//
+		// ★ 放在 `if dp.dbReady` 里（与 M-PNL 相反）：策略变更会写规则集、
+		//   让预计算桶过期 —— 是有副作用的状态改动，不能「无库也照做」。
+		//   库未就绪 ⇒ 不注册路由（404），而不是挂一个假实现返回空列表。
+		//
+		// ★ ScopeGuard 用 isManagementFunc（D6：仅 T1–T2），**不用** isAdmin：
+		//   isAdmin 描述的是平台治理者（管账号/管槽），而策略决策是业务判断。
+		//   两者重合度低，合成一个会让「开管理台权限」意外授予改口径的能力。
+		stratH := &api.StrategyHandlers{
+			Svc:          dp.strategy,
+			Auditor:      dp.strategy,
+			ScopeGuard:   dp.isManagementFunc(),
+			SnapshotHash: dp.snapshotHashFunc(),
+		}
+		stratH.Routes(mux)
 	}
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {

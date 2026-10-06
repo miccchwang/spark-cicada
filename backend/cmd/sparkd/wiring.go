@@ -9,6 +9,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
@@ -42,6 +44,12 @@ type dataPlane struct {
 	// caliberAudit：M-PNL 口径切换的审计落库（append-only）。
 	// nil 表示库未就绪 —— 此时口径仍可切换，但接口会如实回报「未留痕」。
 	caliberAudit *store.CaliberAuditStore
+	// strategy：M-STRATEGY 策略实验室的持久化入口（选型卡 + 决策历史）。
+	//
+	// ★ 与 caliberAudit 不同，本项**不做降级**：策略变更会写规则集、
+	//   会让预计算桶过期，是有副作用的状态改动，不能「无库也照做」。
+	//   nil ⇒ M-STRATEGY 路由不注册（404），而不是挂一个假实现。
+	strategy *store.StrategyStore
 	// dbReady 表示真库已就绪（迁移已应用、注册表已加载）。
 	dbReady bool
 	// dbDegradeReason 在 dbReady=false 时说明**为什么**降级。
@@ -123,6 +131,8 @@ func buildDataPlane(ctx context.Context) *dataPlane {
 	p.templates = templatestore.New(pool)
 	// 口径切换审计复用同一连接池（audit_log 是 append-only，只 INSERT）
 	p.caliberAudit = store.NewCaliberAuditStore(pool)
+	// M-STRATEGY：选型卡读 registry_rule_set，历史读/写 audit_log（同一池）
+	p.strategy = store.NewStrategyStore(pool)
 	p.dbReady = true
 	return p
 }
@@ -353,4 +363,107 @@ func (p *dataPlane) isSupervisorFunc() func(string) bool {
 //   （见 internal/req/req.go 的 isIT 注释）。
 func isITBase(tpl string) bool {
 	return tpl == "tpl.it" || strings.HasPrefix(tpl, "tpl.it.")
+}
+
+// ───────────────────────────── 管理层判定（D6） ─────────────────────────────
+
+// isManagementFunc 返回「某账号是否属于管理层（T1–T2）」的判定函数。
+//
+// ★ 用途：M-STRATEGY 策略实验室的范围守卫（D6：仅管理层）。
+//
+//	策略实验室能改全公司的费率口径、触发全量重算 —— 它不是一个
+//	「用户偏好」，而是一次经营决策。因此范围必须收得很紧。
+//
+// ★ 为什么不用 isAdminFunc：
+//
+//	isAdmin 的判据是「IT 基座 或 启用 m.admin 模块」，那描述的是
+//	**平台治理者**（管账号、管槽）。而策略决策是**业务判断**，
+//	应当由承担经营结果的人做。两者重合度低：IT 能管平台但不应决策
+//	费率口径；业务负责人能决策但不能管账号。
+//	合成一个函数会让「给某人开管理台权限」意外地授予他改全公司口径的能力。
+//
+// ★ 判据（按优先级）：
+//  1. 组织链路里 tier ∈ {T1, T2}（数据面就绪时查 dim_org）。
+//  2. 显式启用 m.strategy 模块（为将来放权留的显式开关）。
+//
+// ★ 库未就绪时**保守返回 false**：见下。
+func (p *dataPlane) isManagementFunc() func(string) bool {
+	return func(account string) bool {
+		if account == "" {
+			return false
+		}
+		// ① 组织层级 T1/T2
+		if p.dbReady && p.pool != nil {
+			var tier *string
+			err := p.pool.QueryRow(context.Background(),
+				`SELECT tier FROM dim_org WHERE account = $1`, account).Scan(&tier)
+			if err == nil && tier != nil {
+				if *tier == "T1" || *tier == "T2" {
+					return true
+				}
+			}
+			// 查库失败或查不到：继续走 ② 的模块判定，不在此处放行
+		}
+		// ② 显式启用 m.strategy 模块
+		if p.resolver != nil && p.ents != nil {
+			if view := resolveFor(p.resolver, p.ents, account); view != nil {
+				for _, m := range view.Modules {
+					if m == "m.strategy" {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+}
+
+// ───────────────────────────── 决策依据快照 ─────────────────────────────
+
+// snapshotHashFunc 返回「当前数据快照哈希」的取值函数。
+//
+// ★ 用途：策略决策要落一条「决策依据」（docs/01 §7.5）。
+//
+//	日后有人问「为什么 3 月的净利率变了」，能顺着这个 hash 找到
+//	当时依据的那份数据 —— 而不是只能回答「有人改过参数」。
+//	KODP 的教训正是「口径变更不追溯，导致无法解释为什么变了」。
+//
+// ★ 哈希的构成：各预计算桶的「状态 + 算法版本 + 规则集版本」拼起来的
+//   确定性指纹。选这个组合而不是「数据的哈希」，是因为：
+//   ① 桶的版本直接决定「报表会显示什么」，这才是决策真正依据的东西；
+//   ② 全量数据的哈希每次采数都会变（哪怕业务没变），
+//      那样哈希就失去了「可比对」的作用。
+//
+// ★ 取不到时返回空串而不是报错：快照哈希是**辅助证据**，
+//   不应因为它拿不到就阻止一次决策（那会变成「因为观测不了所以不能决策」）。
+//   接口层会如实告知「未取到快照」，但不失败。
+func (p *dataPlane) snapshotHashFunc() func(context.Context) string {
+	return func(ctx context.Context) string {
+		if !p.dbReady || p.pool == nil {
+			return ""
+		}
+		// 按桶 id 排序取，保证同样的库状态永远得到同样的哈希
+		rows, err := p.pool.Query(ctx, `
+			SELECT id, state, algo_versions::text, rule_versions::text
+			  FROM registry_bucket
+			 ORDER BY id`)
+		if err != nil {
+			return ""
+		}
+		defer rows.Close()
+
+		h := sha256.New()
+		for rows.Next() {
+			var id, state, algo, rule string
+			if err := rows.Scan(&id, &state, &algo, &rule); err != nil {
+				return ""
+			}
+			// 分隔符用不可见字符，避免字段内容拼接产生歧义
+			fmt.Fprintf(h, "%s\x1f%s\x1f%s\x1f%s\x1e", id, state, algo, rule)
+		}
+		if err := rows.Err(); err != nil {
+			return ""
+		}
+		return "sha256:" + hex.EncodeToString(h.Sum(nil))
+	}
 }

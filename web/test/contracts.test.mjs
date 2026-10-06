@@ -36,6 +36,7 @@ const PAIRS = [
   { dir: "data-contract", ifaces: ["ColumnDef", "LevelSummary", "AlgoTrace", "DataGap", "DataContract"] },
   { dir: "view-template", ifaces: ["ViewTemplate", "ColumnPref", "LayoutPref"] },
   { dir: "pnl", ifaces: ["CaliberMeta", "PnlLineDef", "PnlLine", "PnlStatement"] },
+  { dir: "strategy-choice", ifaces: ["StrategyChoice", "ChoiceOption", "ImpactPreview", "StrategyHistoryEntry"] },
 ];
 
 for (const { dir, ifaces } of PAIRS) {
@@ -80,6 +81,12 @@ test("契约版本号一致", () => {
   const pvTruth = pTruth.match(/PNL_CONTRACT_VERSION\s*=\s*"([^"]+)"/)?.[1];
   const pvMirror = pMirror.match(/PNL_CONTRACT_VERSION\s*=\s*"([^"]+)"/)?.[1];
   assert.equal(pvMirror, pvTruth, "PnL 契约版本号漂移");
+
+  const sTruth = readFileSync(join(REPO, "contracts", "strategy-choice.ts"), "utf8");
+  const sMirror = readFileSync(join(WEB, "src", "contracts", "strategy-choice.ts"), "utf8");
+  const svTruth = sTruth.match(/STRATEGY_CHOICE_VERSION\s*=\s*"([^"]+)"/)?.[1];
+  const svMirror = sMirror.match(/STRATEGY_CHOICE_VERSION\s*=\s*"([^"]+)"/)?.[1];
+  assert.equal(svMirror, svTruth, "StrategyChoice 契约版本号漂移");
 });
 
 /**
@@ -98,5 +105,38 @@ test("★ P&L 口径契约：不变量行 / 折扣归属 / 模块默认（D10）
     assert.match(src, /B:\s*"seller_discount"/, `${name} 口径 B 的折扣归属应为 seller_discount（收入抵减）`);
     assert.match(src, /"module\.report":\s*"A"/, `${name} 经营报表默认口径应为 A（运营口径）`);
     assert.match(src, /"module\.pnl":\s*"B"/, `${name} P&L 默认口径应为 B（财务口径，D10 分模块各自默认）`);
+  }
+});
+
+/**
+ * ★ 策略实验室的「不许自由输入」必须在**契约层**就锁死。
+ *
+ * 若这条只存在于某个 handler 的校验里，下一代维护者会觉得
+ * 「加个自定义输入更灵活」——那正是需求明确禁止的（"以选型方式提供"）。
+ * 这里直接盯住 DecisionAction 的联合类型：只能有 choose / keep_current。
+ */
+test("★ 策略契约：决策动作只有选型，绝无自由输入", () => {
+  const truth = readFileSync(join(REPO, "contracts", "strategy-choice.ts"), "utf8");
+  const mirror = readFileSync(join(WEB, "src", "contracts", "strategy-choice.ts"), "utf8");
+  for (const [name, src] of [["真源", truth], ["镜像", mirror]]) {
+    // 动作联合类型必须只含这两种
+    assert.match(
+      src,
+      /export type DecisionAction\s*=[\s\S]*?kind:\s*"choose"[\s\S]*?kind:\s*"keep_current"/,
+      `${name} DecisionAction 必须且只能包含 choose / keep_current`,
+    );
+    // 不得出现「填公式 / 任意数值」类动作
+    for (const forbidden of ["formula", "expression", "set_value", "setValue", "rawValue"]) {
+      assert.doesNotMatch(
+        src,
+        new RegExp(`kind:\\s*"${forbidden}"`, "i"),
+        `${name} 不应存在自由输入类动作 kind: "${forbidden}"`,
+      );
+    }
+    // 选项必须自带风险与可逆性（选之前就能看到代价）
+    assert.match(src, /risk:\s*"low"\s*\|\s*"medium"\s*\|\s*"high"/, `${name} ChoiceOption 必须有 risk`);
+    assert.match(src, /reversible:\s*boolean/, `${name} ChoiceOption 必须有 reversible`);
+    // 候选数量契约：2–4
+    assert.match(src, /候选选项 2–4 个/, `${name} 应声明候选数量为 2–4 个`);
   }
 });
