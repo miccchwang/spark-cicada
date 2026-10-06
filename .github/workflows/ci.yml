@@ -163,6 +163,44 @@ jobs:
           fi
           echo "产物密钥扫描通过"
 
+  # ───────────────────────── G8 性能闸门（真实测量 + 判定）─────────────────────────
+  #
+  # ★ 本作业的存在本身就是一条闸门（由 gate/g8_perf_wiring_test.go 钉住）。
+  #   在此之前 `gate.CheckPerf` 全仓没有任何非测试调用点 —— 四条阈值一条都没在把关，
+  #   而 docs/05 标着「✅ 已实现」、尾注却写「实测由 CI 的 gate-perf 阶段产出」，
+  #   可 CI 里根本没有这个作业。现补上：spark-perf 调 perf.Judge → gate.CheckPerf。
+  #
+  # 口径（诚实说明）：
+  #   * `--measure-bundle` 真实测出「首屏产物 gzip」—— 确定性、无需浏览器，
+  #     本作业据此**真正把关**这一条阈值（超标即 CI 红）。
+  #   * TTI / 筛选 P95 需要无头浏览器 / 真库，当前作业无法产出 ⇒ 如实标记为「未测」，
+  #     故用**非严格**模式（未测不判失败，但会打进日志）。
+  #     一旦接上测量源，改成 `--strict` 即可让「未测」也判失败。
+  perf:
+    name: G8 性能闸门（首屏产物真实测量）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: backend/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 构建前端产物
+        working-directory: web
+        run: |
+          npm install --no-audit --no-fund
+          node scripts/build.mjs
+
+      - name: ★ G8 判定（真实测量首屏产物 gzip → gate.CheckPerf）
+        working-directory: backend
+        run: go run ./cmd/spark-perf --measure-bundle ../web/dist
+
   # ───────────────────────── 密钥扫描（G11a）─────────────────────────
   secret-scan:
     name: 全仓密钥扫描
@@ -244,6 +282,6 @@ jobs:
   gate:
     name: 全部闸门通过
     runs-on: ubuntu-latest
-    needs: [go, rust, web, secret-scan, launch-check]
+    needs: [go, rust, web, perf, secret-scan, launch-check]
     steps:
       - run: echo "ALL GATES PASSED"
