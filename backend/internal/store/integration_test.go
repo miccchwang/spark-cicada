@@ -132,6 +132,18 @@ func TestIntegration_ITCannotViewBusinessValues(t *testing.T) {
 	pool := m.Pool()
 
 	// 准备两个组织节点（外键要求）
+	//
+	// ★ 0011 之后 fact_entitlement 的主键 (account) 已被替换为
+	//   **部分唯一索引** uq_fact_entitlement_tenant_account (tenant_id, account)
+	//   WHERE tenant_id IS NOT NULL —— 因为 account 必须改为「租户内唯一」。
+	//
+	// ★★ 后果（必须理解，否则会写出查不到冲突目标的 upsert）：
+	//   PostgreSQL 的 `ON CONFLICT (cols)` **无法推断部分唯一索引**，
+	//   除非把该索引的 WHERE 谓词**原样写进 ON CONFLICT**：
+	//       ON CONFLICT (tenant_id, account) WHERE tenant_id IS NOT NULL
+	//   漏掉 WHERE ⇒ SQLSTATE 42P10「no unique or exclusion constraint
+	//   matching the ON CONFLICT specification」。
+	//   这正是本用例迁移后第一次运行时踩到的报错。
 	_, _ = pool.Exec(ctx, `INSERT INTO dim_org (account, display_name, tier, primary_dept)
 		VALUES ('it.t','IT','T4','SEA') ON CONFLICT DO NOTHING`)
 	_, _ = pool.Exec(ctx, `INSERT INTO dim_org (account, display_name, tier, primary_dept)
@@ -139,7 +151,9 @@ func TestIntegration_ITCannotViewBusinessValues(t *testing.T) {
 
 	// ① 业务账号：允许可见
 	_, err := pool.Exec(ctx, `INSERT INTO fact_entitlement (account, base_template, can_view_business_values)
-		VALUES ('biz.t','tpl.lead', true) ON CONFLICT (account) DO UPDATE SET can_view_business_values = true`)
+		VALUES ('biz.t','tpl.lead', true)
+		ON CONFLICT (tenant_id, account) WHERE tenant_id IS NOT NULL
+		DO UPDATE SET can_view_business_values = true`)
 	if err != nil {
 		t.Fatalf("业务账号授权不应失败：%v", err)
 	}
@@ -147,7 +161,8 @@ func TestIntegration_ITCannotViewBusinessValues(t *testing.T) {
 	// ② IT 账号可见业务数值：DB 必须拒绝
 	_, err = pool.Exec(ctx, `INSERT INTO fact_entitlement (account, base_template, can_view_business_values)
 		VALUES ('it.t','tpl.it', true)
-		ON CONFLICT (account) DO UPDATE SET base_template='tpl.it', can_view_business_values=true`)
+		ON CONFLICT (tenant_id, account) WHERE tenant_id IS NOT NULL
+		DO UPDATE SET base_template='tpl.it', can_view_business_values=true`)
 	if err == nil {
 		t.Fatal("D7 失败：DB 层竟然允许 IT 账号可见业务数值 —— CHECK 约束失效")
 	}

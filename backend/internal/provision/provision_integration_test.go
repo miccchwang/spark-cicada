@@ -220,6 +220,49 @@ func TestProvision_可重入_半途失败后可续跑(t *testing.T) {
 		t.Fatal("★ 租户 schema 里没有任何表 —— 记账与实物脱节")
 	}
 	t.Logf("租户 schema 中共 %d 张表", n)
+
+	// ★★ 关键断言（本用例存在的真正理由）：
+	//   独立档 schema 里的表也必须**被 0011 加固**（tenant_id 列 + RLS + 策略）。
+	//
+	//   为什么这条断言不可省：0011 曾把表名写死成 `public.fact_sales_daily`，
+	//   于是独立档重放迁移时：
+	//     · 改的是**平台库**的表（且因早已改过而报错/静默跳过）；
+	//     · 租户 schema 里的表 **tenant_id 列都不存在**。
+	//   而上面那句「共 N 张表」的断言**照样通过** —— 它只数表个数，
+	//   看不出「表建了但没加固」。本断言补上这个盲区。
+	//
+	//   ★ 断言三件事（缺一不可）：
+	//     ① 12 张受管表在租户 schema 里都有 tenant_id 列；
+	//     ② 都开了 RLS；
+	//     ③ 都开了 FORCE（否则以表拥有者身份连库时策略不生效）。
+	const guardedTables = `ARRAY[
+		'fact_sales_daily','bucket_pnl_month','dim_org','dim_data_chain',
+		'dim_group','dim_group_member','fact_entitlement','fact_permission_request',
+		'fact_group_grant_change','dim_view_template','dim_view_template_share','audit_log']`
+
+	var hardened int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM pg_class c
+		JOIN pg_namespace ns ON ns.oid = c.relnamespace
+		WHERE ns.nspname = $1
+		  AND c.relkind = 'r'
+		  AND c.relname = ANY(`+guardedTables+`)
+		  AND c.relrowsecurity
+		  AND c.relforcerowsecurity
+		  AND EXISTS (SELECT 1 FROM information_schema.columns ic
+		               WHERE ic.table_schema = $1
+		                 AND ic.table_name = c.relname
+		                 AND ic.column_name = 'tenant_id')`,
+		*tr.SchemaName).Scan(&hardened); err != nil {
+		t.Fatal(err)
+	}
+	if hardened != 12 {
+		t.Errorf("★ 独立档租户 schema 中应有 12 张表被加固（tenant_id + RLS + FORCE），"+
+			"实际只有 %d 张。\n"+
+			"最常见原因：某个迁移把表名写死成 `public.<表>` —— "+
+			"重放到独立档 schema 时就会去改平台库的表，而租户 schema 里的表从未被加固。",
+			hardened)
+	}
 }
 
 // ───────────────────────────── 并发安全 ─────────────────────────────
