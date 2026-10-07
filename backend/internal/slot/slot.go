@@ -191,6 +191,27 @@ func (s Slot) FreshnessMinutes() (int, bool) {
 	return gate.ParseFreshness(s.Freshness)
 }
 
+// KeyStrategyDocs 返回全部槽的匹配键策略声明，供 gate.CheckKeyStrategyDeclared /
+// CheckKeyStrategyCohesion 判定。
+//
+// ★ 这是「槽的 key_strategy 必须可解析」这条断言第一次拿到**磁盘上的真值**。
+// 同时带上 SourceKind / SourceRef，用于「键与来源是否相称」以及
+// 「共用来源的槽键口径必须一致」两类判定 —— 二者都需要跨槽视野，
+// 单个槽的 YAML 看不出来。
+func (r *Registry) KeyStrategyDocs() []gate.KeyStrategyDoc {
+	out := make([]gate.KeyStrategyDoc, 0, len(r.order))
+	for _, id := range r.order {
+		s := r.slots[id]
+		out = append(out, gate.KeyStrategyDoc{
+			SlotID:     s.ID,
+			Raw:        s.KeyStrategy,
+			SourceKind: s.SourceKind,
+			SourceRef:  s.SourceRef,
+		})
+	}
+	return out
+}
+
 // Validate 用 **gate 的多条 G4 判定函数**校验注册表本身。
 //
 // ★ 这是 G4 闸门第一次被生产代码调用：判定的对象是**磁盘上的真 YAML**，
@@ -218,6 +239,19 @@ func (r *Registry) Validate() error {
 	// derived 槽的 ref 交给 `ValidateWithBuckets` 在**桶到位后**收口
 	// （LoadRegistry 阶段桶还没加载，此处按「未声明 ref」处理，不伪造解析结果）。
 	violations = append(violations, gate.CheckSlotSourceResolvable(r.sourceDocsForValidate(false))...)
+	// 槽的**匹配键策略**必须可解析（G4 第七侧 / docs/03 §2.2、§2.3）。
+	//
+	// ★ 此前 `key_strategy` 是**被读进来、写进 DB（registry_slot.key_strategy）、
+	// 但没有任何判定消费**的一个字段：全链路只有解析/赋值/写库三类用法，
+	// 没有第四类（比较、判定、阈值）。于是 16 个槽全声明了它，
+	// 而 `store_sku` 与 `随便写` 在行为上完全等价。
+	//
+	// 后果不是「少一条断言」，而是**跨源对齐口径失去判据**：key_strategy 决定
+	// 多条来源按什么键合并成一行；写错它，桶照样算出来，但合并后的每一行都可能
+	// 张冠李戴（A 店的成本配到 B 店的收入上），且全程零报错。
+	violations = append(violations, gate.CheckKeyStrategyDeclared(r.KeyStrategyDocs())...)
+	// 共用同一来源的槽，其键口径必须一致（逐条合法、合起来是错的 —— 单元断言看不见）。
+	violations = append(violations, gate.CheckKeyStrategyCohesion(r.KeyStrategyDocs())...)
 	// 算法 → 算法 的引用完整性（depends_on_algos 必须指向已注册算法）。
 	// 与 CheckSlotsRegistered 对称；缺了它，`depends_on_algos: [algo.ghost]`
 	// 会被当作「已声明依赖」从而让绑定校验放行一个根本不存在的来源。

@@ -67,6 +67,7 @@ id: slot.a
 name: 槽
 source_kind: api
 source_ref: master.x
+key_strategy: direct
 coverage_gate: 0.50
 `+tc.freshness+`
 permission: L3
@@ -105,6 +106,7 @@ id: slot.nofresh
 name: 无时效
 source_kind: api
 source_ref: master.x
+key_strategy: direct
 coverage_gate: 0.50
 permission: L3
 status: AVAILABLE
@@ -145,6 +147,7 @@ id: slot.fresh
 name: 时效槽
 source_kind: api
 source_ref: master.x
+key_strategy: direct
 coverage_gate: 0.80
 freshness: 7d
 permission: L3
@@ -233,6 +236,7 @@ id: slot.a
 name: 槽
 source_kind: api
 source_ref: master.x
+key_strategy: direct
 coverage_gate: 0.50
 freshness: 1d
 permission: L3
@@ -280,6 +284,7 @@ id: slot.a
 name: 槽
 source_kind: api
 source_ref: master.x
+key_strategy: direct
 coverage_gate: 0.50
 freshness: 1d
 permission: L3
@@ -318,6 +323,7 @@ id: slot.m
 name: 无来源
 source_kind: api
 source_ref: master.x
+key_strategy: direct
 coverage_gate: 0.50
 freshness: 1d
 permission: L3

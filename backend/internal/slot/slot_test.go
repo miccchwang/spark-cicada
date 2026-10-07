@@ -119,6 +119,7 @@ id: slot.rev
 name: 收入
 source_kind: derived
 source_ref: channel_sales
+key_strategy: store_sku
 coverage_gate: 0.95
 permission: L3
 status: AVAILABLE
@@ -154,6 +155,7 @@ id: slot.rev
 name: 收入
 source_kind: derived
 source_ref: channel_sales
+key_strategy: store_sku
 coverage_gate: 0.95
 permission: L3
 status: AVAILABLE
@@ -203,6 +205,7 @@ id: slot.nogate
 name: 无门限
 source_kind: api
 source_ref: master.x
+key_strategy: direct
 permission: L3
 `)
 	writeYAML(t, algosDir, "a.yaml", `
@@ -228,6 +231,7 @@ id: slot.cost
 name: 成本
 source_kind: master_table
 source_ref: cost_master.v2
+key_strategy: barcode_then_sku
 coverage_gate: 0.80
 freshness: 7d
 permission: L4
@@ -298,6 +302,7 @@ id: slot.s
 name: 槽
 source_kind: api
 source_ref: master.x
+key_strategy: direct
 coverage_gate: 0.50
 freshness: 1d
 permission: L3
@@ -339,6 +344,7 @@ id: slot.p
 name: 部分
 source_kind: api
 source_ref: master.x
+key_strategy: direct
 coverage_gate: 0.90
 freshness: 1d
 permission: L4
@@ -387,6 +393,7 @@ id: slot.dup
 name: 重复
 source_kind: api
 source_ref: master.x
+key_strategy: direct
 coverage_gate: 0.5
 permission: L3
 status: AVAILABLE
@@ -414,6 +421,7 @@ id: slot.s
 name: 槽
 source_kind: api
 source_ref: master.x
+key_strategy: direct
 coverage_gate: 0.5
 permission: L3
 status: AVAILABLE
@@ -439,6 +447,7 @@ id: slot.s
 name: 槽
 source_kind: api
 source_ref: master.x
+key_strategy: direct
 coverage_gate: 0.5
 permission: L3
 status: ACTIVE
