@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/miccchwang/spark-cicada/backend/internal/gate"
 )
@@ -99,6 +100,30 @@ func (r *BucketRegistry) RegisteredBucketIDs() map[string]bool {
 		out[id] = true
 	}
 	return out
+}
+
+// RefreshIntervalMinutes 返回该桶声明的刷新上限分钟数（0 = 无固定节律）。
+//
+// 这是 `Bucket.Refresh` 的**生产消费点**：把裸字符串变成可比较的时长，
+// 供 IsDue 判定。此前该字段除了「非空校验」外没有任何人读它。
+func (b Bucket) RefreshIntervalMinutes() int {
+	mins, ok := gate.ParseRefresh(b.Refresh)
+	if !ok {
+		return 0
+	}
+	return mins
+}
+
+// IsDue 判定该桶在 now 时刻是否**到期需重算**（docs/04 §3.2）。
+//
+// lastRefreshed 为 nil 表示从未成功刷新 ⇒ 一律判到期（fail-closed）。
+// 声明为 manual/event（无固定节律）时不参与判定 —— 返回 (false, 原因)。
+//
+// ★ 这是 gate.CheckRefreshDue 的**真实生产调用点**：把「桶该刷了吗」
+//
+//	从「无人能答」变成一条可被运维流水线消费的判定。
+func (b Bucket) IsDue(lastRefreshed *time.Time, now time.Time) (bool, string) {
+	return gate.CheckRefreshDue(b.ID, b.Refresh, lastRefreshed, now)
 }
 
 // AlgoToBuckets 返回「算法 ID → 产出它的桶」映射，供 gate.AffectedBuckets 使用（G6）。
@@ -206,7 +231,7 @@ func (r *BucketRegistry) validate(reg *Registry, registeredRules map[string]bool
 	// ①c PENDING 算法不得被桶引用（否则运行时会产出恒空的静默列）。
 	bad = append(bad, gate.CheckPendingAlgosNotProducing(reg.AlgoDocs(), docs)...)
 
-	// ② 闸门之外的结构性约束（版本号为正、grain/refresh 必备）。
+	// ② 闸门之外的结构性约束（版本号为正、grain 必备）。
 	for _, id := range r.order {
 		b := r.buckets[id]
 
@@ -218,10 +243,23 @@ func (r *BucketRegistry) validate(reg *Registry, registeredRules map[string]bool
 		if len(b.Grain) == 0 {
 			bad = append(bad, fmt.Sprintf("桶 %s 未声明 grain（预计算粒度是桶的定义性属性）", id))
 		}
-		if strings.TrimSpace(b.Refresh) == "" {
-			bad = append(bad, fmt.Sprintf("桶 %s 未声明 refresh 策略", id))
-		}
 	}
+
+	// ①d 刷新节律声明（G4 第五侧）。
+	//
+	// ★ 这是本仓「假闸门」形态的另一实例：`Bucket.Refresh` 全链路
+	//   （YAML → Bucket → BucketDoc → registry_bucket.refresh 列）被带过，
+	//   但此前对它唯一的校验是「非空字符串」⇒ `monthly_incremental` 与
+	//   乱写**完全等价**，且没有任何到期判定 ⇒ 桶可能无限期陈旧而无人知。
+	//   现把 gate.CheckRefreshDeclared 接成真实生产调用点。
+	refreshDocs := make([]gate.RefreshDoc, 0, len(r.order))
+	for _, id := range r.order {
+		refreshDocs = append(refreshDocs, gate.RefreshDoc{
+			BucketID: id,
+			Raw:      r.buckets[id].Refresh,
+		})
+	}
+	bad = append(bad, gate.CheckRefreshDeclared(refreshDocs)...)
 
 	if len(bad) > 0 {
 		return fmt.Errorf("桶注册表校验失败：\n  - %s", strings.Join(bad, "\n  - "))

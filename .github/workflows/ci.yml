@@ -145,6 +145,17 @@ jobs:
         working-directory: backend
         run: go test ./internal/rule/ -count=1 -v
 
+      # ★ 桶刷新节律闸门（G4 第五侧：refresh 声明 + 到期判定）
+      #   Bucket.Refresh 的全链路（YAML → 结构体 → registry_bucket.refresh 列）
+      #   此前**唯一的校验是「非空字符串」** ⇒ monthly_incremental 与乱写完全等价，
+      #   且没有任何到期判定 ⇒ 桶可能无限期陈旧而无人知（静默的旧表）。
+      #   现：声明必须是已知节律（自由文本即加载失败）；Bucket.IsDue 真正做到期判定
+      #   （从未刷新 / 未知节律一律 fail-closed 判到期，manual/event 不参与）。
+      #   与槽的 freshness 互补：一个管「上游数据新不新」，一个管「桶该不该重算」。
+      - name: ★ 桶刷新节律闸门（G4 第五侧：refresh 声明 + 到期判定 + 接线）
+        working-directory: backend
+        run: go test ./internal/slot/ ./internal/gate/ -count=1 -run "Refresh" -v
+
       - name: 控制面闸门
         working-directory: backend
         run: go test ./internal/admin/ -count=1 -v

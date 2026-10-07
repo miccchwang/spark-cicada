@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/miccchwang/spark-cicada/backend/internal/authz"
 	"github.com/miccchwang/spark-cicada/backend/internal/chain"
@@ -1152,4 +1153,154 @@ func toStrings(v any) []string {
 	default:
 		return nil
 	}
+}
+
+// ──────────────────────── G4 · 桶的刷新节律（refresh）声明 ────────────────────────
+
+// RefreshDoc 是桶的**刷新节律声明**（对应 buckets/*.yaml 的 `refresh` 键）。
+//
+// 这是本仓「假闸门」形态在 G4 上的**第五个变种**，也是第十三个变种
+// （「字段被读进来、写进数据库，却没有任何判定消费它」）在桶侧的同一实例：
+//
+//	`Bucket.Refresh` 的链路是 `buckets/*.yaml → Bucket.Refresh →
+//	gate.BucketDoc.Refresh → registry_bucket.refresh 列 → 结束`。
+//	`BucketRegistry.validate` 对它的全部校验是 `strings.TrimSpace(...) == ""`
+//	（只查**非空**），此后**全仓没有任何人读它**：
+//	  * 没有解析器（`monthly_incremental` / `daily` / `manual` 只是裸字符串）；
+//	  * 没有到期判定（「这个桶该刷了吗」无从回答）；
+//	  * 没有与 docs/04 §3.1 刷新任务表的对齐校验。
+//
+//	后果与 freshness 完全同型：`refresh: monthly_incremental` 与
+//	`refresh: 想写什么写什么` 在行为上**完全等价** —— 都是「不影响任何事」。
+//	最贵的代价是**静默的陈旧**：桶永远不会被判「该刷了」，于是没人知道
+//	pnl_month 已经三个月没重算；而 docs/04 §3.1 明明写明了各桶频率。
+//
+//	与 freshness 的分工（两者互补，不可互替）：
+//	  freshness 答「**上游数据**新不新」（采集侧，超过即判槽过期）；
+//	  refresh   答「**这个桶**该多久重算一次」（物化侧，超过即判桶到期）。
+//	一份新鲜的输入进了一个从不重算的桶，报表依然是旧的。
+type RefreshDoc struct {
+	// BucketID 桶 ID（报错时可定位）。
+	BucketID string
+	// Raw 声明原文（如 `monthly_incremental` / `daily`）。
+	Raw string
+}
+
+// refreshModes 是允许的刷新节律（**唯一权威表**）。
+//
+// 键是声明写法，值是「该节律对应的刷新上限分钟数」：
+//   - 0 表示**无固定节律**（manual = 仅手动/事件触发），不参与到期判定；
+//   - 其余为「距上次成功刷新超过该分钟数即判到期」。
+//
+// ★ 不接受任意自由文本：`refresh: weekly-ish` 看起来合理，但解析器拿不到
+//
+//	节律，最终必然退化成「不影响任何事」—— 正是本文档要消灭的形态。
+var refreshModes = map[string]int{
+	"daily":               24 * 60,      // 每日
+	"daily_incremental":   24 * 60,      // 每日增量
+	"monthly":             31 * 24 * 60, // 每月（按最长月取上界，宁晚不早）
+	"monthly_incremental": 31 * 24 * 60, // 每日增量 + 月终结转（docs/04 §3.1 pnl_month）
+	"hourly":              60,           // 每小时
+	"manual":              0,            // 仅手动/事件触发，无固定节律
+	"event":               0,            // 事件驱动，无固定节律
+}
+
+// RefreshModes 暴露允许的节律集合（供接线闸门比对，防两侧漂移）。
+func RefreshModes() map[string]bool {
+	out := make(map[string]bool, len(refreshModes))
+	for m := range refreshModes {
+		out[m] = true
+	}
+	return out
+}
+
+// ParseRefresh 解析刷新节律声明，返回**刷新上限分钟数**。
+//
+// 第二个返回值为 false 表示「不是合法的固定节律声明」。注意 `manual` / `event`
+// 是**合法**的（ok=true）但上限为 0（无固定节律）—— 合法与「有节律」是两件事，
+// 调用方须用 RefreshHasInterval 区分，不可把 0 当作「立即到期」。
+func ParseRefresh(raw string) (int, bool) {
+	s := strings.TrimSpace(strings.ToLower(raw))
+	if s == "" {
+		return 0, false
+	}
+	mins, ok := refreshModes[s]
+	if !ok {
+		return 0, false
+	}
+	return mins, true
+}
+
+// RefreshHasInterval 报告该声明是否带**固定节律**（即到期判定适用）。
+func RefreshHasInterval(raw string) bool {
+	mins, ok := ParseRefresh(raw)
+	return ok && mins > 0
+}
+
+// CheckRefreshDeclared 断言每个桶都声明了**可解析且已知**的刷新节律（G4 / docs/04 §3.1）。
+//
+// 校验口径（与 CheckFreshnessDeclared 同构，有意保守）：
+//   - 必须非空（缺声明 ⇒ 无刷新判据，桶可能无限期陈旧而无人知）；
+//   - 必须是 RefreshModes 里的已知节律（`daily` / `monthly_incremental` / `manual` …）；
+//   - 不认 `weekly-ish` / `1 day` / `每日` 等自由文本 —— 它们看起来合理，
+//     但解析器拿不到节律，最终还是会退化成「不影响任何事」。
+//
+// 返回人类可读原因（fail-closed：无法确认节律 ⇒ 不视为合规）。
+func CheckRefreshDeclared(docs []RefreshDoc) []string {
+	var violations []string
+	for _, d := range docs {
+		raw := strings.TrimSpace(d.Raw)
+		if raw == "" {
+			violations = append(violations, fmt.Sprintf(
+				"桶 %s 未声明 refresh —— 无刷新判据，桶可能无限期陈旧而无人知", d.BucketID))
+			continue
+		}
+		if _, ok := ParseRefresh(raw); !ok {
+			violations = append(violations, fmt.Sprintf(
+				"桶 %s 的 refresh=%q 不是已知节律（允许：%s；"+
+					"自由文本如 weekly-ish/每日 会让到期判定退化为「不影响任何事」）",
+				d.BucketID, raw, strings.Join(knownRefreshModes(), "/")))
+		}
+	}
+	sort.Strings(violations)
+	return violations
+}
+
+// knownRefreshModes 返回排序后的已知节律（供报错信息稳定可读）。
+func knownRefreshModes() []string {
+	out := make([]string, 0, len(refreshModes))
+	for m := range refreshModes {
+		out = append(out, m)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// CheckRefreshDue 判定桶是否**到期需重算**（G4 / docs/04 §3.2）。
+//
+// lastRefreshed 为 nil 表示「从未成功刷新」⇒ **一律判到期**（fail-closed：
+// 没刷过的桶必须刷，而不是「未知所以放行」）。只有 manual/event 这类
+// 无固定节律的声明才**不参与**到期判定（返回 false 且原因说明）。
+//
+// now 由调用方注入（本包纪律：纯函数、零副作用、可测），不在此取 time.Now()。
+func CheckRefreshDue(bucketID, rawRefresh string, lastRefreshed *time.Time, now time.Time) (bool, string) {
+	raw := strings.TrimSpace(rawRefresh)
+	if raw == "" {
+		return true, fmt.Sprintf("桶 %s 未声明 refresh ⇒ 无节律可依，按需要重算处理（fail-closed）", bucketID)
+	}
+	mins, ok := ParseRefresh(raw)
+	if !ok {
+		return true, fmt.Sprintf("桶 %s 的 refresh=%q 不是已知节律 ⇒ 判到期（fail-closed）", bucketID, raw)
+	}
+	if mins <= 0 {
+		return false, fmt.Sprintf("桶 %s 的 refresh=%s 无固定节律（手动/事件触发），不参与到期判定", bucketID, raw)
+	}
+	if lastRefreshed == nil {
+		return true, fmt.Sprintf("桶 %s 从未成功刷新 ⇒ 到期", bucketID)
+	}
+	age := now.Sub(*lastRefreshed)
+	if age >= time.Duration(mins)*time.Minute {
+		return true, fmt.Sprintf("桶 %s 距上次刷新 %s ≥ 上限 %d 分钟 ⇒ 到期", bucketID, age.Round(time.Minute), mins)
+	}
+	return false, fmt.Sprintf("桶 %s 距上次刷新 %s < 上限 %d 分钟 ⇒ 未到期", bucketID, age.Round(time.Minute), mins)
 }
