@@ -187,6 +187,22 @@ jobs:
         working-directory: backend
         run: go test ./internal/gate/ ./internal/slot/ -count=1 -run "KeyStrategy" -v
 
+      # ★ 密级闸门（G4 引用完整性的**第八侧**：permission 可解析 + 与 DB CHECK 词表同源）
+      #   承袭本仓「字段被读进来、写进 DB，却没有任何判定消费」这个病的**第十六个变种**：
+      #   槽与算法的 permission 全链路（YAML → 结构体 → registry_*.permission 列）被读被存，
+      #   但 Go 侧唯一的校验是 `s.Permission == ""` ⇒ 16 个槽 + 4 个算法全声明了它，
+      #   而 `L4` 与 `想写什么写什么` 在 Go 侧行为完全等价（DB 的 CHECK 只是入库兜底）。
+      #   后果是**越权**：成本/利润类槽（L3/L4）一旦被写成 L1，就会与产品 ID 同权限暴露。
+      #   现：档位必须已知（唯一权威表 gate.permissionLevels）、与 0002 的 CHECK 词表**同源**
+      #   （在加载期就把 DB 那份读出来逐个比对，防两处各写一份词表迟早漂移）。
+      #   ★ 本侧**刻意不做**「算法密级 ≤ 原料槽密级」的单调性断言 —— 已实测证伪：
+      #   algo.cogs(L4) ← slot.qty(L2) × slot.cost_unit(L4) 在业务上正当（销量属内部、
+      #   成本属核心），强行断言单调只能靠「抬高 slot.qty 到 L4」（过度限权）或
+      #   「压低 algo.cogs 到 L2」（把核心成本降级 = 真正的安全回归）来满足，二者都是伪造。
+      - name: ★ 密级闸门（G4 第八侧：permission 可解析 + 与 DB 词表同源）
+        working-directory: backend
+        run: go test ./internal/gate/ ./internal/slot/ -count=1 -run "Permission" -v
+
       - name: 控制面闸门
         working-directory: backend
         run: go test ./internal/admin/ -count=1 -v

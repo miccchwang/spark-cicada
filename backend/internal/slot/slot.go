@@ -212,8 +212,32 @@ func (r *Registry) KeyStrategyDocs() []gate.KeyStrategyDoc {
 	return out
 }
 
-// Validate 用 **gate 的多条 G4 判定函数**校验注册表本身。
+// PermissionDocs 返回全部槽与算法的密级声明，供 gate.CheckPermissionDeclared 判定
+// （G4 第八侧）。
 //
+// ★ 这是「密级必须可解析且已知」这条断言第一次拿到**磁盘上的真值**。
+// 槽与算法两侧都收：二者都有 permission 列、都在此前「被读被存无判定消费」。
+func (r *Registry) PermissionDocs() []gate.PermissionDoc {
+	out := make([]gate.PermissionDoc, 0, len(r.order)+len(r.algos))
+	for _, id := range r.order {
+		out = append(out, gate.PermissionDoc{
+			Kind: "槽", ID: r.slots[id].ID, Raw: r.slots[id].Permission,
+		})
+	}
+	var algoIDs []string
+	for id := range r.algos {
+		algoIDs = append(algoIDs, id)
+	}
+	sort.Strings(algoIDs)
+	for _, id := range algoIDs {
+		out = append(out, gate.PermissionDoc{
+			Kind: "算法", ID: r.algos[id].ID, Raw: r.algos[id].Permission,
+		})
+	}
+	return out
+}
+
+// Validate 用 **gate 的多条 G4 判定函数**校验注册表本身。//
 // ★ 这是 G4 闸门第一次被生产代码调用：判定的对象是**磁盘上的真 YAML**，
 // 而不是测试里手搓的假数据。违规即返回 error（fail-closed）。
 func (r *Registry) Validate() error {
@@ -252,6 +276,17 @@ func (r *Registry) Validate() error {
 	violations = append(violations, gate.CheckKeyStrategyDeclared(r.KeyStrategyDocs())...)
 	// 共用同一来源的槽，其键口径必须一致（逐条合法、合起来是错的 —— 单元断言看不见）。
 	violations = append(violations, gate.CheckKeyStrategyCohesion(r.KeyStrategyDocs())...)
+	// 槽的**密级**必须可解析，且不得低于依赖它的算法的密级（G4 第八侧 / docs/01 §13.3）。
+	//
+	// ★ 此前 `permission` 是**被读进来、写进 DB（registry_slot.permission）、
+	// 但没有任何判定消费**的一个字段：全链路只有解析/赋值/写库三类用法，
+	// 没有第四类（比较、判定、阈值）。Go 侧唯一的校验是 `validateSlot` 的
+	// `s.Permission == ""`，于是 16 个槽全声明了它，而 `L4` 与 `想写什么写什么`
+	// 在 Go 侧行为完全等价（DB 侧 0002 的 CHECK 只是**入库兜底**，不等于 Go 侧有闸门）。
+	//
+	// 后果是**越权**：成本/利润类槽（L3/L4）一旦被写成 L1，就会与产品 ID 同权限暴露，
+	// 而脱敏与区间展示（docs/01 §13.3）也随之失去依据 —— 且全程零报错。
+	violations = append(violations, gate.CheckPermissionDeclared(r.PermissionDocs())...)
 	// 算法 → 算法 的引用完整性（depends_on_algos 必须指向已注册算法）。
 	// 与 CheckSlotsRegistered 对称；缺了它，`depends_on_algos: [algo.ghost]`
 	// 会被当作「已声明依赖」从而让绑定校验放行一个根本不存在的来源。

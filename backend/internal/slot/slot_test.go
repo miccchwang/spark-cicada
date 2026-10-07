@@ -127,6 +127,7 @@ status: AVAILABLE
 	// ★ 违规：算法里混入 table/source（G4 禁止）
 	writeYAML(t, algosDir, "bad.yaml", `
 id: algo.bad
+permission: L3
 name: 坏算法
 formula: "rev"
 depends_on_slots: [slot.rev]
@@ -162,6 +163,7 @@ status: AVAILABLE
 `)
 	writeYAML(t, algosDir, "bad.yaml", `
 id: algo.bad
+permission: L3
 name: 坏算法
 formula: "rev"
 depends_on_slots: [slot.rev, slot.ghost]
@@ -210,6 +212,7 @@ permission: L3
 `)
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.x
+permission: L3
 formula: "1"
 depends_on_slots: [slot.nogate]
 `)
@@ -239,6 +242,7 @@ status: AVAILABLE
 `)
 	writeYAML(t, algosDir, "gp.yaml", `
 id: algo.gp
+permission: L3
 formula: "rev - cogs"
 depends_on_slots: [slot.cost]
 `)
@@ -310,6 +314,7 @@ status: AVAILABLE
 `)
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
+permission: L3
 formula: "1"
 depends_on_slots: [slot.s]
 `)
@@ -352,6 +357,7 @@ status: PARTIAL
 `)
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
+permission: L3
 formula: "1"
 depends_on_slots: [slot.p]
 `)
@@ -402,6 +408,7 @@ status: AVAILABLE
 	writeYAML(t, slotsDir, "b.yaml", body)
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
+permission: L3
 formula: "1"
 depends_on_slots: [slot.dup]
 `)
@@ -429,6 +436,7 @@ status: AVAILABLE
 	// 未声明 depends_on_slots ⇒ 拒绝（算法必须有数据来源）
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
+permission: L3
 formula: "1"
 `)
 
@@ -454,6 +462,7 @@ status: ACTIVE
 `)
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
+permission: L3
 formula: "1"
 depends_on_slots: [slot.s]
 `)
