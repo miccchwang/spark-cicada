@@ -9,7 +9,7 @@
 id: slot.gross_profit
 name: 毛利额
 source_kind: derived
-source_ref: pnl_sku_month         # 取自预计算桶的 gp 物化列（docs/03 §3.2）
+source_ref: pnl_month         # 取自预计算桶的 gp 物化列（docs/03 §3.2）
 key_strategy: store_sku
 coverage_gate: 0.80               # 与成本同门槛：成本不可用则毛利不可用
 freshness: 1d

@@ -66,7 +66,7 @@ func TestFreshnessDeclaration_RejectsUnparsable(t *testing.T) {
 id: slot.a
 name: 槽
 source_kind: api
-source_ref: x
+source_ref: master.x
 coverage_gate: 0.50
 `+tc.freshness+`
 permission: L3
@@ -104,7 +104,7 @@ func TestFreshnessDeclaration_MissingRejected(t *testing.T) {
 id: slot.nofresh
 name: 无时效
 source_kind: api
-source_ref: x
+source_ref: master.x
 coverage_gate: 0.50
 permission: L3
 status: AVAILABLE
@@ -144,7 +144,7 @@ func TestFreshness_StaleSlotSkipsAlgorithm(t *testing.T) {
 id: slot.fresh
 name: 时效槽
 source_kind: api
-source_ref: x
+source_ref: master.x
 coverage_gate: 0.80
 freshness: 7d
 permission: L3
@@ -232,7 +232,7 @@ func TestFreshness_UnknownAgeIsFailClosed(t *testing.T) {
 id: slot.a
 name: 槽
 source_kind: api
-source_ref: x
+source_ref: master.x
 coverage_gate: 0.50
 freshness: 1d
 permission: L3
@@ -279,7 +279,7 @@ func TestFreshness_NegativeAgeIsStale(t *testing.T) {
 id: slot.a
 name: 槽
 source_kind: api
-source_ref: x
+source_ref: master.x
 coverage_gate: 0.50
 freshness: 1d
 permission: L3
@@ -317,7 +317,7 @@ func TestFreshness_MissingStaticStaysMissing(t *testing.T) {
 id: slot.m
 name: 无来源
 source_kind: api
-source_ref: x
+source_ref: master.x
 coverage_gate: 0.50
 freshness: 1d
 permission: L3

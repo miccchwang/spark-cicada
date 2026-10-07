@@ -98,6 +98,10 @@ type Registry struct {
 	slots map[string]Slot
 	algos map[string]Algorithm
 	order []string // 槽的稳定顺序（便于确定性输出/审计）
+	// derivedResolver 由 ValidateWithBuckets 注入：把 derived 槽的 source_ref
+	// 解析到**真实上游**（事实表简名 或 物化桶 ID）。nil ⇒ 尚无解析能力
+	// （LoadRegistry 阶段），此时 derived 的 ref 不参与校验（见 sourceDocsForValidate）。
+	derivedResolver func(ref string) bool
 }
 
 // Slots 返回全部槽（按 ID 升序）；返回副本，调用方改不动内部状态。
@@ -204,6 +208,16 @@ func (r *Registry) Validate() error {
 	// 都是「不影响任何事」。这条断言把「时效」从装饰字段变成**必须成立的前提**，
 	// 并由 coverage.go 的真正判活（超期 ⇒ DEGRADED ⇒ skip）接手。
 	violations = append(violations, gate.CheckFreshnessDeclared(r.FreshnessDocs())...)
+	// 槽的**数据来源**必须可解析（G4 第六侧 / docs/03 §2.3）。
+	//
+	// ★ 此前 `source_kind`/`source_ref` 是**被读进来、写进 DB、然后被彻底遗忘**的一对
+	// 字段：全仓唯一校验是 `validateSlot` 的 `SourceKind == ""`，于是
+	// `source_kind: 随便写` 与 `api` 等价、`source_ref` 删掉也照过。
+	// 这条断言把「数据从哪来」从装饰字段变成**必须成立的前提**。
+	//
+	// derived 槽的 ref 交给 `ValidateWithBuckets` 在**桶到位后**收口
+	// （LoadRegistry 阶段桶还没加载，此处按「未声明 ref」处理，不伪造解析结果）。
+	violations = append(violations, gate.CheckSlotSourceResolvable(r.sourceDocsForValidate(false))...)
 	// 算法 → 算法 的引用完整性（depends_on_algos 必须指向已注册算法）。
 	// 与 CheckSlotsRegistered 对称；缺了它，`depends_on_algos: [algo.ghost]`
 	// 会被当作「已声明依赖」从而让绑定校验放行一个根本不存在的来源。
@@ -217,6 +231,68 @@ func (r *Registry) Validate() error {
 	}
 	if len(violations) > 0 {
 		return fmt.Errorf("槽注册表校验失败（G4）：\n  - %s", strings.Join(violations, "\n  - "))
+	}
+	return nil
+}
+
+// ResolveDerived 报告 derived 槽的 source_ref 是否解析到**真实上游**。
+//
+// 合法上游有两种形态（docs/01 §12.1 + buckets/*.yaml）：
+//   - 事实表简名/全名（`channel_sales` / `fact_channel_sales`）；
+//   - 物化桶 ID（`pnl_sku_month`，取「预计算桶的物化列」，docs/03 §2.2）。
+//
+// derivedResolver 在 `ValidateWithBuckets` 阶段由桶注册表注入；此前为 nil
+// ⇒ fail-closed 返回 false（绝不假装解析得到）。
+func (r *Registry) ResolveDerived(ref string) bool {
+	if r.derivedResolver == nil {
+		return false
+	}
+	return r.derivedResolver(ref)
+}
+
+// sourceDocsForValidate 构造 G4 第六侧的判定输入。
+//
+// withBuckets=false（LoadRegistry 阶段）：derived 槽的 ref 暂时置空 ——
+// 上游还没加载、无解析结果可用；derived 的 ref 本就可空，故按「未声明 ref」处理，
+// **不伪造解析结果、也不假装核对过**（那正是本仓反复踩的坑）。
+//
+// withBuckets=true （ValidateWithBuckets 阶段）：带真实上游解析结果。
+func (r *Registry) sourceDocsForValidate(withBuckets bool) []gate.SlotSourceDoc {
+	out := make([]gate.SlotSourceDoc, 0, len(r.order))
+	for _, id := range r.order {
+		s := r.slots[id]
+		doc := gate.SlotSourceDoc{SlotID: s.ID, Kind: s.SourceKind, Ref: s.SourceRef}
+		isDerived := strings.EqualFold(strings.TrimSpace(s.SourceKind), gate.SourceKindDerived)
+		if isDerived && !withBuckets {
+			// 上游还没加载 ⇒ 无解析结果可用。derived 的 ref 本就可空，
+			// 故暂按「未声明 ref」处理（不伪造、不假装核对过）。
+			doc.Ref = ""
+		} else if isDerived {
+			doc.DerivedChecked = true
+			doc.DerivedResolved = r.ResolveDerived(strings.TrimSpace(s.SourceRef))
+		}
+		out = append(out, doc)
+	}
+	return out
+}
+
+// ValidateWithBuckets 在**桶注册表到位后**校验 derived 槽的 source_ref。
+//
+// ★ 这是「加载顺序」造成静默窗口的收口：`LoadRegistry` 只读 slots/algorithms，
+//   而 derived 槽的 ref 指向**上游**（事实表或物化桶）。若不在上游到位后校验，
+//   `source_ref: pnl_sku_month_typo` 这类幽灵引用将永远无人发现。
+func (r *Registry) ValidateWithBuckets(br *BucketRegistry) error {
+	if br == nil {
+		return fmt.Errorf("ValidateWithBuckets: 桶注册表为 nil（fail-closed：无法核对 derived 来源）")
+	}
+	// 上游解析 = 事实表简名/全名（docs/01 §12.1） ∪ 物化桶 ID（buckets/*.yaml）。
+	r.derivedResolver = func(ref string) bool {
+		return gate.IsKnownFactTable(ref) || br.Resolves(ref)
+	}
+	var violations []string
+	violations = append(violations, gate.CheckSlotSourceResolvable(r.sourceDocsForValidate(true))...)
+	if len(violations) > 0 {
+		return fmt.Errorf("槽的数据来源校验失败（G4 第六侧）：\n  - %s", strings.Join(violations, "\n  - "))
 	}
 	return nil
 }

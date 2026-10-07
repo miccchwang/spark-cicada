@@ -522,9 +522,14 @@ func TestBucketRuleVersions_RejectsGhostRule(t *testing.T) {
 	reg, _, rules := loadAll(t)
 
 	// 直接对一个含幽灵规则名的桶注册表走校验（临时目录 + 真实入口）。
+	//
+	// ★ 桶 ID 取 `pnl_month`（真桶 ID）：因为 `LoadBucketRegistry` 会按**算法注册表**
+	//   校验 `writes_bucket` 引用完整性（G4 第六侧附）—— 真算法声明的是
+	//   `writes_bucket: pnl_month`，夹具若用别的 ID 会先在这里被拦下，
+	//   从而测不到本用例真正要测的 `rule_versions` 幽灵规则。
 	dir := t.TempDir()
 	body := `
-id: ghost_bucket
+id: pnl_month
 grain: [month]
 produced_by: [algo.gp]
 algo_versions: {algo.gp: 3}

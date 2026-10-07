@@ -156,6 +156,22 @@ jobs:
         working-directory: backend
         run: go test ./internal/slot/ ./internal/gate/ -count=1 -run "Refresh" -v
 
+      # ★ 槽数据来源闸门（G4 引用完整性的**第六侧**：槽来源可解析 + 算法写入桶已注册）
+      #   槽的 source_kind / source_ref 全链路（YAML → Slot → registry_slot 列）被读、被存，
+      #   但在此之前**唯一的校验是 SourceKind == ""** ⇒ source_ref: x / todo /
+      #   source_kind: 想写什么写什么 一律照过（声明等于装饰）；算法的 writes_bucket
+      #   更是从未被校验。★ 闸门首日抓到真缺陷：slot.gross_profit 的 source_ref
+      #   pnl_sku_month 与 algorithms/{cogs,gmp,gp} 的 writes_bucket 指向**并不存在的桶**
+      #   （唯一桶是 pnl_month）⇒ 写入的桶漂移、currentAlgoVersions 静默取空，
+      #   G6 漂移检测对该桶**永远沉默**。
+      #   现：kind 必须已知（与 0005 迁移 CHECK 同源）、外部来源必带非占位符 ref、
+      #   derived 的 ref 必须真解析（fact 表全称/简名或已物化桶），否则 fail-closed。
+      #   派生解析依赖桶 ⇒ 在桶装载后经 slot.ValidateWithBuckets **重校验**
+      #   （sparkd loadSpecs 调用，收口加载顺序静默窗口）。
+      - name: ★ 槽来源闸门（G4 第六侧：来源可解析 + 算法写入桶已注册 + 接线）
+        working-directory: backend
+        run: go test ./internal/gate/ ./internal/slot/ -count=1 -run "SlotSource|AlgoWritesBucket" -v
+
       - name: 控制面闸门
         working-directory: backend
         run: go test ./internal/admin/ -count=1 -v

@@ -82,6 +82,17 @@ func (r *BucketRegistry) Bucket(id string) (Bucket, bool) {
 	return b, ok
 }
 
+// Resolves 报告某桶 ID 是否在本注册表内存在（供槽的 derived source_ref 解析）。
+//
+// ★ 为什么由桶注册表来答：`slots/*.yaml` 里 derived 槽的 `source_ref` 指的是
+// **上游物化来源**，而本仓的物化单位是**桶**（`buckets/*.yaml` 的 ID 即物化列名，
+// 见 docs/03 §3.2「取自预计算桶的 gp 物化列」）。故「这个 ref 是否真实存在」
+// 只有桶注册表能回答 —— 与 `pnl_month.yaml` 引幽灵算法是同一类引用完整性问题。
+func (r *BucketRegistry) Resolves(ref string) bool {
+	_, ok := r.buckets[strings.TrimSpace(ref)]
+	return ok
+}
+
 // IDs 返回全部桶 ID（升序）。
 func (r *BucketRegistry) IDs() []string {
 	out := make([]string, len(r.order))
@@ -260,6 +271,22 @@ func (r *BucketRegistry) validate(reg *Registry, registeredRules map[string]bool
 		})
 	}
 	bad = append(bad, gate.CheckRefreshDeclared(refreshDocs)...)
+
+	// ①e 算法的 writes_bucket 必须指向**真实桶**（G4 第六侧附）。
+	//
+	// ★ 这是同一个病的又一处实例（本闸门上线首刻抓到 3 处真缺陷）：
+	//   `writes_bucket` **被运行时真正消费**（sparkd `currentAlgoVersions` 按它
+	//   汇总桶的算法版本，G6 据此判「桶版本落后 ⇒ 需重算」），但它的值此前
+	//   **从未被校验** —— `algorithms/{cogs,gmp,gp}.yaml` 都写
+	//   `writes_bucket: pnl_sku_month`，而真桶 ID 是 `pnl_month`。
+	//   后果：`currentAlgoVersions("pnl_month")` 恒返回空 map ⇒ G6 对该桶恒不成立。
+	algoBucketDocs := make([]gate.AlgoBucketDoc, 0)
+	for _, a := range reg.Algorithms() {
+		algoBucketDocs = append(algoBucketDocs, gate.AlgoBucketDoc{
+			AlgoID: a.ID, WritesBucket: a.WritesBucket, Status: a.Status,
+		})
+	}
+	bad = append(bad, gate.CheckAlgoWritesBucketRegistered(algoBucketDocs, r.RegisteredBucketIDs())...)
 
 	if len(bad) > 0 {
 		return fmt.Errorf("桶注册表校验失败：\n  - %s", strings.Join(bad, "\n  - "))

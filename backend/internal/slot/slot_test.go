@@ -202,7 +202,7 @@ func TestLoadRegistry_RejectsSlotWithoutCoverageGate(t *testing.T) {
 id: slot.nogate
 name: 无门限
 source_kind: api
-source_ref: x
+source_ref: master.x
 permission: L3
 `)
 	writeYAML(t, algosDir, "a.yaml", `
@@ -297,7 +297,7 @@ func TestCoverageGate_UnobservedIsMissing(t *testing.T) {
 id: slot.s
 name: 槽
 source_kind: api
-source_ref: x
+source_ref: master.x
 coverage_gate: 0.50
 freshness: 1d
 permission: L3
@@ -338,7 +338,7 @@ func TestCoverageGate_PartialStatic(t *testing.T) {
 id: slot.p
 name: 部分
 source_kind: api
-source_ref: x
+source_ref: master.x
 coverage_gate: 0.90
 freshness: 1d
 permission: L4
@@ -386,7 +386,7 @@ func TestLoadRegistry_RejectsDuplicateSlotID(t *testing.T) {
 id: slot.dup
 name: 重复
 source_kind: api
-source_ref: x
+source_ref: master.x
 coverage_gate: 0.5
 permission: L3
 status: AVAILABLE
@@ -413,7 +413,7 @@ func TestLoadRegistry_RejectsAlgorithmWithoutSlots(t *testing.T) {
 id: slot.s
 name: 槽
 source_kind: api
-source_ref: x
+source_ref: master.x
 coverage_gate: 0.5
 permission: L3
 status: AVAILABLE
@@ -438,7 +438,7 @@ func TestLoadRegistry_RejectsIllegalStatus(t *testing.T) {
 id: slot.s
 name: 槽
 source_kind: api
-source_ref: x
+source_ref: master.x
 coverage_gate: 0.5
 permission: L3
 status: ACTIVE

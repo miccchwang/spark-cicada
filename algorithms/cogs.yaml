@@ -8,7 +8,7 @@ permission: L4
 depends_on_slots:
   - slot.qty
   - slot.cost_unit
-writes_bucket: pnl_sku_month
+writes_bucket: pnl_month
 missing_policy: skip
 trace: true
 notes: |

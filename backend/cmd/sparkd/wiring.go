@@ -368,6 +368,24 @@ func (p *dataPlane) loadSpecs(specDir string) {
 			"rule→bucket mapping is empty: G6 rule drift will never mark any bucket stale")
 	}
 
+	// ★ 槽的「数据来源」必须可解析（G4 第六侧 / docs/03 §2.3）。
+	//
+	// 为什么必须**在桶到位之后**复核：`source_kind`/`source_ref` 此前是
+	// 「被读进来、写进 registry_slot、然后被彻底遗忘」的一对字段（全仓唯一校验是
+	// `SourceKind == ""`）—— 于是 `source_kind: 随便写` 与 `api` 等价、
+	// `source_ref` 删掉也照过；而 `source_kind` 决定采集层去哪取数、
+	// 以及写进 DB 后能否满足 0005 迁移的 CHECK 约束。
+	//
+	// 其中 derived 槽的 `source_ref` 指向**桶**（物化来源，docs/03 §3.2），
+	// 故必须等 `buckets` 加载完成才能核对 —— 否则 `source_ref: 幽灵桶` 永远无人发现
+	// （同 `pnl_month.yaml` 引 4 个不存在算法那类缺陷）。
+	if err := reg.ValidateWithBuckets(buckets); err != nil {
+		p.specIssues = append(p.specIssues, "slot source: "+err.Error())
+		log.Printf("[warn] 槽的数据来源校验失败：%v", err)
+		return
+	}
+	log.Printf("[spec] 槽的数据来源全部可解析（G4 第六侧：kind 已知 + ref 非占位/非幽灵）")
+
 	// ★ 槽的「采集时效」必须逐条可解析（G4 / docs/03 §2.3）。
 	//
 	// 为什么在**进程内**再核一次（注册表加载时已核过）：装载注册表一旦失败会
