@@ -3,7 +3,7 @@
 id: algo.gp
 name: 毛利
 version: 3
-formula: "rev - cogs"
+formula: "revenue - cogs"
 unit: THB
 permission: L3
 depends_on_slots:

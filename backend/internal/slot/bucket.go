@@ -163,6 +163,49 @@ func (r *BucketRegistry) validate(reg *Registry, registeredRules map[string]bool
 		bad = append(bad, gate.CheckBucketRuleVersionsRegistered(docs, registeredRules)...)
 	}
 
+	// ①b 公式自由变量绑定完整性（G4 第三侧：值绑定）。
+	//
+	// ★ 这是本仓「假闸门」形态在 G4 上的**第三个变种**：
+	//   前两个是「桶 → 算法」（上面 ①）与「桶 → 规则」；
+	//   而算法真正的执行载荷 —— `formula` —— 里的自由变量**从没被任何断言看过**。
+	//   实例：`algo.gp` 公式 `rev - cogs` 依赖槽 `slot.revenue`，槽绑出的变量名是
+	//   `revenue`，公式要的却是 `rev` ⇒ 内核按 Missing 处理 ⇒ 配合
+	//   `missing_policy: skip`，该列在**每条数据**上都被静默跳过（全空、零报错）。
+	//
+	//   ★ 语义：**逐桶**校验，且只校验该桶 `produced_by` 里真的会被执行的算法。
+	//   理由：BuildRow 是「一个桶一行、按该桶 produced_by 串行求值」。某个算法
+	//   若没被任何桶引用，它在运行时**根本不会被执行**，要求其变量可绑定是过严的
+	//   （且会让「尚未入桶的新算法」无法先落地）。反之，只要它入了桶，其公式的
+	//   每个自由变量就必须能在该桶的执行顺序里绑定到，否则就是一条恒空的静默列。
+	for _, bid := range r.order {
+		b := r.buckets[bid]
+		// 该桶的执行序：只有列在 produced_by 里、且真实注册的算法会被执行。
+		var chain []gate.AlgoDoc
+		upstream := map[string]map[string]bool{}
+		seen := map[string]bool{}
+		byID := map[string]gate.AlgoDoc{}
+		for _, d := range reg.AlgoDocs() {
+			byID[d.ID] = d
+		}
+		for _, algoID := range b.ProducedBy {
+			d, ok := byID[algoID]
+			if !ok {
+				continue // 未注册 ⇒ 已由 ① 报出
+			}
+			up := map[string]bool{}
+			for prev := range seen {
+				up[prev] = true
+			}
+			upstream[algoID] = mergeMaps(upstream[algoID], up)
+			seen[algoID] = true
+			chain = append(chain, d)
+		}
+		bad = append(bad, gate.CheckFormulaVariablesBound(chain, upstream)...)
+	}
+
+	// ①c PENDING 算法不得被桶引用（否则运行时会产出恒空的静默列）。
+	bad = append(bad, gate.CheckPendingAlgosNotProducing(reg.AlgoDocs(), docs)...)
+
 	// ② 闸门之外的结构性约束（版本号为正、grain/refresh 必备）。
 	for _, id := range r.order {
 		b := r.buckets[id]
@@ -219,6 +262,45 @@ func LoadBucketRegistry(bucketsDir string, reg *Registry) (*BucketRegistry, erro
 		return nil, err
 	}
 	return r, nil
+}
+
+// mergeMaps 把 b 的键并入 a（返回 a，nil 时新建）。
+func mergeMaps(a, b map[string]bool) map[string]bool {
+	if a == nil {
+		a = map[string]bool{}
+	}
+	for k := range b {
+		a[k] = true
+	}
+	return a
+}
+
+// upstreamByAlgo 计算「算法 ID → 在本算法**之前**已算出的算法 ID 集合」。
+//
+// 语义与 precomp.Builder.BuildRow 的运行时串行循环一致：按 produced_by 顺序
+// 依次求值，每算出一个就放进变量表供下游使用。同一算法在多个桶里可能有不同的
+// 上游集合，故取**并集**。
+//
+// 供测试与外部核对使用（生产校验路径已按桶逐条进行，见 validate 的 ①b）。
+func (r *BucketRegistry) upstreamByAlgo(reg *Registry) map[string]map[string]bool {
+	out := map[string]map[string]bool{}
+	if reg != nil {
+		for _, a := range reg.Algorithms() {
+			if out[a.ID] == nil {
+				out[a.ID] = map[string]bool{}
+			}
+		}
+	}
+	for _, bid := range r.order {
+		seen := map[string]bool{}
+		for _, algoID := range r.buckets[bid].ProducedBy {
+			for prev := range seen {
+				out[algoID] = mergeMaps(out[algoID], map[string]bool{prev: true})
+			}
+			seen[algoID] = true
+		}
+	}
+	return out
 }
 
 // bucketFileNames 返回 buckets/ 下的文件名（供接线闸门核对目录约定）。

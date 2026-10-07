@@ -2,7 +2,7 @@
 id: algo.gmp
 name: 毛利率
 version: 3
-formula: "rev == 0 ? null : gp / rev"
+formula: "revenue == 0 ? null : gp / revenue"
 unit: percent
 permission: L3
 depends_on_slots:

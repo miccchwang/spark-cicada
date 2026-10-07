@@ -110,6 +110,26 @@ type AlgoDoc struct {
 	ID             string
 	Formula        string
 	DependsOnSlots []string
+	// DependsOnAlgos 声明「算法依赖算法」（docs/03 §3.2 尾注的待决策项，
+	// 于 2026-10-07 落为显式声明字段）。
+	//
+	// 为什么需要它：`algo.net_contrib` 的公式是 `cm2 - overhead_alloc`，
+	// 而 `cm2` 是**上游算法** `algo.cm2` 的字段、`overhead_alloc` 是另一个来源。
+	// 此前这两个自由变量**无任何声明处**，只能靠 `produced_by` 的偶然顺序兜底：
+	// 若桶没把 `algo.cm2` 排在前面，内核就静默按 Missing 处理 ⇒ 整列空。
+	// 显式声明后，绑定来源可被静态校验，也把「算法依赖算法」从口头约定变成可检查的契约。
+	DependsOnAlgos []string
+	// Status 算法实现状态：`ACTIVE`（默认，可绑定校验）/ `PENDING`（口径未定、实现待补）。
+	//
+	// 为什么需要它：`algo.net_contrib` 的公式 `cm2 - overhead_alloc` 里两个名字
+	// 全仓**无定义**（docs/03 §3.2 尾注明标「待决策项」）。把它当 ACTIVE 校验，
+	// 只能二选一：要么臆造一份来源（污染口径①单一事实源），要么让闸门永远红灯。
+	// 二者都错。正确做法是**如实声明它尚不可实现** —— 校验按 PENDING 单独口径处理：
+	//   * 自由变量**不要求**可绑定（因为本来就还没有来源）；
+	//   * 但必须显式登记进 docs/06 待办，且**不得**被任何桶的 produced_by 引用
+	//     （否则运行时它就是一条静默空列）。
+	// 这样「已知的未完成」是一个**可被断言的状态**，而不是静默通过。
+	Status string
 	// Raw 保留原始键，用于探测是否混入数据源字段。
 	Raw map[string]any
 }
@@ -145,6 +165,236 @@ func CheckSlotsRegistered(docs []AlgoDoc, registered map[string]bool) []string {
 			}
 		}
 	}
+	return violations
+}
+
+// ── 公式自由变量绑定（G4 第三侧：算法 → 槽/上游算法的**值绑定**完整性）──
+//
+// 算法实现状态取值（YAML 键 `status`）。
+const (
+	// StatusActive 默认状态：公式的自由变量必须全部可绑定。
+	StatusActive = "ACTIVE"
+	// StatusPending 口径未定 / 实现待补：不要求可绑定，但必须登记且不得被桶引用。
+	StatusPending = "PENDING"
+)
+
+// 为什么需要这条（2026-10-07 实测缺陷）：
+//   G4 原有两条断言只查「引用的名字**是否存在**」——
+//     * CheckSlotsRegistered：depends_on_slots 里的槽 ID 是否已注册；
+//     * CheckAlgorithmNoDataSource：有没有混入 source/table 等数据源字段。
+//   但算法真正被执行的载荷是 `formula`，而**公式里的自由变量从没被任何断言看过一眼**：
+//     - `algo.gp`        公式 `rev - cogs`          依赖槽 `slot.revenue` `slot.cogs`
+//     - `algo.gmp`       公式 `rev == 0 ? null : gp/rev`  依赖槽 `slot.revenue` `slot.gross_profit`
+//     - `algo.net_contrib` 公式 `cm2 - overhead_alloc`     依赖槽 `slot.platform_fee` …
+//   `slot.revenue` 绑定出来的变量名是 `revenue`，而公式要的是 `rev` ⇒ **永远取不到值**。
+//   Rust 内核 `eval_formula` 对未定义变量返回 `Scalar::Missing`（lib.rs：`unwrap_or(Missing)`）
+//   ⇒ 配合 `missing_policy: skip`，该算法在**每一条数据上**都被静默跳过：
+//   `gp` / `gmp` / `net_contrib` 三列**永远为空、全程零报错**。
+//   这就是本仓反复出现的「假闸门」形态在 G4 上的第三个变种 —— 前两个是
+//   「桶→算法」（CheckBucketProducersRegistered）与「桶→规则」（CheckBucketRuleVersionsRegistered）。
+
+// FormulaVars 从公式里抽取**自由变量名**。
+//
+// 语法范围与 Rust 内核 formula.rs 的词法保持一致：
+//   * 标识符 = `[A-Za-z_][A-Za-z0-9_]*`；
+//   * **函数调用**（名字后紧跟 `(`）不算自由变量 —— 见 formulaFuncs；
+//   * `null` / `true` / `false` 是字面量，不是变量；
+//   * 字符串里的内容不参与（本内核公式无字符串字面量，遇引号即跳过以防误抽）。
+//
+// 返回**去重且有序**的变量名，便于确定性报错。
+func FormulaVars(formula string) []string {
+	seen := map[string]bool{}
+	var out []string
+	i := 0
+	n := len(formula)
+	for i < n {
+		c := formula[i]
+		switch {
+		case c == '"' || c == '\'':
+			// 跳过字符串字面量（内核语法其实不支持，但别把里面的字当成变量）
+			q := c
+			i++
+			for i < n && formula[i] != q {
+				i++
+			}
+			i++ // 跳过收尾引号
+		case isIdentStart(c):
+			j := i + 1
+			for j < n && isIdentPart(formula[j]) {
+				j++
+			}
+			name := formula[i:j]
+			// 允许点号分段（`slot.revenue` / `algo.gp`）——
+			// 万一有人把带前缀的名字写进公式，也要能被识别出来并报错。
+			for j < n && formula[j] == '.' && j+1 < n && isIdentStart(formula[j+1]) {
+				k := j + 1
+				for k < n && isIdentPart(formula[k]) {
+					k++
+				}
+				name = formula[i:k]
+				j = k
+			}
+			// ★ 函数名只在**后面紧跟 `(`** 时才算函数调用。
+			//   早前的实现无条件放行白名单名字 —— 于是 `sum - qty` 里出现在
+			//   **变量位置**的 `sum` 也被当成函数而漏检（由本文件的负向自测逼出）。
+			isCall := j < n && formula[j] == '('
+			if !isFormulaKeyword(name) && !(isCall && formulaFuncs[name]) && !seen[name] {
+				seen[name] = true
+				out = append(out, name)
+			}
+			i = j
+		default:
+			i++
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func isIdentStart(c byte) bool {
+	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func isIdentPart(c byte) bool {
+	return isIdentStart(c) || (c >= '0' && c <= '9')
+}
+
+// isFormulaKeyword 判断一个名字是否为字面量/关键字，而非需要绑定的变量。
+func isFormulaKeyword(name string) bool {
+	switch name {
+	case "null", "true", "false":
+		return true
+	}
+	return false
+}
+
+// formulaFuncs 是本内核公式允许的**函数名**白名单。
+//
+// 函数名出现在公式里但不需要变量绑定 —— 必须显式列出，
+// 否则「`sum(qty*cost_unit)` 里的 `sum` 未绑定」会误报。
+// 内核新增函数时**必须同步本表**（有自测钉住，见 g4_formula_test.go）。
+var formulaFuncs = map[string]bool{
+	"sum": true, "avg": true, "min": true, "max": true, "abs": true,
+	"round": true, "coalesce": true, "count": true,
+}
+
+// BareName 把 `slot.revenue` → `revenue`、`algo.gp` → `gp`；
+// 无前缀的原样返回。这是本仓「槽 ID / 算法 ID → 公式变量名」的**唯一**约定。
+//
+// ★ 该约定此前只存在于 precomp.fieldName（算法 ID → 桶列名）里、**且只对 algo. 前缀生效**，
+// 槽侧完全没有对应实现 ⇒ 槽依赖从未真正落进 vars。
+func BareName(id string) string {
+	if i := strings.LastIndex(id, "."); i >= 0 && i+1 < len(id) {
+		return id[i+1:]
+	}
+	return id
+}
+
+// CheckFormulaVariablesBound 断言：公式里每个自由变量都能被绑定（G4 值绑定完整性）。
+//
+// 可绑定的来源只有三处，与 precomp.BuildRow 的运行时行为**逐字对应**：
+//  1. 该算法的 `depends_on_slots` 里的槽（变量名 = BareName(slotID)）；
+//  2. 该算法的 `depends_on_algos` 里显式声明的上游算法（变量名 = BareName(algoID)）——
+//     docs/03 §3.2 尾注所称「算法依赖算法」的表达方式，本字段即其落地形式；
+//  3. 桶的 `produced_by` 中**排在本算法之前**的上游算法（变量名 = BareName(algoID)）。
+//     顺序很重要：BuildRow 是「依赖在前」的串行循环，下游只能引用已算出的上游。
+//     来源 3 是**运行时的偶然可得**，来源 2 是**静态契约** —— 两者都算绑定成功，
+//     但只有来源 2 能保证不依赖桶清单的书写顺序。
+//
+// 参数：
+//   - docs：全部算法（提供 ID / Formula / DependsOnSlots / DependsOnAlgos）；
+//   - upstreamByAlgo：算法 ID → 在其**之前**已算出的算法 ID 集合（来自桶的 produced_by 拓扑序）。
+//     不在此表里的算法视为「没有上游」。
+//
+// 违规即返回人类可读原因（fail-closed）。
+func CheckFormulaVariablesBound(docs []AlgoDoc, upstreamByAlgo map[string]map[string]bool) []string {
+	var violations []string
+	for _, d := range docs {
+		if strings.EqualFold(d.Status, StatusPending) {
+			// PENDING 算法口径未定，来源尚不存在 ⇒ 不要求可绑定。
+			// 但它**必须**有非空 formula（否则「待补」是个空壳，无从判断待补什么）。
+			if strings.TrimSpace(d.Formula) == "" {
+				violations = append(violations, fmt.Sprintf(
+					"algo %s 标为 %s 但未写 formula —— 「待补」必须写明待补的是哪条公式",
+					d.ID, StatusPending))
+			}
+			continue
+		}
+		bound := map[string]bool{}
+		for _, s := range d.DependsOnSlots {
+			bound[BareName(s)] = true
+		}
+		for _, a := range d.DependsOnAlgos {
+			bound[BareName(a)] = true
+		}
+		for up := range upstreamByAlgo[d.ID] {
+			bound[BareName(up)] = true
+		}
+		for _, v := range FormulaVars(d.Formula) {
+			if bound[v] {
+				continue
+			}
+			violations = append(violations, fmt.Sprintf(
+				"algo %s 公式 %q 的自由变量 %q 无绑定来源"+
+					"（既不是 depends_on_slots 的槽名 %v，也不是 depends_on_algos 或上游算法的字段名 %v）"+
+					" ⇒ 内核按 Missing 处理，配合 missing_policy 会**静默跳过该列**",
+				d.ID, d.Formula, v, bareNames(d.DependsOnSlots),
+				mergeNames(d.DependsOnAlgos, upstreamByAlgo[d.ID])))
+		}
+	}
+	sort.Strings(violations)
+	return violations
+}
+
+func mergeNames(algos []string, upstream map[string]bool) []string {
+	set := map[string]bool{}
+	for _, a := range algos {
+		set[BareName(a)] = true
+	}
+	for a := range upstream {
+		set[BareName(a)] = true
+	}
+	out := make([]string, 0, len(set))
+	for n := range set {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func bareNames(ids []string) []string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, BareName(id))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// CheckPendingAlgosNotProducing 断言：PENDING 算法**不得**出现在任何桶的 produced_by 里。
+//
+// 为什么：PENDING 的自由变量恰好是那些「没有来源」的名字。一旦某桶把它列进
+// produced_by，运行时该列就是一条**恒空的静默列** —— 正是本次要消灭的失效形态。
+// 想让它产出，就必须先把它改成 ACTIVE 并补齐来源。
+func CheckPendingAlgosNotProducing(docs []AlgoDoc, buckets []BucketDoc) []string {
+	pending := map[string]bool{}
+	for _, d := range docs {
+		if strings.EqualFold(d.Status, StatusPending) {
+			pending[d.ID] = true
+		}
+	}
+	var violations []string
+	for _, b := range buckets {
+		for _, algo := range b.ProducedBy {
+			if pending[algo] {
+				violations = append(violations, fmt.Sprintf(
+					"桶 %s 的 produced_by 含 PENDING 算法 %s —— 其源码未定，运行时会产出恒空列；"+
+						"请先补齐该算法来源并置 status: %s，或从桶定义中移除",
+					b.ID, algo, StatusActive))
+			}
+		}
+	}
+	sort.Strings(violations)
 	return violations
 }
 

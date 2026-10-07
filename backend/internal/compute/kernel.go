@@ -17,12 +17,30 @@ import (
 	"fmt"
 	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 )
 
 // Scalar 可空标量（与 Rust scalar::Scalar 语义一致）。
 // nil 指针表示缺失（Missing）；非 nil 表示有确定数值（含 0）。
 type Scalar = *float64
+
+// BareName 把带前缀的 ID 折成本内核公式里的**变量名**：
+//
+//	slot.revenue → revenue
+//	algo.gp      → gp
+//
+// 这是「注册表 ID ↔ 公式自由变量」之间**唯一**的约定，Go 侧的唯一权威实现。
+// 内核 `spark-compute` 对查不到的变量返回 `Scalar::Missing`
+//（lib.rs: `unwrap_or(Scalar::Missing)`）—— 所以一旦这里和公式写岔了，
+// 结果是**静默取 Missing**，而不是报错。`gate.CheckFormulaVariablesBound`
+// 用同一条规则做静态校验，两侧必须同步。
+func BareName(id string) string {
+	if i := strings.LastIndex(id, "."); i >= 0 && i+1 < len(id) {
+		return id[i+1:]
+	}
+	return id
+}
 
 // Kernel 是计算内核的统一接口。
 type Kernel interface {

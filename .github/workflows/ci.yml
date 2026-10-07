@@ -112,6 +112,19 @@ jobs:
         working-directory: backend
         run: go test ./internal/slot/ -count=1 -run "Bucket" -v
 
+      # ★ 公式值绑定闸门（G4 引用完整性的**第四侧**：公式自由变量 → 槽/上游算法）
+      #   G4 前三侧只查「名字**是否存在**」（槽已注册 / 算法已注册 / 规则已注册），
+      #   而算法真正的执行载荷 —— `formula` —— 的**自由变量从没被任何断言看过**。
+      #   槽 slot.revenue 绑出的变量名是 revenue，公式却写 rev ⇒ 内核
+      #   spark-compute 对查不到的变量返回 Scalar::Missing（**不报错**），
+      #   配合 missing_policy: skip 该列在**每条数据**上被静默跳过（全空、零报错）。
+      #   本闸门上线首日即抓到 3 个真实缺陷（algo.gp / algo.gmp / algo.net_contrib）。
+      #   同一步还钉住「PENDING 算法不得入桶」与「运行时与静态闸门共用同一条
+      #   BareName 约定」（防「静态全绿、运行时全空」的最坏组合）。
+      - name: ★ 公式值绑定闸门（G4 第四侧：公式变量绑定 + PENDING 不入桶 + 接线）
+        working-directory: backend
+        run: go test ./internal/gate/ ./internal/slot/ ./internal/precomp/ -count=1 -run "Formula|BareName|Pending|Binding|Wiring" -v
+
       # ★ 规则集注册表闸门（G4 引用完整性的**第三侧**：规则 → 槽/桶）
       #   rules/*.yaml 是 docs/01 §0.3 明写的「费率/口径唯一事实源」，但在此之前
       #   **全仓没有任何代码读过它**（grep "rules/" 唯一命中是 README 的一句话）。

@@ -11,7 +11,11 @@ produced_by:
   - algo.cogs            # algorithms/cogs.yaml  ✅ 真存在（v3）
   - algo.gp              # algorithms/gp.yaml    ✅ 真存在（v3）
   - algo.gmp             # algorithms/gmp.yaml   ✅ 真存在（v3）
-  - algo.net_contrib     # algorithms/net_contrib.yaml ✅ 真存在（v1）
+  # ── ★ 2026-10-07 移除 algo.net_contrib：其口径未定（status: PENDING）──
+  #   公式 `cm2 - overhead_alloc` 的 cm2/overhead_alloc 全仓无定义 ⇒ 内核静默按
+  #   Missing 处理、整列恒空且零报错。gate.CheckPendingAlgosNotProducing 禁止
+  #   PENDING 算法入桶；待口径拍板、补齐来源并置 ACTIVE 后可恢复。
+  #   - algo.net_contrib
   # ── ★ 在 algorithms/ 下缺失、已从本清单**移除**（否则引用完整性校验失败）──
   #   如需恢复，须先在 algorithms/ 下补出对应 YAML（公式与依赖槽见 docs/03 §3.2）：
   #     - algo.rev          收入 Σ(qty×unit_price)                     依赖 slot.qty slot.revenue
@@ -25,7 +29,7 @@ algo_versions:
   algo.gp: 3
   algo.gmp: 3
   algo.cogs: 3
-  algo.net_contrib: 1
+  # algo.net_contrib: 2   # ★ 已随 produced_by 一并移除（PENDING，见上）
 # ★ 2026-10-07 补齐（G4 引用完整性第三方向的关把点）：
 #   本字段此前**无人校验** —— `gate.CheckBucketProducersRegistered` 只查
 #   `produced_by` 与 `algo_versions` 里的**算法**，`rule_versions` 里的**规则名**

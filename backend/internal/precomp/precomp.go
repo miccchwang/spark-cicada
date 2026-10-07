@@ -109,9 +109,29 @@ func (b *Builder) BuildRow(ctx context.Context, def BucketDef, inputs map[string
 
 	out := &RowResult{Keys: map[string]string{}}
 	// 计算上下文：已算出的上游算法结果也作为变量，供下游公式引用
+	//
+	// ★ 变量命名约定（本函数与 gate.CheckFormulaVariablesBound 必须一致）：
+	//   * 槽 `slot.revenue`   → 变量名 `revenue`（BareName）
+	//   * 算法 `algo.gp`      → 变量名 `gp`（fieldName）
+	//   此前 **槽侧没有任何绑定**：`inputs` 由调用方给出，其键名是事实表的列名，
+	//   与公式里的名字毫无约束关系 ⇒ 像 `algo.gp` 公式 `rev - cogs` 里的 `rev`
+	//   永远取不到值，内核按 Missing 处理，配合 missing_policy=skip 让整列静默为空。
+	//   现按 BareName 显式绑定一遍槽变量（同名时以调用方 inputs 为准，保持既有语义）。
 	vars := map[string]compute.Scalar{}
 	for k, v := range inputs {
 		vars[k] = v
+	}
+	for _, a := range algos {
+		for _, s := range a.DependsOnSlots {
+			name := compute.BareName(s)
+			if _, given := vars[name]; given {
+				continue // 调用方显式给了同名原子量 ⇒ 尊重
+			}
+			if v, ok := inputs[s]; ok {
+				// 也接受「用完整槽 ID 作键」的调用形态
+				vars[name] = v
+			}
+		}
 	}
 
 	// 按定义顺序执行（依赖在前）

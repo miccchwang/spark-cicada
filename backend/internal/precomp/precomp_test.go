@@ -14,16 +14,16 @@ func (fakeKernel) EvalFormula(_ context.Context, formula string, vars map[string
 	// 只支持测试所需的最小公式集，模拟 Rust 内核的 fail-closed 语义
 	get := func(k string) (*float64, bool) { v, ok := vars[k]; return v, ok }
 	switch formula {
-	case "rev - cogs":
-		rev, ok1 := get("rev")
+	case "revenue - cogs":
+		rev, ok1 := get("revenue")
 		cogs, ok2 := get("cogs")
 		if !ok1 || !ok2 || rev == nil || cogs == nil {
 			return nil, nil // 缺失 → nil（不补 0）
 		}
 		r := *rev - *cogs
 		return &r, nil
-	case "rev == 0 ? null : gp / rev":
-		rev, ok1 := get("rev")
+	case "revenue == 0 ? null : gp / revenue":
+		rev, ok1 := get("revenue")
 		gp, ok2 := get("gp")
 		if !ok1 || !ok2 || rev == nil || gp == nil {
 			return nil, nil
@@ -66,8 +66,8 @@ func newBuilder(slots []precomp.SlotState) *precomp.Builder {
 			defs := map[string]precomp.AlgoDef{
 				"algo.rev":   {ID: "algo.rev", Version: 1, Formula: "rev", MissingPolicy: "skip"},
 				"algo.cogs":  {ID: "algo.cogs", Version: 3, Formula: "rev - cogs", DependsOnSlots: []string{"slot.qty", "slot.cost_unit"}, MissingPolicy: "skip"},
-				"algo.gp":    {ID: "algo.gp", Version: 3, Formula: "rev - cogs", DependsOnSlots: []string{"slot.revenue", "slot.cogs"}, MissingPolicy: "skip"},
-				"algo.gmp":   {ID: "algo.gmp", Version: 3, Formula: "rev == 0 ? null : gp / rev", DependsOnSlots: []string{"slot.revenue", "slot.gp"}, MissingPolicy: "skip"},
+				"algo.gp":    {ID: "algo.gp", Version: 3, Formula: "revenue - cogs", DependsOnSlots: []string{"slot.revenue", "slot.cogs"}, MissingPolicy: "skip"},
+				"algo.gmp":   {ID: "algo.gmp", Version: 3, Formula: "revenue == 0 ? null : gp / revenue", DependsOnSlots: []string{"slot.revenue", "slot.gp"}, MissingPolicy: "skip"},
 				"algo.net_contrib": {ID: "algo.net_contrib", Version: 1, Formula: "cm2 - overhead_alloc",
 					DependsOnSlots: []string{"slot.platform_fee", "slot.ad_spend", "slot.affiliate"}, MissingPolicy: "skip"},
 			}
@@ -92,7 +92,7 @@ func TestBuildRow_GP(t *testing.T) {
 	})
 	def := precomp.BucketDef{ID: "pnl_month", ProducedBy: []string{"algo.gp"}}
 	row, err := b.BuildRow(context.Background(), def, map[string]*float64{
-		"rev": f(1000), "cogs": f(620),
+		"revenue": f(1000), "cogs": f(620),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -112,7 +112,7 @@ func TestBuildRow_SkipsWhenCoverageLow(t *testing.T) {
 		{ID: "slot.cogs", Status: "ACTIVE", Coverage: 0.60, Gate: 0.80}, // 低于门限
 	})
 	def := precomp.BucketDef{ID: "pnl_month", ProducedBy: []string{"algo.gp"}}
-	row, err := b.BuildRow(context.Background(), def, map[string]*float64{"rev": f(1000), "cogs": f(620)})
+	row, err := b.BuildRow(context.Background(), def, map[string]*float64{"revenue": f(1000), "cogs": f(620)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestBuildRow_GMPZeroDenominator(t *testing.T) {
 		{ID: "slot.gp", Status: "ACTIVE", Coverage: 0.99, Gate: 0.80},
 	})
 	def := precomp.BucketDef{ID: "pnl_month", ProducedBy: []string{"algo.gmp"}}
-	row, err := b.BuildRow(context.Background(), def, map[string]*float64{"rev": f(0), "gp": f(30)})
+	row, err := b.BuildRow(context.Background(), def, map[string]*float64{"revenue": f(0), "gp": f(30)})
 	if err != nil {
 		t.Fatal(err)
 	}

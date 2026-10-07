@@ -75,9 +75,19 @@ type Algorithm struct {
 	Unit           string   `yaml:"unit"`
 	Permission     string   `yaml:"permission"`
 	DependsOnSlots []string `yaml:"depends_on_slots"`
-	WritesBucket   string   `yaml:"writes_bucket"`
-	MissingPolicy  string   `yaml:"missing_policy"`
-	Trace          bool     `yaml:"trace"`
+	// DependsOnAlgos 声明「算法依赖算法」（docs/03 §3.2 尾注的待决策项）。
+	//
+	// ★ 为什么必须有这个字段（2026-10-07 实测缺陷）：
+	//   `algo.net_contrib` 的公式是 `cm2 - overhead_alloc`，其中 `cm2` 是
+	//   **上游算法**的字段。但此前 AlgoDef **没有任何地方能声明该依赖** ——
+	//   绑定只能靠桶 `produced_by` 的书写顺序偶然成立。桶清单少一个算法、
+	//   或顺序写反，公式就在**每条数据**上静默取 Missing（整列空、零报错）。
+	DependsOnAlgos []string `yaml:"depends_on_algos"`
+	// Status 实现状态：缺省 ACTIVE；口径未定/实现待补写 PENDING（见 gate.StatusPending）。
+	Status        string `yaml:"status"`
+	WritesBucket  string `yaml:"writes_bucket"`
+	MissingPolicy string `yaml:"missing_policy"`
+	Trace         bool   `yaml:"trace"`
 
 	// Raw 保留原始键（G4 用它探测 source/table/sql 等数据源字段）。
 	Raw map[string]any `yaml:"-"`
@@ -149,13 +159,15 @@ func (r *Registry) AlgoDocs() []gate.AlgoDoc {
 			ID:             a.ID,
 			Formula:        a.Formula,
 			DependsOnSlots: a.DependsOnSlots,
+			DependsOnAlgos: a.DependsOnAlgos,
+			Status:         a.Status,
 			Raw:            a.Raw,
 		})
 	}
 	return out
 }
 
-// Validate 用 **gate 的两条 G4 判定函数**校验注册表本身。
+// Validate 用 **gate 的多条 G4 判定函数**校验注册表本身。
 //
 // ★ 这是 G4 闸门第一次被生产代码调用：判定的对象是**磁盘上的真 YAML**，
 // 而不是测试里手搓的假数据。违规即返回 error（fail-closed）。
@@ -164,6 +176,17 @@ func (r *Registry) Validate() error {
 	var violations []string
 	violations = append(violations, gate.CheckAlgorithmNoDataSource(docs)...)
 	violations = append(violations, gate.CheckSlotsRegistered(docs, r.RegisteredSlotIDs())...)
+	// 算法 → 算法 的引用完整性（depends_on_algos 必须指向已注册算法）。
+	// 与 CheckSlotsRegistered 对称；缺了它，`depends_on_algos: [algo.ghost]`
+	// 会被当作「已声明依赖」从而让绑定校验放行一个根本不存在的来源。
+	for _, a := range r.Algorithms() {
+		for _, up := range a.DependsOnAlgos {
+			if _, ok := r.algos[up]; !ok {
+				violations = append(violations, fmt.Sprintf(
+					"algo %s 的 depends_on_algos 引用未注册算法 %q", a.ID, up))
+			}
+		}
+	}
 	if len(violations) > 0 {
 		return fmt.Errorf("槽注册表校验失败（G4）：\n  - %s", strings.Join(violations, "\n  - "))
 	}

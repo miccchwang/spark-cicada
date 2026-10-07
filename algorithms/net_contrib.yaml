@@ -1,7 +1,26 @@
 # algorithms/net_contrib.yaml —— 净贡献
+#
+# ★ 2026-10-07 状态修正：本算法口径**未定**，如实标为 PENDING。
+#   公式 `cm2 - overhead_alloc` 里的两个自由变量全仓无定义：
+#     * `cm2` —— 上游算法 `algo.cm2`，其本身依赖 `algo.cm1` → `algo.marketing`，
+#       三者均「⚠️ 待补 YAML」（docs/03 §3.2）；「算法依赖算法」的表达方式
+#       在 docs/03 §3.2 尾注里被明标为**待决策项**；
+#     * `overhead_alloc` —— 在 docs/ slots/ rules/ buckets/ 下**搜不到任何定义**。
+#   内核 `spark-compute` 对查不到的变量返回 `Scalar::Missing`
+#   （lib.rs: `unwrap_or(scalar::Scalar::Missing)`，**不报错**）⇒ 配合
+#   missing_policy=skip，本算法在**每条数据**上都被静默跳过：
+#   `net_contrib` 列永远为空、全程零报错。这是本次 G4 值绑定闸门首次上线
+#   就抓到的真实缺陷，见 docs/06 待办（NET-CONTRIB 来源待定）。
+#
+#   本版**不臆造来源**（口径①单一事实源不容污染）：
+#     - status: PENDING  ⇒ 绑定闸门不要求其变量可绑定，但要求 formula 非空；
+#     - 同时由 gate.CheckPendingAlgosNotProducing 禁止任何桶引用它
+#       （已从 buckets/pnl_month.yaml 的 produced_by 移除）。
+#   待 `algo.cm2` / `slot.overhead_alloc` 口径拍板后可改回 ACTIVE 并重新入桶。
 id: algo.net_contrib
 name: 净贡献
-version: 1
+version: 2
+status: PENDING
 formula: "cm2 - overhead_alloc"
 unit: THB
 permission: L3
@@ -11,9 +30,14 @@ depends_on_slots:
   - slot.affiliate
   - slot.shipping
   - slot.mkt_expense
+# ★ 「算法依赖算法」的显式声明位置（docs/03 §3.2 尾注所称「需另行定义」的表达方式）。
+#   待 algo.cm2 补齐 YAML 后启用：
+# depends_on_algos:
+#   - algo.cm2
 writes_bucket: pnl_month
 missing_policy: skip
 trace: true
 notes: |
-  依赖 slot.affiliate（达人佣金）当前为 MISSING，故多数粒度会被跳过。
-  这是预期行为（fail-closed），不得用 0 补齐导致净贡献虚高。
+  口径未定（见文件头）。当前 PENDING，不参与任何桶产出，也不会被静默跳过成空列。
+  依赖 slot.affiliate（达人佣金）当前为 MISSING —— 即便口径拍板后，多数粒度仍会被
+  跳过；这是预期行为（fail-closed），不得用 0 补齐导致净贡献虚高。
