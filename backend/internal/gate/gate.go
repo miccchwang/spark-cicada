@@ -476,6 +476,121 @@ func CheckBucketRuleVersionsRegistered(docs []BucketDoc, registeredRules map[str
 	return violations
 }
 
+// ──────────────────────── G4 · 槽的采集时效（freshness）声明 ────────────────────────
+
+// FreshnessDoc 是槽的**采集时效声明**（对应 slots/*.yaml 的 `freshness` 键）。
+//
+// 为什么单列一条而不是并进 coverage 那侧：这两者回答的是**两个不同的问题** ——
+//
+//	coverage_gate 答「这一份数据**全不全**」（覆盖率够不够）；
+//	freshness     答「这一份数据**新不新**」（距上次成功采集多久算过期）。
+//
+// 一份覆盖率 100% 但停在两周前的快照，跑出来的 P&L 是**旧的**且没有任何信号。
+// 本仓此前对 `freshness` 的处理是：**解析成一个字符串，然后放进数据库，再没有任何人读它**
+// （实为第十二个变种：**声明被读进来、却从没有任何判定消费它**）。
+// 于是 `freshness: 7d` 与 `freshness: garbage` 在行为上**完全等价** —— 都是「不影响任何事」。
+type FreshnessDoc struct {
+	// SlotID 槽 ID（报错时可定位）。
+	SlotID string
+	// Raw 声明原文（如 `1d` / `7d`）。
+	Raw string
+}
+
+// CheckFreshnessDeclared 断言每个槽都声明了**可解析**的采集时效（G4 / docs/03 §2.3）。
+//
+// 校验口径（有意保守 —— 只认「明确无歧义」的写法）：
+//   - 必须非空（缺声明 ⇒ 过期时无判据，静默接受陈旧数据）；
+//   - 形如 `<正整数><单位>`，单位 ∈ {m,h,d,w}（分/时/天/周）；
+//   - `0d` 之类非正数一律拒（时效必须为正，否则等于「永远过期」）；
+//   - 不认 `daily` / `1 day` / `7天` 等自由文本 —— 它们看起来合理，
+//     但解析器拿不到时长，最终还是会退化成「不影响任何事」。
+//
+// 返回人类可读原因（fail-closed：无法确认时效 ⇒ 不视为合规）。
+func CheckFreshnessDeclared(docs []FreshnessDoc) []string {
+	var violations []string
+	for _, d := range docs {
+		raw := strings.TrimSpace(d.Raw)
+		if raw == "" {
+			violations = append(violations, fmt.Sprintf(
+				"槽 %s 未声明 freshness —— 采集停滞时无判据，陈旧数据会被当作最新数据使用", d.SlotID))
+			continue
+		}
+		if _, ok := ParseFreshness(raw); !ok {
+			violations = append(violations, fmt.Sprintf(
+				"槽 %s 的 freshness=%q 不可解析（应形如 1d/7d/12h/30m/2w 的正整数+单位；"+
+					"自由文本如 daily/7天 会让时效判定退化为「不影响任何事」）", d.SlotID, raw))
+		}
+	}
+	sort.Strings(violations)
+	return violations
+}
+
+// freshUnits 是允许的时效单位（唯一权威表）。
+//
+// ★ 与 slot 包共用：`slot.FreshnessDuration` 必须引用本表所定义的单位集合，
+// 不得另立一份（有闸门断言两处口径一致，防止解析器与校验器分叉）。
+var freshUnits = map[string]string{
+	"m": "分钟", "h": "小时", "d": "天", "w": "周",
+}
+
+// FreshnessUnits 暴露允许的单位集合（供接线闸门比对，防两侧漂移）。
+func FreshnessUnits() map[string]bool {
+	out := make(map[string]bool, len(freshUnits))
+	for u := range freshUnits {
+		out[u] = true
+	}
+	return out
+}
+
+// ParseFreshness 解析 `<正整数><单位>` 形式的时效声明，返回**分钟数**。
+//
+// 为什么返回分钟而不是 time.Duration：
+//
+//	本包纪律是「零副作用、纯函数、可被 cmd 复用」，不能依赖 time 包的
+//	隐式行为（例如 Duration 溢出）。分钟是整数、无溢出风险，
+//	且足够表达本仓实际量级（1d = 1440 分钟）。
+//
+// ★ 不接受小数（`1.5d`）：不是不能算，而是**口径要唯一**。
+//   若将来真需要，必须在此显式扩展并同步 docs —— 而非让每个调用方各自四舍五入。
+func ParseFreshness(raw string) (int, bool) {
+	s := strings.TrimSpace(strings.ToLower(raw))
+	if s == "" {
+		return 0, false
+	}
+	unit := s[len(s)-1:]
+	mult, ok := freshUnits[unit]
+	if !ok {
+		return 0, false
+	}
+	_ = mult
+	digits := s[:len(s)-1]
+	if digits == "" {
+		return 0, false
+	}
+	n := 0
+	for i := 0; i < len(digits); i++ {
+		c := digits[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int(c-'0')
+	}
+	if n <= 0 {
+		return 0, false // 时效必须为正：0 或 00 都是「永远过期」，非法
+	}
+	switch unit {
+	case "m":
+		return n, true
+	case "h":
+		return n * 60, true
+	case "d":
+		return n * 24 * 60, true
+	case "w":
+		return n * 7 * 24 * 60, true
+	}
+	return 0, false
+}
+
 // ───────────────────────────── G5 · 覆盖率门控 ─────────────────────────────
 
 // CoverageCase 覆盖率门控的判定输入。
@@ -495,8 +610,26 @@ type CoverageVerdict struct {
 // DecideCoverage 依据覆盖率与槽状态决定是否跳过（G5）。
 //
 // 门控规则（与 Rust gate::coverage_gate 一致）：
-//   - 状态 MISSING/DISABLED ⇒ 硬不可用，跳过
+//   - 状态 MISSING/DISABLED ⇒ 硬不可用，跳过（无权威来源，覆盖率无意义）
 //   - coverage < gate ⇒ 跳过（不补 0、不摊分）
+//   - 状态 DEGRADED ⇒ 跳过（软不可用：数据不全或已过期）
+//
+// ★ 2026-10-07 修正两处**实现与自身口径分叉**：
+//
+//	① 原实现只对 `MISSING` / `DISABLED` 硬跳过，而注释与 docs/03 §2.1 都写着
+//	   `DEGRADED` 属「硬不可用」—— 于是任何把槽判成 DEGRADED 的上游
+//	   （既有「覆盖率不足」路径、本轮新增「数据过期」路径）都只能**报个状态**，
+//	   实际并不会让它被跳过。
+//	② 判定顺序反了：原先先看状态再看覆盖率，而 `runtimeStatus` 恰恰**就是**
+//	   「coverage < gate ⇒ DEGRADED」的产物 ⇒ 走这条路径时永远先撞上状态分支，
+//	   `coverage < gate` 那条独立判断**从未被执行过**；报出的原因也从
+//	   「coverage 0.4200 < gate 0.8000」（可行动）退化成「status=DEGRADED」（不可行动）。
+//	   现改为**覆盖率优先**：只要数值不达标就先报数值，状态只作为覆盖率之外的第二道原因。
+//
+// 判定口径（顺序即语义，勿随意调换）：
+//  1. MISSING/DISABLED —— 无来源，压过一切；
+//  2. coverage < gate —— 数值不过关，原因含具体数值；
+//  3. DEGRADED —— 覆盖率过关但数据陈旧/不全（如本轮的新鲜度超期）。
 func DecideCoverage(cases []CoverageCase) CoverageVerdict {
 	for _, c := range cases {
 		switch c.Status {
@@ -506,6 +639,10 @@ func DecideCoverage(cases []CoverageCase) CoverageVerdict {
 		if c.Coverage < c.Gate {
 			return CoverageVerdict{true, fmt.Sprintf(
 				"slot %s coverage %.4f < gate %.4f", c.SlotID, c.Coverage, c.Gate)}
+		}
+		if c.Status == "DEGRADED" {
+			return CoverageVerdict{true, fmt.Sprintf(
+				"slot %s status=DEGRADED（覆盖率 %.4f 达标但数据已过期/不全）", c.SlotID, c.Coverage)}
 		}
 	}
 	return CoverageVerdict{false, ""}

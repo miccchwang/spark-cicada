@@ -96,7 +96,15 @@ jobs:
       #   「这些判定函数必须有非测试调用点」。
       #   在此之前它们全仓**没有任何生产调用点** ⇒ 四条闸门恒真、YAML 从没被扫过。
       #   已实测抓到真缺陷：algo.gmp 把算法 algo.gp 当数据槽 slot.gp 依赖（分类错误）。
-      - name: ★ 数据槽注册表闸门（G2/G3/G4/G5 真读 YAML + 接线）
+      #
+      #   ★ 同一步覆盖「槽的采集时效闭环」（2026-10-07 第二轮，第十三个变种）：
+      #     slots/*.yaml 的 freshness 此前**被读、被写进 DB、然后没有任何判定消费它** ——
+      #     `freshness: 7d` 与 `freshness: 想写什么写什么` 行为完全等价，
+      #     于是一份覆盖率 100% 但停在三个月前的快照会被照常采用（报表给出旧数字）。
+      #     现由 gate.CheckFreshnessDeclared（声明层，自由文本即加载失败）
+      #     + slot.CheckFreshness / Cases / Judge（判活：过期 ⇒ DEGRADED ⇒ 算法 skip）关把，
+      #     无读数按过期处理（fail-closed）。见 freshness_test.go。
+      - name: ★ 数据槽注册表闸门（G2/G3/G4/G5 真读 YAML + 接线 + freshness 时效）
         working-directory: backend
         run: go test ./internal/slot/ -count=1 -v
 

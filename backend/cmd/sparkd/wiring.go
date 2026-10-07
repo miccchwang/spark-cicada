@@ -367,6 +367,25 @@ func (p *dataPlane) loadSpecs(specDir string) {
 		p.specIssues = append(p.specIssues,
 			"rule→bucket mapping is empty: G6 rule drift will never mark any bucket stale")
 	}
+
+	// ★ 槽的「采集时效」必须逐条可解析（G4 / docs/03 §2.3）。
+	//
+	// 为什么在**进程内**再核一次（注册表加载时已核过）：装载注册表一旦失败会
+	// `return`，后面四个注册表都不再装载；而这里是一次**独立的、只读的**复核，
+	// 确保「时效声明可解析」这一条在 sparkd 的 healthz 里**始终**有据可查，
+	// 不依赖前面那条 return 路径的成败。
+	//
+	// ★ 同时这也是 `freshness` 判活（slot.CheckFreshness）的**前置条件**：
+	//   时效不可解析 ⇒ 判活只能 fail-closed 把所有槽判过期。
+	//   与其让运行期悄悄全量跳过，不如启动时就把问题摆到 healthz 上。
+	if bad := gate.CheckFreshnessDeclared(reg.FreshnessDocs()); len(bad) > 0 {
+		for _, b := range bad {
+			p.specIssues = append(p.specIssues, "slot freshness: "+b)
+		}
+		log.Printf("[warn] 槽的 freshness 声明有问题（%d 条），已进 healthz", len(bad))
+	} else {
+		log.Printf("[spec] 槽的采集时效声明全部可解析（freshness 判活已就绪）")
+	}
 }
 
 // envOr 读取环境变量（带默认值）。

@@ -229,6 +229,7 @@ name: 成本
 source_kind: master_table
 source_ref: cost_master.v2
 coverage_gate: 0.80
+freshness: 7d
 permission: L4
 status: AVAILABLE
 `)
@@ -243,17 +244,24 @@ depends_on_slots: [slot.cost]
 		t.Fatal(err)
 	}
 
-	// ① 覆盖率达标（0.93 ≥ 0.80）⇒ 不跳过
+	// ★ 2026-10-07：本用例只聚焦「覆盖率」这一维，故**必须显式提供新鲜度读数**。
+	// 否则过期判定（fail-closed：无读数即过期）会先一步把槽判掉，
+	// 掩盖掉本用例真正要测的覆盖率行为 —— 那样断言即便「通过」也测错了对象。
+	fresh := map[string]int{"slot.cost": 60} // 1 小时龄，远小于声明的 7d
+
+	// ① 覆盖率达标（0.93 ≥ 0.80）且数据新鲜 ⇒ 不跳过
 	okVerdicts := r.JudgesForAlgorithm(slot.Observation{
-		Coverage: map[string]float64{"slot.cost": 0.93},
+		Coverage:   map[string]float64{"slot.cost": 0.93},
+		AgeMinutes: fresh,
 	})
 	if len(okVerdicts) != 1 || okVerdicts[0].Skip {
-		t.Fatalf("覆盖率达标不应 skip，实际 %+v", okVerdicts)
+		t.Fatalf("覆盖率达标且数据新鲜不应 skip，实际 %+v", okVerdicts)
 	}
 
 	// ② 覆盖率不足（0.42 < 0.80）⇒ 跳过，且原因可读
 	lowVerdicts := r.JudgesForAlgorithm(slot.Observation{
-		Coverage: map[string]float64{"slot.cost": 0.42},
+		Coverage:   map[string]float64{"slot.cost": 0.42},
+		AgeMinutes: fresh,
 	})
 	if len(lowVerdicts) != 1 || !lowVerdicts[0].Skip {
 		t.Fatalf("覆盖率不足应 skip，实际 %+v", lowVerdicts)
@@ -261,11 +269,17 @@ depends_on_slots: [slot.cost]
 	if lowVerdicts[0].Reason == "" {
 		t.Fatal("skip 必须携带可读原因（可审计）")
 	}
+	// 跳过的原因必须指向**覆盖率**，而不是被其它维度抢先导致（否则本用例名不副实）
+	if !strings.Contains(lowVerdicts[0].Reason, "coverage") &&
+		!strings.Contains(lowVerdicts[0].Reason, "覆盖率") {
+		t.Fatalf("本用例期望因覆盖率不足而跳过，实际原因: %q", lowVerdicts[0].Reason)
+	}
 
 	// ③ 显式 MISSING ⇒ 硬跳过
 	missVerdicts := r.JudgesForAlgorithm(slot.Observation{
-		Coverage: map[string]float64{"slot.cost": 0.99},
-		Status:   map[string]string{"slot.cost": slot.StatusMissing},
+		Coverage:   map[string]float64{"slot.cost": 0.99},
+		Status:     map[string]string{"slot.cost": slot.StatusMissing},
+		AgeMinutes: fresh,
 	})
 	if !missVerdicts[0].Skip {
 		t.Fatal("显式 MISSING 应硬跳过（即便覆盖率很高）")
@@ -285,6 +299,7 @@ name: 槽
 source_kind: api
 source_ref: x
 coverage_gate: 0.50
+freshness: 1d
 permission: L3
 status: AVAILABLE
 `)
@@ -325,6 +340,7 @@ name: 部分
 source_kind: api
 source_ref: x
 coverage_gate: 0.90
+freshness: 1d
 permission: L4
 status: PARTIAL
 `)
@@ -338,13 +354,22 @@ depends_on_slots: [slot.p]
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 覆盖率回到门限之上 ⇒ 可用
-	good := r.Judge(slot.Observation{Coverage: map[string]float64{"slot.p": 0.95}})
+	// ★ 同上：本用例聚焦覆盖率，须显式给出新鲜度读数（否则会被过期判定抢先判掉）。
+	fresh := map[string]int{"slot.p": 30}
+
+	// 覆盖率回到门限之上 + 数据新鲜 ⇒ 可用（静态 PARTIAL 不阻断运行时事实）
+	good := r.Judge(slot.Observation{
+		Coverage:   map[string]float64{"slot.p": 0.95},
+		AgeMinutes: fresh,
+	})
 	if good[0].Skip {
-		t.Fatalf("覆盖率达标不应 skip，实际 %+v", good[0])
+		t.Fatalf("覆盖率达标且数据新鲜不应 skip，实际 %+v", good[0])
 	}
 	// 覆盖率低于门限 ⇒ skip
-	bad := r.Judge(slot.Observation{Coverage: map[string]float64{"slot.p": 0.88}})
+	bad := r.Judge(slot.Observation{
+		Coverage:   map[string]float64{"slot.p": 0.88},
+		AgeMinutes: fresh,
+	})
 	if !bad[0].Skip {
 		t.Fatalf("覆盖率不足应 skip，实际 %+v", bad[0])
 	}

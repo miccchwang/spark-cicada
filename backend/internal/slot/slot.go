@@ -167,6 +167,26 @@ func (r *Registry) AlgoDocs() []gate.AlgoDoc {
 	return out
 }
 
+// FreshnessDoc 返回全部槽的采集时效声明，供 gate.CheckFreshnessDeclared 判定。
+//
+// ★ 这是「槽的 freshness 必须可解析」这条断言第一次拿到**磁盘上的真值**。
+func (r *Registry) FreshnessDocs() []gate.FreshnessDoc {
+	out := make([]gate.FreshnessDoc, 0, len(r.order))
+	for _, id := range r.order {
+		s := r.slots[id]
+		out = append(out, gate.FreshnessDoc{SlotID: s.ID, Raw: s.Freshness})
+	}
+	return out
+}
+
+// FreshnessMinutes 把槽的 freshness 声明解析为分钟数（第二返回值 false = 不可解析）。
+//
+// 解析实现**委托** gate.ParseFreshness —— 单位集合只有一份权威表（gate.freshUnits），
+// 防止「校验器认 1d、判活器不认 1d」这类分叉静默发生。
+func (s Slot) FreshnessMinutes() (int, bool) {
+	return gate.ParseFreshness(s.Freshness)
+}
+
 // Validate 用 **gate 的多条 G4 判定函数**校验注册表本身。
 //
 // ★ 这是 G4 闸门第一次被生产代码调用：判定的对象是**磁盘上的真 YAML**，
@@ -176,6 +196,14 @@ func (r *Registry) Validate() error {
 	var violations []string
 	violations = append(violations, gate.CheckAlgorithmNoDataSource(docs)...)
 	violations = append(violations, gate.CheckSlotsRegistered(docs, r.RegisteredSlotIDs())...)
+	// 槽的采集时效必须显式且可解析（G4 / docs/03 §2.3）。
+	//
+	// ★ 此前 `freshness` 是**被读进来、但没有任何判定消费**的一个字符串：
+	// 解析进 Slot.Freshness → 写进 DB → 此后全仓无人再读。于是
+	// `freshness: 7d` 与 `freshness: 随便写` 在行为上完全等价 ——
+	// 都是「不影响任何事」。这条断言把「时效」从装饰字段变成**必须成立的前提**，
+	// 并由 coverage.go 的真正判活（超期 ⇒ DEGRADED ⇒ skip）接手。
+	violations = append(violations, gate.CheckFreshnessDeclared(r.FreshnessDocs())...)
 	// 算法 → 算法 的引用完整性（depends_on_algos 必须指向已注册算法）。
 	// 与 CheckSlotsRegistered 对称；缺了它，`depends_on_algos: [algo.ghost]`
 	// 会被当作「已声明依赖」从而让绑定校验放行一个根本不存在的来源。
