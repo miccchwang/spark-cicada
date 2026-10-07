@@ -76,6 +76,7 @@ status: AVAILABLE
 			writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
 permission: L3
+unit: THB
 formula: "1"
 depends_on_slots: [slot.a]
 `)
@@ -119,6 +120,7 @@ status: AVAILABLE
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
 permission: L3
+unit: THB
 formula: "1"
 depends_on_slots: [slot.nofresh]
 `)
@@ -158,6 +160,7 @@ status: AVAILABLE
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
 permission: L3
+unit: THB
 formula: "1"
 depends_on_slots: [slot.fresh]
 `)
@@ -248,6 +251,7 @@ status: AVAILABLE
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
 permission: L3
+unit: THB
 formula: "1"
 depends_on_slots: [slot.a]
 `)
@@ -297,6 +301,7 @@ status: AVAILABLE
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
 permission: L3
+unit: THB
 formula: "1"
 depends_on_slots: [slot.a]
 `)
@@ -337,6 +342,7 @@ status: MISSING
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
 permission: L3
+unit: THB
 formula: "1"
 depends_on_slots: [slot.m]
 `)

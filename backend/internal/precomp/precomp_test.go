@@ -64,11 +64,11 @@ func newBuilder(slots []precomp.SlotState) *precomp.Builder {
 		},
 		Algos: func(_ context.Context, ids []string) ([]precomp.AlgoDef, error) {
 			defs := map[string]precomp.AlgoDef{
-				"algo.rev":   {ID: "algo.rev", Version: 1, Formula: "rev", MissingPolicy: "skip"},
-				"algo.cogs":  {ID: "algo.cogs", Version: 3, Formula: "rev - cogs", DependsOnSlots: []string{"slot.qty", "slot.cost_unit"}, MissingPolicy: "skip"},
-				"algo.gp":    {ID: "algo.gp", Version: 3, Formula: "revenue - cogs", DependsOnSlots: []string{"slot.revenue", "slot.cogs"}, MissingPolicy: "skip"},
-				"algo.gmp":   {ID: "algo.gmp", Version: 3, Formula: "revenue == 0 ? null : gp / revenue", DependsOnSlots: []string{"slot.revenue", "slot.gp"}, MissingPolicy: "skip"},
-				"algo.net_contrib": {ID: "algo.net_contrib", Version: 1, Formula: "cm2 - overhead_alloc",
+				"algo.rev":   {ID: "algo.rev", Version: 1, Formula: "rev", Unit: "THB", MissingPolicy: "skip"},
+				"algo.cogs":  {ID: "algo.cogs", Version: 3, Formula: "rev - cogs", Unit: "THB", DependsOnSlots: []string{"slot.qty", "slot.cost_unit"}, MissingPolicy: "skip"},
+				"algo.gp":    {ID: "algo.gp", Version: 3, Formula: "revenue - cogs", Unit: "THB", DependsOnSlots: []string{"slot.revenue", "slot.cogs"}, MissingPolicy: "skip"},
+				"algo.gmp":   {ID: "algo.gmp", Version: 3, Formula: "revenue == 0 ? null : gp / revenue", Unit: "percent", DependsOnSlots: []string{"slot.revenue", "slot.gp"}, MissingPolicy: "skip"},
+				"algo.net_contrib": {ID: "algo.net_contrib", Version: 1, Formula: "cm2 - overhead_alloc", Unit: "THB",
 					DependsOnSlots: []string{"slot.platform_fee", "slot.ad_spend", "slot.affiliate"}, MissingPolicy: "skip"},
 			}
 			var out []precomp.AlgoDef
@@ -186,5 +186,76 @@ func TestFieldName(t *testing.T) {
 		if got := precomp.FieldName(in); got != want {
 			t.Fatalf("FieldName(%q)=%q want %q", in, got, want)
 		}
+	}
+}
+
+// ★ 单位随单元格产出（G4 第九侧的下游一半）。
+//
+// 为什么必须有这条：`AlgoDef.Unit` 在此之前是**结构性死字段** ——
+// 它被解析、被写进 registry_algorithm.unit，但 precomp.go 从头到尾没读过一次
+// （BuildRow 只消费 Formula / DependsOnSlots / MissingPolicy）。于是
+// 「algo.gmp 的单位是比率」这条事实**永远到不了**渲染/导出层，
+// 页面上就会出现 `0.42 THB` 这种静默错误口径。
+//
+// 本用例钉住「产出的单元格真的带单位」，让「有人把 Unit 那行删掉」变成可检出的破坏
+// （注入自测实测：删掉那行时，本用例**必须**红）。
+func TestBuildRow_CarriesUnit(t *testing.T) {
+	b := newBuilder([]precomp.SlotState{
+		{ID: "slot.revenue", Status: "ACTIVE", Coverage: 0.99, Gate: 0.80},
+		{ID: "slot.cogs", Status: "ACTIVE", Coverage: 0.95, Gate: 0.80},
+	})
+	// 金额算法：unit: THB
+	def := precomp.BucketDef{ID: "pnl_month", ProducedBy: []string{"algo.gp"}}
+	row, err := b.BuildRow(context.Background(), def, map[string]*float64{
+		"revenue": f(1000), "cogs": f(620),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(row.Cells) != 1 {
+		t.Fatalf("期望 1 个单元格，得 %d", len(row.Cells))
+	}
+	if got := row.Cells[0].Unit; got != "THB" {
+		t.Fatalf("algo.gp 的单元格单位应为 THB，得 %q —— 单位没被带出来（死字段）", got)
+	}
+	// 结构化输出：Units() 必须能被下游直接消费。
+	units := row.Units()
+	if units["gp"] != "THB" {
+		t.Fatalf("Units() 应含 gp=THB，得 %v", units)
+	}
+
+	// 比率算法：unit: percent ⇒ 归一到 %，且**不被**当成金额
+	def2 := precomp.BucketDef{ID: "pnl_month", ProducedBy: []string{"algo.gmp"}}
+	row2, err := b.BuildRow(context.Background(), def2, map[string]*float64{
+		"revenue": f(1000), "gp": f(380),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(row2.Cells) != 1 {
+		t.Fatalf("期望 1 个单元格，得 %d", len(row2.Cells))
+	}
+	if got := row2.Cells[0].Unit; got != "%" {
+		t.Fatalf("algo.gmp（percent）应归一到 %%，得 %q", got)
+	}
+}
+
+// 跳过（skipped）的单元格**也要带单位** ——
+// 下游按单位决定 null 的展示形态（`— THB` vs `— %`），漏掉会让空值显示成「无单位」。
+func TestBuildRow_SkippedCellAlsoCarriesUnit(t *testing.T) {
+	b := newBuilder([]precomp.SlotState{
+		{ID: "slot.revenue", Status: "ACTIVE", Coverage: 0.99, Gate: 0.80},
+		{ID: "slot.cogs", Status: "ACTIVE", Coverage: 0.60, Gate: 0.80}, // 低于门限 ⇒ skip
+	})
+	def := precomp.BucketDef{ID: "pnl_month", ProducedBy: []string{"algo.gp"}}
+	row, err := b.BuildRow(context.Background(), def, map[string]*float64{"revenue": f(1000), "cogs": f(620)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(row.Cells) != 1 || !row.Cells[0].Skipped {
+		t.Fatalf("本用例需要一条被跳过的单元格，得 %+v", row.Cells)
+	}
+	if row.Cells[0].Unit != "THB" {
+		t.Fatalf("被跳过的单元格也应带单位 THB，得 %q", row.Cells[0].Unit)
 	}
 }

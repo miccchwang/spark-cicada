@@ -40,23 +40,33 @@ ON CONFLICT (id) DO UPDATE SET
 
 -- ───────────────────────────── 算法 ─────────────────────────────
 -- 注意公式列是**纯公式**，无 FROM/表名（G4）。
+--
+-- ★ 2026-10-08 单位口径对齐（G4 第九侧闸门「种子 ↔ 算法 YAML」同源检查抓出）：
+--   本段此前与 `algorithms/*.yaml` **逐字不同** ——
+--     种子 `algo.rev`/`cogs`/`gp`/`net_contrib` 写 `'CNY'`，而 YAML 写 `THB`；
+--     种子 `algo.gmp` 写 `'ratio'`，而 YAML 写 `percent`。
+--   这不是「种子错了」，而是**两侧各写一份词表**的必然结果：谁也没错、
+--   就是不一致。而 `unit` 列在 0002 里是 `text NOT NULL`（**无 CHECK**），
+--   加载期此前也无人校验 ⇒ 两侧分叉可以无限期共存。
+--   现按 docs/03 §4.2「本位币 THB（rule.fx.base）」统一为 `THB`，
+--   比率统一为 `%`（与 YAML 的 percent 归一同一形）。
 INSERT INTO registry_algorithm
     (id, name, version, formula, unit, permission, depends_on_slots,
      writes_bucket, missing_policy, trace, notes)
 VALUES
-    ('algo.rev', '营收合计', 1, 'sum(revenue)', 'CNY', 'L2',
+    ('algo.rev', '营收合计', 1, 'sum(revenue)', 'THB', 'L2',
      ARRAY['slot.revenue'], 'pnl_month', 'skip', true,
      '营业收入的原子汇总；缺失按跳过处理'),
-    ('algo.cogs', '商品成本合计', 2, 'sum(unit_cost * qty)', 'CNY', 'L3',
+    ('algo.cogs', '商品成本合计', 2, 'sum(unit_cost * qty)', 'THB', 'L3',
      ARRAY['slot.cogs'], 'pnl_month', 'skip', true,
      '成本 = 单位成本 × 数量；任一为 NULL 则该行跳过'),
-    ('algo.gp', '毛利', 3, 'rev - cogs', 'CNY', 'L3',
+    ('algo.gp', '毛利', 3, 'rev - cogs', 'THB', 'L3',
      ARRAY['slot.revenue', 'slot.cogs'], 'pnl_month', 'skip', true,
      '毛利 = 营收 - 成本（依赖两个槽）'),
-    ('algo.gmp', '毛利率', 1, 'safe_div(gp, rev)', 'ratio', 'L3',
+    ('algo.gmp', '毛利率', 1, 'safe_div(gp, rev)', '%', 'L3',
      ARRAY['slot.revenue', 'slot.cogs'], 'pnl_month', 'null', true,
      '分母为 0 或缺失 ⇒ NULL（绝不写 Infinity / 0）'),
-    ('algo.net_contrib', '净贡献', 1, 'gp - platform_fee - affiliate_fee', 'CNY', 'L4',
+    ('algo.net_contrib', '净贡献', 1, 'gp - platform_fee - affiliate_fee', 'THB', 'L4',
      ARRAY['slot.platform_fee', 'slot.affiliate'], 'pnl_month', 'skip', true,
      '★ 依赖 slot.affiliate（当前 MISSING）⇒ 该列全为 NULL，前端显示「待接入」')
 ON CONFLICT (id) DO UPDATE SET

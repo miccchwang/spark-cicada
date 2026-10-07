@@ -237,6 +237,37 @@ func (r *Registry) PermissionDocs() []gate.PermissionDoc {
 	return out
 }
 
+// UnitDocs 返回全部算法的计量单位声明，供 gate.CheckUnitDeclared /
+// CheckUnitMatchesFormulaKind 判定（G4 第九侧）。
+//
+// ★ 这是「算法的 unit 必须可解析且已知」这条断言第一次拿到**磁盘上的真值**。
+// 同时带上 Formula：比率型判定（`A / B`）需要看公式形态 —— 单位与公式
+// 是**一对**，单看 unit 字段看不出「金额公式声明成比率」这类矛盾。
+func (r *Registry) UnitDocs() []gate.UnitDoc {
+	var algoIDs []string
+	for id := range r.algos {
+		algoIDs = append(algoIDs, id)
+	}
+	sort.Strings(algoIDs)
+	out := make([]gate.UnitDoc, 0, len(algoIDs))
+	for _, id := range algoIDs {
+		out = append(out, gate.UnitDoc{
+			Kind: "算法", ID: r.algos[id].ID, Raw: r.algos[id].Unit,
+		})
+	}
+	return out
+}
+
+// AlgoFormulas 返回「算法 ID → 公式」的映射，供 CheckUnitMatchesFormulaKind
+// 做单位与公式形态的相称判定。
+func (r *Registry) AlgoFormulas() map[string]string {
+	out := make(map[string]string, len(r.algos))
+	for id, a := range r.algos {
+		out[id] = a.Formula
+	}
+	return out
+}
+
 // Validate 用 **gate 的多条 G4 判定函数**校验注册表本身。//
 // ★ 这是 G4 闸门第一次被生产代码调用：判定的对象是**磁盘上的真 YAML**，
 // 而不是测试里手搓的假数据。违规即返回 error（fail-closed）。
@@ -287,6 +318,20 @@ func (r *Registry) Validate() error {
 	// 后果是**越权**：成本/利润类槽（L3/L4）一旦被写成 L1，就会与产品 ID 同权限暴露，
 	// 而脱敏与区间展示（docs/01 §13.3）也随之失去依据 —— 且全程零报错。
 	violations = append(violations, gate.CheckPermissionDeclared(r.PermissionDocs())...)
+	// 算法的**计量单位**必须可解析且已知，且与公式形态相称（G4 第九侧 / docs/03 §3.1）。
+	//
+	// ★ 此前 `unit` 是**被读进来、写进 DB（registry_algorithm.unit）、
+	// 但没有任何判定消费**的一个字段：全链路只有解析/赋值/写库三类用法，
+	// 没有第四类（比较、判定、阈值）。全仓 `grep "\.Unit"` 的非测试命中只有
+	// admin_handlers.go / plane.go / store/admin.go 三处，**全是序列化与建表**；
+	// `precomp.AlgoDef.Unit` 更是结构性死字段（BuildRow 从不读它）。
+	// 于是 `unit: THB` 与 `unit: 想写什么写什么` 在加载期行为完全等价。
+	//
+	// 后果是**量纲静默失真**：`algo.gmp` 是比率（0.42）却可被写成 THB，
+	// 页面就会出现 `0.42 THB` 这种静默错误口径；跨算法聚合（哪些列可相加）
+	// 也以 unit 为唯一判据 —— unit 不可信则可加性整体失效。
+	violations = append(violations, gate.CheckUnitDeclared(r.UnitDocs())...)
+	violations = append(violations, gate.CheckUnitMatchesFormulaKind(r.UnitDocs(), r.AlgoFormulas())...)
 	// 算法 → 算法 的引用完整性（depends_on_algos 必须指向已注册算法）。
 	// 与 CheckSlotsRegistered 对称；缺了它，`depends_on_algos: [algo.ghost]`
 	// 会被当作「已声明依赖」从而让绑定校验放行一个根本不存在的来源。

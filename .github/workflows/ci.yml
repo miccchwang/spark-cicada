@@ -203,6 +203,25 @@ jobs:
         working-directory: backend
         run: go test ./internal/gate/ ./internal/slot/ -count=1 -run "Permission" -v
 
+      # ★ 计量单位闸门（G4 第九侧：unit 可解析 + 与种子/公式形态相称 + 下游携带）。
+      #   此前 `unit` 是**被读进来、写进 DB（registry_algorithm.unit）、但没有任何判定消费**
+      #   的一个字段：全仓 `grep "\.Unit"` 的非测试命中只有 admin_handlers.go / plane.go /
+      #   store/admin.go 三处，**全是序列化与建表**；`precomp.AlgoDef.Unit` 更是结构性死字段
+      #   （BuildRow 从不读它）⇒ `unit: THB` 与 `unit: 想写什么写什么` 在加载期完全等价。
+      #   后果是**量纲静默失真**：algo.gmp 是比率（0.42）却可被写成 THB ⇒ 页面出现
+      #   `0.42 THB` 这种静默错误口径；跨算法聚合（哪些列可相加）也以 unit 为唯一判据。
+      #   现：单位必须可解析（唯一权威表 gate.algoUnits）、**与公式形态相称**
+      #   （比率公式不得声明为金额）、与 0002/0004 **同源**（加载期静态比对，不连库）；
+      #   并由 precomp 把单位**随单元格产出**（CellResult.Unit / RowResult.Units），
+      #   让它第一次成为可被下游消费的结构化输出。
+      #   ★ 闸门首日抓出真缺陷：0004 种子写 CNY / ratio，而 algorithms/*.yaml 写 THB / percent
+      #   —— 两侧各写一份词表，谁也没错、就是不一致；已统一为 THB / %。
+      #   ★ 本侧**刻意不做**「公式量纲推断」（THB 是业务约定，不是表达式能推出来的）；
+      #   与公式的相称判定也只做**单向、很窄**的可疑提示（参第八侧教训：闸门本身也可能是错的）。
+      - name: ★ 单位闸门（G4 第九侧：unit 可解析 + 与种子同源 + 与公式相称 + 下游携带）
+        working-directory: backend
+        run: go test ./internal/gate/ ./internal/slot/ ./internal/precomp/ -count=1 -run "Unit|TestBuildRow" -v
+
       - name: 控制面闸门
         working-directory: backend
         run: go test ./internal/admin/ -count=1 -v

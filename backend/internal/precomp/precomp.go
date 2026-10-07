@@ -13,9 +13,11 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/miccchwang/spark-cicada/backend/internal/compute"
+	"github.com/miccchwang/spark-cicada/backend/internal/gate"
 )
 
 // BucketDef 桶定义（对应 buckets/*.yaml）。
@@ -64,13 +66,53 @@ type CellResult struct {
 	Skipped bool
 	Reason  string
 	Slots   []string
+	// Unit 该字段的计量单位（规范形，来自 AlgoDef.Unit）。
+	//
+	// ★ 为什么必须带出来（2026-10-08）：`AlgoDef.Unit` 在此之前是**结构性死字段** ——
+	// 它被解析、被写进 registry_algorithm.unit，但 precomp.go 从头到尾**没有读过一次**
+	// （BuildRow 只消费 Formula / DependsOnSlots / MissingPolicy）。于是
+	// 「algo.gmp 的单位是比率」这条事实**永远到不了**下游渲染/导出层，
+	// 页面上就会出现 `0.42 THB` 这种静默错误口径。
+	// 现在单位随单元格一起产出，成为「哪些列可相加 / 该怎么渲染」的**唯一判据来源**。
+	//
+	// 归一：经 gate.ParseUnit 归一（`percent`/`pct`/`%` 同一形）；不可解析时
+	// 保留原文（不静默丢弃，让下游看得见异常，而不是拿到空字符串当作「无单位」）。
+	Unit string
 }
 
-// RowResult 一行的构建结果。
+// normalizedUnit 归一算法声明的计量单位。
+//
+// ★ 委托 gate.ParseUnit —— 归一表**只有一份权威**（gate.unitAliases），
+// 防止「校验器认 percent、渲染器不认 percent」这类分叉静默发生
+// （与 slot.Slot.FreshnessMinutes 委托 gate.ParseFreshness 同纪律）。
+//
+// 不可解析时**保留原文**而不是丢弃：下游看得见异常值，好过拿到空字符串
+// 被当作「无单位」而静默按默认格式渲染。
+func normalizedUnit(raw string) string {
+	if u, ok := gate.ParseUnit(raw); ok {
+		return u
+	}
+	return strings.TrimSpace(raw)
+}
+
 type RowResult struct {
 	Keys          map[string]string
 	Cells         []CellResult
 	SkippedFields []string
+}
+
+// Units 返回「字段名 → 计量单位」的映射（仅含已产出的单元格）。
+//
+// ★ 这是「单位」第一次成为**可被下游消费的结构化输出**：
+// 导出/看板按它决定数值格式与可加性，而不是靠字段名的字符串约定去猜。
+func (r *RowResult) Units() map[string]string {
+	out := make(map[string]string, len(r.Cells))
+	for _, c := range r.Cells {
+		if c.Unit != "" {
+			out[c.Field] = c.Unit
+		}
+	}
+	return out
 }
 
 // BuildRow 计算一行的所有派生字段。
@@ -144,7 +186,7 @@ func (b *Builder) BuildRow(ctx context.Context, def BucketDef, inputs map[string
 		if bad, reason := firstBlocked(a.DependsOnSlots, health); bad != "" {
 			out.Cells = append(out.Cells, CellResult{
 				Field: fieldName(a.ID), Skipped: true, Reason: reason,
-				Slots: a.DependsOnSlots,
+				Slots: a.DependsOnSlots, Unit: normalizedUnit(a.Unit),
 			})
 			out.SkippedFields = append(out.SkippedFields, fieldName(a.ID))
 			// 明确写入缺失，供下游传播（不写 0）
@@ -160,6 +202,7 @@ func (b *Builder) BuildRow(ctx context.Context, def BucketDef, inputs map[string
 			out.Cells = append(out.Cells, CellResult{
 				Field: fieldName(a.ID), Skipped: true,
 				Reason: "依赖值缺失（fail-closed）", Slots: a.DependsOnSlots,
+				Unit:   normalizedUnit(a.Unit),
 			})
 			out.SkippedFields = append(out.SkippedFields, fieldName(a.ID))
 			vars[fieldName(a.ID)] = nil
@@ -167,6 +210,7 @@ func (b *Builder) BuildRow(ctx context.Context, def BucketDef, inputs map[string
 		}
 		out.Cells = append(out.Cells, CellResult{
 			Field: fieldName(a.ID), Value: val, Slots: a.DependsOnSlots,
+			Unit: normalizedUnit(a.Unit),
 		})
 		vars[fieldName(a.ID)] = val
 	}

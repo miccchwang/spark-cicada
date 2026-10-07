@@ -128,6 +128,7 @@ status: AVAILABLE
 	writeYAML(t, algosDir, "bad.yaml", `
 id: algo.bad
 permission: L3
+unit: THB
 name: 坏算法
 formula: "rev"
 depends_on_slots: [slot.rev]
@@ -164,6 +165,7 @@ status: AVAILABLE
 	writeYAML(t, algosDir, "bad.yaml", `
 id: algo.bad
 permission: L3
+unit: THB
 name: 坏算法
 formula: "rev"
 depends_on_slots: [slot.rev, slot.ghost]
@@ -213,6 +215,7 @@ permission: L3
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.x
 permission: L3
+unit: THB
 formula: "1"
 depends_on_slots: [slot.nogate]
 `)
@@ -243,6 +246,7 @@ status: AVAILABLE
 	writeYAML(t, algosDir, "gp.yaml", `
 id: algo.gp
 permission: L3
+unit: THB
 formula: "rev - cogs"
 depends_on_slots: [slot.cost]
 `)
@@ -315,6 +319,7 @@ status: AVAILABLE
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
 permission: L3
+unit: THB
 formula: "1"
 depends_on_slots: [slot.s]
 `)
@@ -358,6 +363,7 @@ status: PARTIAL
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
 permission: L3
+unit: THB
 formula: "1"
 depends_on_slots: [slot.p]
 `)
@@ -409,6 +415,7 @@ status: AVAILABLE
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
 permission: L3
+unit: THB
 formula: "1"
 depends_on_slots: [slot.dup]
 `)
@@ -437,6 +444,7 @@ status: AVAILABLE
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
 permission: L3
+unit: THB
 formula: "1"
 `)
 
@@ -463,6 +471,7 @@ status: ACTIVE
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
 permission: L3
+unit: THB
 formula: "1"
 depends_on_slots: [slot.s]
 `)
