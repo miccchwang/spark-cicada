@@ -407,6 +407,15 @@ type BucketDoc struct {
 	RuleVersions map[string]int
 	Grain        []string
 	Refresh      string
+
+	// Indexes 桶上的索引声明（[[month], [channel_code, month], …]）。
+	//
+	// ★ 为什么必须进 BucketDoc（2026-10-08）：`buckets/*.yaml` 的 `indexes`
+	//   此前是**被读被存但无判定消费**的字段（全仓 `grep "\.Indexes"` 命中 0），
+	//   而真正建索引的是迁移 0003 里手写的 CREATE INDEX —— 两侧互不校验。
+	//   进 BucketDoc 后由 gate.CheckBucketIndexesDeclared / CheckBucketIndexesMatchDDL
+	//   真校验（G4 第十一侧）。
+	Indexes [][]string
 }
 
 // CheckBucketProducersRegistered 断言桶的 produced_by 引用的算法均已注册（G4 引用完整性的**反向**）。

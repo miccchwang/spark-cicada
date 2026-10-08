@@ -35,17 +35,17 @@ import (
 //
 // ★ 为什么分两组扫（2026-10-08 修正）：
 //
-//	本仓的 G4 十侧**不是并排写在同一个方法里**，而是按依赖层次分工：
+//	本仓的 G4 各侧**不是并排写在同一个方法里**，而是按依赖层次分工：
 //	  * `slot.go: Registry.Validate`   —— 槽/算法自身的声明层（无桶依赖）；
 //	  * `slot/bucket.go: validate`     —— 桶到位后才能判的四条
 //	    （公式值绑定要按桶的 produced_by 串行链、桶→算法/桶→规则引用、
-//	     桶的刷新节律）。
-//	初版把十侧全指向 `Validate`，结果对三条**误报「装饰」** ——
+//	     桶的刷新节律、桶的索引声明）。
+//	初版把各侧全指向 `Validate`，结果对三条**误报「装饰」** ——
 //	这正是本仓反复强调的「先分辨是闸门漏检还是**断言本身错了**」。
 //	故此处按**真实所在文件**分组扫，并在最终断言里要求两组都命中。
 
-// g4TenSidesInRegistryValidate 是写在 `slot.go: Validate` 里的六侧。
-func g4TenSidesInRegistryValidate() []struct{ Name, Why string } {
+// g4SidesInRegistryValidate 是写在 `slot.go: Validate` 里的七侧。
+func g4SidesInRegistryValidate() []struct{ Name, Why string } {
 	return []struct{ Name, Why string }{
 		{"CheckAlgorithmNoDataSource", "算法里不得混入数据源（分离）"},
 		{"CheckSlotsRegistered", "算法 → 槽 的引用完整性"},
@@ -57,13 +57,14 @@ func g4TenSidesInRegistryValidate() []struct{ Name, Why string } {
 	}
 }
 
-// g4TenSidesInBucketValidate 是写在 `slot/bucket.go: validate` 里的三侧
+// g4SidesInBucketValidate 是写在 `slot/bucket.go: validate` 里的四侧
 // （它们**必须**在桶到位之后才能判）。
-func g4TenSidesInBucketValidate() []struct{ Name, Why string } {
+func g4SidesInBucketValidate() []struct{ Name, Why string } {
 	return []struct{ Name, Why string }{
 		{"CheckFormulaVariablesBound", "公式自由变量的值绑定（逐桶串行链）"},
 		{"CheckBucketProducersRegistered", "桶 → 算法 的反向引用完整性"},
 		{"CheckRefreshDeclared", "桶的刷新节律必须可解析"},
+		{"CheckBucketIndexesDeclared", "桶的索引声明必须可解析（G4 第十一侧）"},
 	}
 }
 
@@ -72,12 +73,12 @@ func needleFor(fn string) string {
 	return "gate." + fn // 名字在运行时拼接，本文件不出现完整字面量
 }
 
-// TestG4Wiring_AllTenSidesHaveProductionCallSites 断言 G4 十侧判定函数
+// TestG4Wiring_AllSidesHaveProductionCallSites 断言 G4 各侧判定函数
 // **全部**在生产路径里被调用（槽/算法侧在 `Registry.Validate`，
-// 桶相关的三侧在 `bucket.go: validate`）。
+// 桶相关的四侧在 `bucket.go: validate`）。
 //
 // 这是「闸门不是装饰」的机器可校验证据。
-func TestG4Wiring_AllTenSidesHaveProductionCallSites(t *testing.T) {
+func TestG4Wiring_AllSidesHaveProductionCallSites(t *testing.T) {
 	regBody := readMethodBody(t, "slot.go", "func (r *Registry) Validate() error {")
 	if len(regBody) < 2000 {
 		t.Fatalf("Validate 方法体只读到 %d 字节 —— 夹具没读到真源码，本用例是假的", len(regBody))
@@ -87,14 +88,14 @@ func TestG4Wiring_AllTenSidesHaveProductionCallSites(t *testing.T) {
 		t.Fatalf("bucket.validate 方法体只读到 %d 字节 —— 夹具没读到真源码，本用例是假的", len(bucketBody))
 	}
 
-	for _, side := range g4TenSidesInRegistryValidate() {
+	for _, side := range g4SidesInRegistryValidate() {
 		if !strings.Contains(regBody, needleFor(side.Name)) {
 			t.Errorf("★ G4 判定函数 %s（%s）在 slot.Registry.Validate 里**没有真实的"+
 				"生产调用点** ⇒ 该侧闸门是装饰（有定义、没消费），docs/05 标「已实现」也不成立",
 				side.Name, side.Why)
 		}
 	}
-	for _, side := range g4TenSidesInBucketValidate() {
+	for _, side := range g4SidesInBucketValidate() {
 		if !strings.Contains(bucketBody, needleFor(side.Name)) {
 			t.Errorf("★ G4 判定函数 %s（%s）在 bucket.validate 里**没有真实的生产调用点**"+
 				" ⇒ 该侧闸门是装饰", side.Name, side.Why)
@@ -118,13 +119,13 @@ func TestG4Wiring_ScannerCanDetectRemoval(t *testing.T) {
 	}
 }
 
-// TestG4Wiring_RealRepoLoadsThroughAllTenSides 用**真仓库**的 slots/algorithms
-// 跑一遍加载 —— 十侧闸门的第一天就会把「以前写得不完整的定义」全部照出来。
-func TestG4Wiring_RealRepoLoadsThroughAllTenSides(t *testing.T) {
+// TestG4Wiring_RealRepoLoadsThroughAllSides 用**真仓库**的 slots/algorithms
+// 跑一遍加载 —— 各侧闸门的第一天就会把「以前写得不完整的定义」全部照出来。
+func TestG4Wiring_RealRepoLoadsThroughAllSides(t *testing.T) {
 	root := repoRoot(t)
 	reg, err := slot.LoadRegistry(filepath.Join(root, "slots"), filepath.Join(root, "algorithms"))
 	if err != nil {
-		t.Fatalf("真仓库定义未能通过 G4 十侧闸门：%v", err)
+		t.Fatalf("真仓库定义未能通过 G4 各侧闸门：%v", err)
 	}
 	// 夹具自证：确实读到了真实定义（不是空目录「因为没东西可查」而通过）。
 	if len(reg.Slots()) < 5 || len(reg.Algorithms()) < 2 {

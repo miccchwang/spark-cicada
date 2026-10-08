@@ -244,6 +244,22 @@ jobs:
         working-directory: backend
         run: go test ./internal/gate/ ./internal/slot/ ./internal/admin/ -count=1 -run "Version|G4Wiring" -v
 
+      # ★ 桶索引闸门（G4 第十一侧：indexes 可解析 + 与迁移 DDL 双向同源）。
+      #   此前 `buckets/*.yaml` 的 `indexes` 是**被读被存但无判定消费**的字段：
+      #   全仓 `grep "\.Indexes"` 命中 **0**（连序列化都没有，`gate.BucketDoc`
+      #   里根本没有这个字段），而真正建索引的是迁移 0003 里**手写**的
+      #   CREATE INDEX —— 两侧互不校验。⇒ 删掉一条索引（该过滤维度退化成
+      #   全表扫描、只在慢查询里才看得见）不会有任何东西变红（第十九个变种）。
+      #   现：声明必须可解析（列名须匹配 `[a-z_][a-z0-9_]*`、同一条索引不得重复列、
+      #   同一桶不得重复声明同一条索引）；并与迁移里手写的 CREATE INDEX
+      #   **双向逐条对平**（读真迁移文件；被注释掉的索引不算数、
+      #   表达式索引与部分索引整条跳过、列序敏感）。
+      #   本步同时钉住接线：`gate.CheckBucketIndexesDeclared` 必须在
+      #   `slot/bucket.go` 的 validate 里有**真实生产调用点**（G4Wiring）。
+      - name: ★ 桶索引闸门（G4 第十一侧：indexes 可解析 + 与迁移 DDL 双向同源）
+        working-directory: backend
+        run: go test ./internal/gate/ ./internal/slot/ -count=1 -run "Indexes|BucketTableName|G4Wiring" -v
+
       - name: 控制面闸门
         working-directory: backend
         run: go test ./internal/admin/ -count=1 -v

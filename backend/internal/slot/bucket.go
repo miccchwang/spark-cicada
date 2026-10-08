@@ -191,6 +191,7 @@ func (r *BucketRegistry) validate(reg *Registry, registeredRules map[string]bool
 			RuleVersions: b.RuleVersions,
 			Grain:        b.Grain,
 			Refresh:      b.Refresh,
+			Indexes:      b.Indexes,
 		})
 	}
 	var bad []string
@@ -287,6 +288,18 @@ func (r *BucketRegistry) validate(reg *Registry, registeredRules map[string]bool
 		})
 	}
 	bad = append(bad, gate.CheckAlgoWritesBucketRegistered(algoBucketDocs, r.RegisteredBucketIDs())...)
+
+	// ①f 桶的**索引声明**必须可解析（G4 第十一侧）。
+	//
+	// ★ 同一个病的又一实例：`Bucket.Indexes` 全链路（YAML → 结构体 → 结束）
+	//   被带过 —— 全仓 `grep "\.Indexes"` 命中 **0**，连序列化都没有；
+	//   而真正建索引的是迁移 0003 里**手写**的 CREATE INDEX，两侧互不校验。
+	//   删掉一条索引（该过滤维度退化成全表扫描、只在慢查询里看得见）
+	//   不会有任何东西变红。现把 gate.CheckBucketIndexesDeclared 接成
+	//   真实生产调用点；与物理 DDL 的**双向对平**由
+	//   gate.CheckBucketIndexesMatchDDL 在 CI 里做（读真迁移文件，
+	//   见 slot/g4_indexes_wiring_test.go）。
+	bad = append(bad, gate.CheckBucketIndexesDeclared(docs)...)
 
 	if len(bad) > 0 {
 		return fmt.Errorf("桶注册表校验失败：\n  - %s", strings.Join(bad, "\n  - "))

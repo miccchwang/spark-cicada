@@ -21,6 +21,13 @@ import (
 )
 
 // BucketDef 桶定义（对应 buckets/*.yaml）。
+//
+// ★ 2026-10-08 移除 `Indexes` 字段：它曾是**结构性死字段** ——
+// precomp 只负责「按桶定义把算法结果物化进已有表」，**从不建表、也不建索引**，
+// 所以这个字段被解析进来后没有任何读取点（全仓 `grep "\.Indexes"` 命中 0）。
+// 桶的索引声明**只有一个权威位置**：`slot.Bucket.Indexes`（加载即过
+// `gate.CheckBucketIndexesDeclared`），并与迁移 DDL 双向对平
+// （`gate.CheckBucketIndexesMatchDDL`）。此处不留第二份副本 —— 留了就会分叉。
 type BucketDef struct {
 	ID           string
 	Grain        []string
@@ -28,7 +35,6 @@ type BucketDef struct {
 	Refresh      string
 	AlgoVersions map[string]int
 	RuleVersions map[string]int
-	Indexes      [][]string
 }
 
 // AlgoDef 算法定义（对应 algorithms/*.yaml）。
@@ -202,7 +208,7 @@ func (b *Builder) BuildRow(ctx context.Context, def BucketDef, inputs map[string
 			out.Cells = append(out.Cells, CellResult{
 				Field: fieldName(a.ID), Skipped: true,
 				Reason: "依赖值缺失（fail-closed）", Slots: a.DependsOnSlots,
-				Unit:   normalizedUnit(a.Unit),
+				Unit: normalizedUnit(a.Unit),
 			})
 			out.SkippedFields = append(out.SkippedFields, fieldName(a.ID))
 			vars[fieldName(a.ID)] = nil
