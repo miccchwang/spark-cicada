@@ -65,6 +65,7 @@ func g4SidesInBucketValidate() []struct{ Name, Why string } {
 		{"CheckBucketProducersRegistered", "桶 → 算法 的反向引用完整性"},
 		{"CheckRefreshDeclared", "桶的刷新节律必须可解析"},
 		{"CheckBucketIndexesDeclared", "桶的索引声明必须可解析（G4 第十一侧）"},
+		{"CheckBucketGrainDeclared", "桶的粒度声明必须可解析（G4 第十二侧）"},
 	}
 }
 
@@ -80,12 +81,15 @@ func needleFor(fn string) string {
 // 这是「闸门不是装饰」的机器可校验证据。
 func TestG4Wiring_AllSidesHaveProductionCallSites(t *testing.T) {
 	regBody := readMethodBody(t, "slot.go", "func (r *Registry) Validate() error {")
-	if len(regBody) < 2000 {
-		t.Fatalf("Validate 方法体只读到 %d 字节 —— 夹具没读到真源码，本用例是假的", len(regBody))
+	// ★ 阈值 600（而非早前的 2000）：`readMethodBody` 现在**去掉了注释**，
+	//   而本仓方法体绝大部分是注释 ⇒ 去注释后字节数大幅下降（Validate ≈1.5KB）。
+	//   阈值的作用只是「证明夹具真读到了源码、没盯错文件」。
+	if len(regBody) < 600 {
+		t.Fatalf("Validate 方法体只读到 %d 字节（去注释后）—— 夹具没读到真源码，本用例是假的", len(regBody))
 	}
 	bucketBody := readMethodBody(t, "bucket.go", "func (r *BucketRegistry) validate(reg *Registry, registeredRules map[string]bool) error {")
-	if len(bucketBody) < 2000 {
-		t.Fatalf("bucket.validate 方法体只读到 %d 字节 —— 夹具没读到真源码，本用例是假的", len(bucketBody))
+	if len(bucketBody) < 600 {
+		t.Fatalf("bucket.validate 方法体只读到 %d 字节（去注释后）—— 夹具没读到真源码，本用例是假的", len(bucketBody))
 	}
 
 	for _, side := range g4SidesInRegistryValidate() {
@@ -141,11 +145,93 @@ func TestG4Wiring_RealRepoLoadsThroughAllSides(t *testing.T) {
 	}
 }
 
+// TestG4Wiring_CommentIsNotACallSite 是**夹具自证**（2026-10-08 新增）：
+// 断言 `stripGoComments` 真的把注释去掉 —— 否则「调用点存在」可以被一段
+// **说明注释**骗过（注入实测 B 就是这么漏检的）。
+func TestG4Wiring_CommentIsNotACallSite(t *testing.T) {
+	line := "func f() {\n\t// gate.CheckOnlyInComment(x)\n\t_ = 1\n}\n"
+	if strings.Contains(stripGoComments(line), "CheckOnlyInComment") {
+		t.Fatal("★ stripGoComments 没去掉行注释 ⇒ 接线断言可被注释骗过（漏检）")
+	}
+	block := "func f() {\n\t/* gate.CheckOnlyInBlock(x) */\n\t_ = 1\n}\n"
+	if strings.Contains(stripGoComments(block), "CheckOnlyInBlock") {
+		t.Fatal("★ stripGoComments 没去掉块注释 ⇒ 接线断言可被注释骗过（漏检）")
+	}
+	// 反向：字符串字面量里的 `//` 不得被误删（否则 URL 被截断、制造假红）。
+	lit := "var u = \"http://example.com\"\n"
+	if !strings.Contains(stripGoComments(lit), "http://example.com") {
+		t.Fatal("★ stripGoComments 误删了字符串字面量里的 // ⇒ 会制造假红")
+	}
+	// 反向：真调用点必须保留。
+	real := "func f() {\n\tgate.CheckReal(x)\n}\n"
+	if !strings.Contains(stripGoComments(real), "gate.CheckReal") {
+		t.Fatal("★ stripGoComments 误删了真调用点")
+	}
+}
+
 // ─────────────────────────── 辅助 ───────────────────────────
+
+// stripGoComments 去掉 Go 源码里的注释（行注释 `//` 与块注释 `/* */`），
+// 但**保护字符串 / 字符字面量**（`"…"` / “ `…` “ / `'…'`）—— 否则 URL 里的 `//`
+// 会被误删，让「调用点存在」的判定产生假阴性（假红）。
+//
+// ★ 为什么必须去注释（2026-10-08 注入实测逼出，第六类缺陷的新实例）：
+//
+//	G4 各侧的接线说明注释里**会写出判定函数名**（例如「现把
+//	gate.CheckBucketGrainDeclared 接成真实生产调用点」）。若扫描前不去注释，
+//	把真正的调用点摘掉、只留那段说明注释，扫描器**照样命中** ⇒ 接线断言被
+//	注释骗过（漏检）。这正是本仓反复强调的「断言覆盖强度不足」形态 ——
+//	断言看着在测「有没有调用点」，实际测的是「文件里出现过这个字符串」。
+func stripGoComments(src string) string {
+	var b strings.Builder
+	b.Grow(len(src))
+	for i := 0; i < len(src); {
+		c := src[i]
+		switch {
+		case c == '"' || c == '`' || c == '\'':
+			// 字符串 / 字符字面量：整段原样保留（含其中的 // 与 /*）。
+			q := c
+			b.WriteByte(c)
+			i++
+			for i < len(src) {
+				if src[i] == '\\' && q != '`' && i+1 < len(src) {
+					b.WriteByte(src[i])
+					b.WriteByte(src[i+1])
+					i += 2
+					continue
+				}
+				b.WriteByte(src[i])
+				if src[i] == q {
+					i++
+					break
+				}
+				i++
+			}
+		case c == '/' && i+1 < len(src) && src[i+1] == '/':
+			j := strings.IndexByte(src[i:], '\n')
+			if j < 0 {
+				i = len(src)
+			} else {
+				i += j // 保留换行本身（下一轮作为普通字节写出）
+			}
+		case c == '/' && i+1 < len(src) && src[i+1] == '*':
+			j := strings.Index(src[i+2:], "*/")
+			if j < 0 {
+				i = len(src)
+			} else {
+				i += 2 + j + 2
+			}
+		default:
+			b.WriteByte(c)
+			i++
+		}
+	}
+	return b.String()
+}
 
 // readMethodBody 读出 file 里 `sig` 到下一个顶格 func 之间的方法体源码
 // （先把 CRLF 归一为 LF —— 本仓 Go 文件 100% CRLF，不归一会让扫描器
-// 与手工 grep 的结果不一致）。
+// 与手工 grep 的结果不一致；再**去掉注释** —— 见 stripGoComments）。
 func readMethodBody(t *testing.T, file, sig string) string {
 	t.Helper()
 	dir, err := os.Getwd()
@@ -156,7 +242,7 @@ func readMethodBody(t *testing.T, file, sig string) string {
 	if err != nil {
 		t.Fatalf("读 %s 失败（本用例必须扫真源码）：%v", file, err)
 	}
-	src := strings.ReplaceAll(string(raw), "\r\n", "\n")
+	src := stripGoComments(strings.ReplaceAll(string(raw), "\r\n", "\n"))
 	start := strings.Index(src, sig)
 	if start < 0 {
 		t.Fatalf("%s 里没找到方法签名 %q —— 签名变了，请同步本扫描器", file, sig)

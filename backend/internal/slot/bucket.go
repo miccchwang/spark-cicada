@@ -243,7 +243,10 @@ func (r *BucketRegistry) validate(reg *Registry, registeredRules map[string]bool
 	// ①c PENDING 算法不得被桶引用（否则运行时会产出恒空的静默列）。
 	bad = append(bad, gate.CheckPendingAlgosNotProducing(reg.AlgoDocs(), docs)...)
 
-	// ② 闸门之外的结构性约束（版本号为正、grain 必备）。
+	// ② 闸门之外的结构性约束（版本号为正）。
+	//
+	// ★ grain 的必备与合法性校验已上移到 ①g 的 gate.CheckBucketGrainDeclared
+	//   （此前这里只有一句 `len(b.Grain) == 0`，把「非空」当成了「粒度合法」）。
 	for _, id := range r.order {
 		b := r.buckets[id]
 
@@ -251,9 +254,6 @@ func (r *BucketRegistry) validate(reg *Registry, registeredRules map[string]bool
 			if v <= 0 {
 				bad = append(bad, fmt.Sprintf("桶 %s 的 algo_versions[%s]=%d 非正数", id, algo, v))
 			}
-		}
-		if len(b.Grain) == 0 {
-			bad = append(bad, fmt.Sprintf("桶 %s 未声明 grain（预计算粒度是桶的定义性属性）", id))
 		}
 	}
 
@@ -300,6 +300,19 @@ func (r *BucketRegistry) validate(reg *Registry, registeredRules map[string]bool
 	//   gate.CheckBucketIndexesMatchDDL 在 CI 里做（读真迁移文件，
 	//   见 slot/g4_indexes_wiring_test.go）。
 	bad = append(bad, gate.CheckBucketIndexesDeclared(docs)...)
+
+	// ①g 桶的**粒度声明**必须可解析（G4 第十二侧）。
+	//
+	// ★ 同一个病的又一实例：`Bucket.Grain` 是桶的**定义性属性**（一行 = 一个
+	//   grain 组合），但此前唯一的校验是「非空」—— `grain: [月份, 月份]` 或
+	//   `grain: [month day]` 一律照过，而它们要么让读取侧按一个**不存在的列名**
+	//   去取值，要么让粒度声明与物理列对不上。且 grain 与物理表的**唯一键**
+	//   此前**完全没有关联**（改 YAML 的 grain 而不动迁移 ⇒ 声明与物理去重键
+	//   静默分叉，同一 grain 组合被拆成多行 / 互相覆盖，全程零报错）。
+	//   现把 gate.CheckBucketGrainDeclared 接成真实生产调用点；与物理唯一键的
+	//   **对平**由 gate.CheckBucketGrainMatchesDDL 在 CI 里做（读真迁移
+	//   0003 + 0011，见 slot/g4_grain_wiring_test.go）。
+	bad = append(bad, gate.CheckBucketGrainDeclared(docs)...)
 
 	if len(bad) > 0 {
 		return fmt.Errorf("桶注册表校验失败：\n  - %s", strings.Join(bad, "\n  - "))

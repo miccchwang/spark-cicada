@@ -164,8 +164,8 @@ func TestG4Indexes_LoadRejectsMalformedIndex(t *testing.T) {
 func TestG4Indexes_HasProductionCallSite(t *testing.T) {
 	body := readMethodBody(t, "bucket.go",
 		"func (r *BucketRegistry) validate(reg *Registry, registeredRules map[string]bool) error {")
-	if len(body) < 2000 {
-		t.Fatalf("validate 方法体只读到 %d 字节 —— 夹具没读到真源码", len(body))
+	if len(body) < 600 {
+		t.Fatalf("validate 方法体只读到 %d 字节（去注释后）—— 夹具没读到真源码", len(body))
 	}
 	needle := "gate." + "CheckBucketIndexesDeclared"
 	if !strings.Contains(body, needle) {

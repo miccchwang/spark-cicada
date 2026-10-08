@@ -260,6 +260,22 @@ jobs:
         working-directory: backend
         run: go test ./internal/gate/ ./internal/slot/ -count=1 -run "Indexes|BucketTableName|G4Wiring" -v
 
+      # ★ 桶粒度闸门（G4 第十二侧：grain 可解析 + 与物理唯一键同源）。
+      #   此前 `buckets/*.yaml` 的 `grain` 是桶的**定义性属性**（一行 = 一个 grain
+      #   组合），但唯一的校验是 `len(b.Grain) == 0` —— 列名是否合法不查、与物理表
+      #   的**唯一键**更是完全没有关联。而真正保证「一行一个 grain」的是迁移里的
+      #   唯一键（0003 的 UNIQUE 约束 / 0011 的租户唯一索引）。两侧互不校验 ⇒
+      #   改 YAML 的 grain（例如加一列 spu）而不动迁移，声明与物理去重键**静默
+      #   分叉**：同一 grain 组合被拆成多行 / 互相覆盖，全程零报错（第二十个变种）。
+      #   现：grain 必须可解析（列名须匹配 `[a-z_][a-z0-9_]*`、不得重复列）；
+      #   并与迁移里手写的唯一键**对平**（剥离 tenant_id 前缀后**集合**相等；
+      #   集合而非序列 —— 唯一键是集合语义，与第十一侧的索引列序敏感刻意相反）。
+      #   本步同时钉住接线：`gate.CheckBucketGrainDeclared` 必须在
+      #   `slot/bucket.go` 的 validate 里有**真实生产调用点**（G4Wiring）。
+      - name: ★ 桶粒度闸门（G4 第十二侧：grain 可解析 + 与物理唯一键同源）
+        working-directory: backend
+        run: go test ./internal/gate/ ./internal/slot/ -count=1 -run "Grain|G4Wiring" -v
+
       - name: 控制面闸门
         working-directory: backend
         run: go test ./internal/admin/ -count=1 -v
