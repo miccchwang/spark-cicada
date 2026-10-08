@@ -159,6 +159,32 @@ func (p *Plane) ValidateAlgorithm(ctx context.Context, a Algorithm) error {
 				a.ID, slotID, s.Status)
 		}
 	}
+	// 4. 版本号必须显式声明且为正整数（G4 第十侧）。
+	//
+	// ★ 此前本方法对 Version **零校验**，而 RegisterAlgorithm 在 Version<=0 时
+	// 静默把它写成 1 —— 那是**缺省填充，不是校验**：它让「没写版本」与
+	// 「版本就是 1」在行为上无法区分。版本是 G6「改了公式要重算哪些桶」的
+	// **唯一判据**（gate.VersionDrift / AffectedBuckets），缺失或自由值会让
+	// 漂移检测静默失真。现改为显式拒绝。
+	if a.Version <= 0 {
+		return fmt.Errorf(
+			"admin: 算法 %s 的版本号必须为正整数（得 %d）—— 版本是 G6 漂移检测的唯一判据，"+
+				"不得缺省填充（0 与『未声明』无法区分）", a.ID, a.Version)
+	}
+	// 5. 版本只能前进（G4 第十侧**唯一有依据的比较**）。
+	//
+	// ★ 版本的全部意义在于比较：G6 靠版本差判断「改了公式要重算哪些桶」。
+	// 允许倒退（3 → 2）会让已重算过的桶被判为「版本超前」，重算结论随之失真。
+	// 首次登记（store 里查不到）⇒ 无比较基准，放行。
+	prev, exists, err := p.Store.GetAlgorithm(ctx, a.ID)
+	if err != nil {
+		return fmt.Errorf("admin: 读取既有算法 %s 失败: %w", a.ID, err)
+	}
+	if exists {
+		if v := gate.CheckAlgorithmVersionNotRegressing(a.ID, prev.Version, a.Version); len(v) > 0 {
+			return fmt.Errorf("admin: %s", strings.Join(v, "；"))
+		}
+	}
 	return nil
 }
 
@@ -170,9 +196,9 @@ func (p *Plane) RegisterAlgorithm(ctx context.Context, actor string, a Algorithm
 	if err := p.ValidateAlgorithm(ctx, a); err != nil {
 		return err
 	}
-	if a.Version <= 0 {
-		a.Version = 1
-	}
+	// 版本号**不再**静默填 1：ValidateAlgorithm 已显式拒绝 Version<=0。
+	// （缺省填充会让「没写版本」与「版本就是 1」在行为上无法区分，
+	// 而版本是 G6 漂移检测的唯一判据。）
 	if a.MissingPolicy == "" {
 		a.MissingPolicy = "skip"
 	}

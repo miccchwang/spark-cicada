@@ -216,7 +216,7 @@ func TestG5_ActiveSlotAllowsAlgorithm(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := p.RegisterAlgorithm(ctx, "admin", Algorithm{
-		ID: "algo.cogs", Name: "成本", Formula: "unit_cost * qty",
+		ID: "algo.cogs", Name: "成本", Version: 1, Formula: "unit_cost * qty",
 		DependsOnSlots: []string{"slot.cogs"}, WritesBucket: "pnl_month",
 	}); err != nil {
 		t.Fatalf("ACTIVE 槽应允许登记：%v", err)
@@ -325,7 +325,7 @@ func TestG10_AllMutationsAudited(t *testing.T) {
 
 	_ = p.RegisterSlot(ctx, "u1", Slot{ID: "slot.cogs", Name: "成本",
 		SourceKind: "db", SourceRef: "x", KeyStrategy: "sku"})
-	_ = p.RegisterAlgorithm(ctx, "u1", Algorithm{ID: "algo.cogs", Formula: "a*b",
+	_ = p.RegisterAlgorithm(ctx, "u1", Algorithm{ID: "algo.cogs", Version: 1, Formula: "a*b",
 		DependsOnSlots: []string{"slot.cogs"}})
 
 	rows := aud.all()
@@ -369,7 +369,7 @@ func TestSnapshot(t *testing.T) {
 	ctx := context.Background()
 	_ = p.RegisterSlot(ctx, "a", Slot{ID: "slot.cogs", Name: "成本",
 		SourceKind: "db", SourceRef: "x", KeyStrategy: "k"})
-	_ = p.RegisterAlgorithm(ctx, "a", Algorithm{ID: "algo.cogs", Formula: "a*b",
+	_ = p.RegisterAlgorithm(ctx, "a", Algorithm{ID: "algo.cogs", Version: 1, Formula: "a*b",
 		DependsOnSlots: []string{"slot.cogs"}})
 
 	ov, err := p.Snapshot(ctx)

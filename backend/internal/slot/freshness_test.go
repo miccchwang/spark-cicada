@@ -75,6 +75,7 @@ status: AVAILABLE
 `)
 			writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
+version: 1
 permission: L3
 unit: THB
 formula: "1"
@@ -119,6 +120,7 @@ status: AVAILABLE
 	writeYAML(t, slotsDir, "slot.nofresh.yaml", slotYAML)
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
+version: 1
 permission: L3
 unit: THB
 formula: "1"
@@ -159,6 +161,7 @@ status: AVAILABLE
 `)
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
+version: 1
 permission: L3
 unit: THB
 formula: "1"
@@ -250,6 +253,7 @@ status: AVAILABLE
 `)
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
+version: 1
 permission: L3
 unit: THB
 formula: "1"
@@ -300,6 +304,7 @@ status: AVAILABLE
 `)
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
+version: 1
 permission: L3
 unit: THB
 formula: "1"
@@ -341,6 +346,7 @@ status: MISSING
 `)
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
+version: 1
 permission: L3
 unit: THB
 formula: "1"

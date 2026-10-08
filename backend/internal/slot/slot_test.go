@@ -127,6 +127,7 @@ status: AVAILABLE
 	// ★ 违规：算法里混入 table/source（G4 禁止）
 	writeYAML(t, algosDir, "bad.yaml", `
 id: algo.bad
+version: 1
 permission: L3
 unit: THB
 name: 坏算法
@@ -164,6 +165,7 @@ status: AVAILABLE
 `)
 	writeYAML(t, algosDir, "bad.yaml", `
 id: algo.bad
+version: 1
 permission: L3
 unit: THB
 name: 坏算法
@@ -214,6 +216,7 @@ permission: L3
 `)
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.x
+version: 1
 permission: L3
 unit: THB
 formula: "1"
@@ -245,6 +248,7 @@ status: AVAILABLE
 `)
 	writeYAML(t, algosDir, "gp.yaml", `
 id: algo.gp
+version: 1
 permission: L3
 unit: THB
 formula: "rev - cogs"
@@ -318,6 +322,7 @@ status: AVAILABLE
 `)
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
+version: 1
 permission: L3
 unit: THB
 formula: "1"
@@ -362,6 +367,7 @@ status: PARTIAL
 `)
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
+version: 1
 permission: L3
 unit: THB
 formula: "1"
@@ -414,6 +420,7 @@ status: AVAILABLE
 	writeYAML(t, slotsDir, "b.yaml", body)
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
+version: 1
 permission: L3
 unit: THB
 formula: "1"
@@ -443,6 +450,7 @@ status: AVAILABLE
 	// 未声明 depends_on_slots ⇒ 拒绝（算法必须有数据来源）
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
+version: 1
 permission: L3
 unit: THB
 formula: "1"
@@ -470,6 +478,7 @@ status: ACTIVE
 `)
 	writeYAML(t, algosDir, "a.yaml", `
 id: algo.a
+version: 1
 permission: L3
 unit: THB
 formula: "1"

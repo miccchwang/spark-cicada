@@ -222,6 +222,28 @@ jobs:
         working-directory: backend
         run: go test ./internal/gate/ ./internal/slot/ ./internal/precomp/ -count=1 -run "Unit|TestBuildRow" -v
 
+      # ★ 算法版本闸门（G4 第十侧：version 可解析 + 登记不得倒退 + 与种子同源）。
+      #   此前 `version` 看似「处处都在用」（registry_algorithm.version 列 / VersionDrift /
+      #   AlgoVersions / AffectedBuckets），但把它的**值**当被校验对象看，全链路只有
+      #   解析 / 赋值 / **逐层搬运**三类用法，**没有第四类**（比较 / 判定 / 阈值）：
+      #     * 全仓非测试代码里没有一处把 Algorithm.Version 与算法身份比较；
+      #     * admin.Plane.ValidateAlgorithm（唯一登记入口）对它**零校验**；
+      #     * RegisterAlgorithm 只在 Version<=0 时静默改成 1（**缺省填充，不是校验**）；
+      #     * 0002 把 version 建成 integer NOT NULL 且**无 CHECK**。
+      #   ⇒ `version: 想写什么写什么` 在加载期与入库期行为完全等价（第十八个变种）。
+      #   后果是**版本漂移检测静默失真**（G6 全部结论都建在它上面）：版本号是「改了公式
+      #   要重算哪些桶」的**唯一判据**，改公式忘了 +1 ⇒ AffectedBuckets 返回空 ⇒ 改了公式
+      #   却不重算、报表长期显示错误口径；版本还能**倒退**让已重算的桶被判「版本超前」。
+      #   现：版本必须为正整数（v3 / 3.1 / latest / +3 即加载失败）、登记时不得倒退
+      #   （next<prev ⇒ 拒绝；prev==0 首次登记放行）、与 0004 种子**加载期静态同源比对**。
+      #   ★ 本侧**刻意不做**「YAML vs 0004 种子的身份对平」—— 实测两侧已真实分叉
+      #   （algo.cogs 3/2、algo.gmp 3/1、algo.net_contrib 2/1、algo.gp 3/3），但静态无法
+      #   判定哪侧是真相（种子被 ON CONFLICT DO UPDATE 覆盖，谁先谁后取决于部署顺序）；
+      #   如实记录并交用户拍板（docs/06 F15），不靠改数据迁就未经验证的规则。
+      - name: ★ 版本闸门（G4 第十侧：version 可解析 + 登记不得倒退 + 与种子同源）
+        working-directory: backend
+        run: go test ./internal/gate/ ./internal/slot/ ./internal/admin/ -count=1 -run "Version|G4Wiring" -v
+
       - name: 控制面闸门
         working-directory: backend
         run: go test ./internal/admin/ -count=1 -v

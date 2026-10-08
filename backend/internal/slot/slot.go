@@ -268,6 +268,50 @@ func (r *Registry) AlgoFormulas() map[string]string {
 	return out
 }
 
+// AlgorithmVersionDocs 返回全部算法的**版本声明**，供 gate.CheckAlgorithmVersionDeclared
+// 判定（G4 第十侧 / docs/03 §3.1）。
+//
+// ★ 这是「算法的 version 必须可解析为正整数」这条断言第一次拿到**磁盘上的真值**。
+//
+// ★ 为什么 Raw 优先取 **YAML 原文**（`a.Raw["version"]`）而不是 `strconv.Itoa(a.Version)`：
+//
+//	版本是数值比较对象，报错必须点名**作者写下的那串字符**。若 Raw 一律由 int 反推，
+//	「漏写 version」会被显示成 `0`（看着像作者真写了 0，其实他根本没写）——
+//	报错信息误导人。取原文则能如实区分：缺键 ⇒ Raw="" ⇒ 报「版本号为空」。
+//
+// ★ 仅在**未经 YAML 解析**（Raw 缺键但结构体有值，如程序内构造）时退回十进制字段，
+//
+//	避免把「有值」误报成「为空」。
+func (r *Registry) AlgorithmVersionDocs() []gate.VersionDoc {
+	var algoIDs []string
+	for id := range r.algos {
+		algoIDs = append(algoIDs, id)
+	}
+	sort.Strings(algoIDs)
+	out := make([]gate.VersionDoc, 0, len(algoIDs))
+	for _, id := range algoIDs {
+		a := r.algos[id]
+		out = append(out, gate.VersionDoc{
+			AlgoID: a.ID,
+			Raw:    rawVersionText(a),
+		})
+	}
+	return out
+}
+
+// rawVersionText 取算法版本号的**原始文本**（保留作者写法）；缺键且结构体为空 ⇒ ""。
+//
+// 只做「原样呈现」，不做任何语义归一 —— 判定交给 gate.ParseAlgorithmVersion。
+func rawVersionText(a Algorithm) string {
+	if v, ok := a.Raw["version"]; ok && v != nil {
+		return fmt.Sprintf("%v", v)
+	}
+	if a.Version != 0 {
+		return fmt.Sprintf("%d", a.Version)
+	}
+	return ""
+}
+
 // Validate 用 **gate 的多条 G4 判定函数**校验注册表本身。//
 // ★ 这是 G4 闸门第一次被生产代码调用：判定的对象是**磁盘上的真 YAML**，
 // 而不是测试里手搓的假数据。违规即返回 error（fail-closed）。
@@ -332,6 +376,19 @@ func (r *Registry) Validate() error {
 	// 也以 unit 为唯一判据 —— unit 不可信则可加性整体失效。
 	violations = append(violations, gate.CheckUnitDeclared(r.UnitDocs())...)
 	violations = append(violations, gate.CheckUnitMatchesFormulaKind(r.UnitDocs(), r.AlgoFormulas())...)
+	// 算法的**版本号**必须可解析为正整数（G4 第十侧 / docs/03 §3.1）。
+	//
+	// ★ 此前 `version` 看似「处处都在用」（registry_algorithm.version 列、
+	// VersionDrift、AlgoVersions、AffectedBuckets …），但把它的**值**当作
+	// 被校验对象来看，全链路只有解析/赋值/逐层搬运三类用法，**没有第四类**
+	// （比较、判定、阈值）：全仓非测试代码里没有一处把 `Algorithm.Version`
+	// 与算法身份比较，DB 侧 0002 把 version 建成 `integer NOT NULL` 且**无 CHECK**。
+	// 于是 `version: 想写什么写什么` 在加载期与入库期行为完全等价。
+	//
+	// 后果是**版本漂移检测静默失真**（G6 的全部结论都建在它上面）：
+	// 版本号是「改了公式要重算哪些桶」的唯一判据，若它不可信，
+	// AffectedBuckets 可能返回空 ⇒ 改了公式却不重算，报表长期显示错误口径。
+	violations = append(violations, gate.CheckAlgorithmVersionDeclared(r.AlgorithmVersionDocs())...)
 	// 算法 → 算法 的引用完整性（depends_on_algos 必须指向已注册算法）。
 	// 与 CheckSlotsRegistered 对称；缺了它，`depends_on_algos: [algo.ghost]`
 	// 会被当作「已声明依赖」从而让绑定校验放行一个根本不存在的来源。
