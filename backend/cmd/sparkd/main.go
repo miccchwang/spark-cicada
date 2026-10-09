@@ -219,6 +219,34 @@ func main() {
 		stratH.Routes(mux)
 	}
 
+	// ── M-DR：备份下载 / 主备切换 / 回滚（G12）──
+	//
+	// ★ 为什么必须注册这些路由：`internal/dr` 把 G12 四条判定链路实现了，
+	//   但若没有 HTTP 入口，`gate.CheckMonthlyQuota` / `CheckNoCredentialsInURL`
+	//   / `CheckFailoverFencing` / `CheckRollbackKeepsAudit` 仍然只在测试里被调到
+	//   = 仍然恒真。本层是那条「真实生产入口」。
+	//
+	// ★ 高风险操作（隔离 / 见证 / 切换 / 回滚）的门禁用 isT1Func —— 判定走
+	//   **服务端**判据，接口层再把 Tier 写死为 "T1"，绝不透传客户端声明。
+	drH := &api.DrHandlers{
+		Downloads: dp.buildDownloadService(),
+		Failover:  dp.buildFailoverController(),
+		IsT1:      dp.isT1Func(),
+	}
+	drH.Routes(mux)
+
+	// ── M-AUTH：上级代授（D13）──
+	//
+	// ★ 补的是「代授不溢出」这条断言的生产调用点：此前 `authz.Resolver.Delegate`
+	//   全仓没有任何非测试调用点，于是「代授不溢出自身范围」在实现侧恒真。
+	//   Sink 目前为 nil（尚无 grants 的持久化层）⇒ 响应如实回报 persisted=false，
+	//   不假装权限已生效（登记 docs/06 F18）。
+	delH := &api.DelegationHandlers{
+		Resolver:     resolver,
+		Entitlements: dp.ents,
+	}
+	delH.Routes(mux)
+
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		v, err := kernel.Health(r.Context())
 		if err != nil {
