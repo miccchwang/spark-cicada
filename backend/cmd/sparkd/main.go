@@ -32,6 +32,34 @@ import (
 	"github.com/miccchwang/spark-cicada/backend/internal/slot"
 )
 
+// buildBucketAlgoRefs 从**真实注册表**派生「桶 → 字段 → 算法引用」，供 query
+// 组装可回溯的 AlgoTrace（G4 第十四侧 / docs/01 §5.5、docs/02 验收「可回溯算法与数据槽」）。
+//
+// ★ 为什么不在装配层手抄：手抄的映射必然与 algorithms/*.yaml 分叉
+//   （依赖槽 / trace 任一改动都不会同步），而 AlgoTrace 的可回溯性正建在它上面。
+//   这里以 slotReg（算法注册表）+ buckets（桶定义）为**唯一事实源**。
+//
+// ★ 注册表未就绪（降级运行）时返回 nil：query 仍产出 AlgoTrace 但 dataSlots 为空，
+//   出站契约守卫会 fail-closed 拒绝出站（宁可拒绝，也不出不可回溯的契约）。
+func buildBucketAlgoRefs(dp *dataPlane) map[string]map[string]query.AlgoRef {
+	if dp == nil || dp.slotReg == nil {
+		return nil
+	}
+	raw := dp.slotReg.BucketAlgoRefs(dp.buckets)
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make(map[string]map[string]query.AlgoRef, len(raw))
+	for bucket, fields := range raw {
+		m := make(map[string]query.AlgoRef, len(fields))
+		for field, info := range fields {
+			m[field] = query.AlgoRef{ID: info.AlgoID, Slots: info.Slots, Trace: info.Trace}
+		}
+		out[bucket] = m
+	}
+	return out
+}
+
 func main() {
 	var (
 		addr       = flag.String("addr", ":8080", "HTTP 监听地址")
@@ -79,6 +107,9 @@ func main() {
 			BucketAlgoMap: map[string]map[string]string{
 				"pnl_month": {"gp": "algo.gp", "cogs": "algo.cogs", "net_contrib": "algo.net_contrib"},
 			},
+			// ★ 可回溯来源（G4 第十四侧）：桶 → 字段 → 算法引用（含依赖槽与 trace），
+			//   从**真实注册表**派生，而非手抄（手抄必然与 algorithms/*.yaml 分叉）。
+			BucketAlgoRefs: buildBucketAlgoRefs(dp),
 		},
 	}
 

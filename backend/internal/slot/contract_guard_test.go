@@ -25,7 +25,7 @@ func TestContractGuard_AcceptsValidContract(t *testing.T) {
 			{"gp": contracts.NewNum(1234.5)},
 		},
 		AlgoTrace: []contracts.AlgoTrace{
-			{Field: "gp", AlgoID: "algo.gp", Skipped: false},
+			{Field: "gp", AlgoID: "algo.gp", DataSlots: []string{"slot.revenue", "slot.cogs"}, Skipped: false},
 		},
 	}
 	if err := g.MustValidContract(dc); err != nil {
@@ -61,7 +61,7 @@ func TestContractGuard_RejectsZeroImputation(t *testing.T) {
 			{"cogs": contracts.NewNum(0)}, // ★ 违规：疑似占位补零
 		},
 		AlgoTrace: []contracts.AlgoTrace{
-			{Field: "cogs", AlgoID: "algo.cogs", Skipped: false},
+			{Field: "cogs", AlgoID: "algo.cogs", DataSlots: []string{"slot.cogs"}, Skipped: false},
 		},
 	}
 	if err := g.MustValidContract(dc); err == nil {
@@ -81,7 +81,7 @@ func TestContractGuard_RejectsSkippedWithValue(t *testing.T) {
 			{"net_contrib": contracts.NewNum(999)},
 		},
 		AlgoTrace: []contracts.AlgoTrace{
-			{Field: "net_contrib", AlgoID: "algo.net_contrib", Skipped: true, Reason: "slot.affiliate MISSING"},
+			{Field: "net_contrib", AlgoID: "algo.net_contrib", DataSlots: []string{"slot.platform_fee", "slot.ad_spend", "slot.affiliate"}, Skipped: true, Reason: "slot.affiliate MISSING"},
 		},
 	}
 	if err := g.MustValidContract(dc); err == nil {
@@ -101,7 +101,7 @@ func TestContractGuard_AllowsWhitelistedZero(t *testing.T) {
 			{"cogs": contracts.NewNum(0)},
 		},
 		AlgoTrace: []contracts.AlgoTrace{
-			{Field: "cogs", AlgoID: "algo.cogs", Skipped: false},
+			{Field: "cogs", AlgoID: "algo.cogs", DataSlots: []string{"slot.cogs"}, Skipped: false},
 		},
 	}
 	if err := g.MustValidContract(dc); err != nil {

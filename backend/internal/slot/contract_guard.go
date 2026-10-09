@@ -59,6 +59,14 @@ func (g *ContractGuard) Validate(dc *contracts.DataContract) []string {
 	// G3：不补 0 / skipped 必须为 null。
 	violations = append(violations, gate.CheckNoZeroImputation(dc, g.ZeroWhitelist)...)
 
+	// G4 第十四侧（可回溯性）：每条派生列必须有 AlgoTrace 条目且携带 dataSlots。
+	//
+	// ★ 这是「算法的 trace 声明必须可判定」这条断言在**出站路径**上的真实调用点：
+	//   声明层（gate.CheckTraceDeclared）禁止物化算法声明 trace: false，
+	//   出站层（本条）再确保**每条派生列**真的可回溯 —— 两层配合才闭环，
+	//   只做声明层会漏掉「声明 true 但运行时根本不产出溯源」的静默失败。
+	violations = append(violations, gate.CheckAlgoTraceCoversColumns(dc)...)
+
 	return violations
 }
 

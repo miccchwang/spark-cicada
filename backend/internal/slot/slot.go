@@ -357,6 +357,107 @@ func rawMissingPolicyText(a Algorithm) (string, bool) {
 	return "", false
 }
 
+// TraceDocs 返回全部算法的**可回溯声明**，供 gate.CheckTraceDeclared 判定
+// （G4 第十四侧 / docs/02 验收「所有输出可沿 AlgoTrace 回溯」）。
+//
+// ★ 这是「trace 必须可判定、且物化算法必须为 true」这条断言第一次拿到
+// **磁盘上的真值**。
+//
+// ★ Materializes 的判据：writes_bucket 非空且 status 非 PENDING —— 只有这类
+// 算法的输出会被写进桶、出现在出站契约里，因此必须可回溯。
+func (r *Registry) TraceDocs() []gate.TraceDoc {
+	var algoIDs []string
+	for id := range r.algos {
+		algoIDs = append(algoIDs, id)
+	}
+	sort.Strings(algoIDs)
+	out := make([]gate.TraceDoc, 0, len(algoIDs))
+	for _, id := range algoIDs {
+		a := r.algos[id]
+		val, declared, valid := rawTraceValue(a)
+		out = append(out, gate.TraceDoc{
+			AlgoID:   a.ID,
+			Trace:    val,
+			Declared: declared,
+			Valid:    valid,
+			Materializes: strings.TrimSpace(a.WritesBucket) != "" &&
+				!strings.EqualFold(strings.TrimSpace(a.Status), gate.StatusPending),
+		})
+	}
+	return out
+}
+
+// rawTraceValue 取 trace 的**原始值**，并回报「键是否存在 / 是否可判定为布尔」。
+//
+//   - 键不存在                  ⇒ (DefaultTrace, false, true) —— 缺省为 true（与 0002 DEFAULT 同源）；
+//   - 键存在、值是布尔           ⇒ (值, true, true)；
+//   - 键存在、值是 YAML 空值/非布尔 ⇒ (false, true, false) —— 声明了但不可判定（fail-closed）；
+//   - 未经 YAML（Raw 缺键，如程序内构造）⇒ 按缺省 true 处理，避免把「有值」误报成「不可判定」。
+func rawTraceValue(a Algorithm) (val bool, declared bool, valid bool) {
+	if v, ok := a.Raw["trace"]; ok {
+		if v == nil {
+			return false, true, false // 键存在但值是 YAML 空值（裸空）—— 不可判定
+		}
+		if b, ok := gate.ParseTrace(v); ok {
+			return b, true, true
+		}
+		return false, true, false
+	}
+	return gate.DefaultTrace, false, true
+}
+
+// AlgoRefInfo 描述桶里一条派生列对应的算法（供装配层组装可回溯的 AlgoTrace）。
+type AlgoRefInfo struct {
+	// AlgoID 算法 ID（如 algo.gp）。
+	AlgoID string
+	// Slots 该算法的依赖数据槽（写入 AlgoTrace.dataSlots）。
+	Slots []string
+	// Trace 该算法的 trace 声明（缺省 true；与 0002 DEFAULT 同源）。
+	Trace bool
+}
+
+// BucketAlgoRefs 返回「桶 ID → 列名 → AlgoRefInfo」，来源是**真实算法注册表 + 桶定义**。
+//
+// ★ 这是 query 组装可回溯 AlgoTrace 的唯一来源（G4 第十四侧）：
+//
+//	列名按 `algo.gp → gp` 约定折算，依赖槽与 trace 取自算法注册表（单一事实源），
+//	而不是在装配层手抄一份 —— 手抄的那份必然会与 YAML 分叉（本仓已多次实证）。
+func (r *Registry) BucketAlgoRefs(br *BucketRegistry) map[string]map[string]AlgoRefInfo {
+	if br == nil {
+		return nil
+	}
+	out := make(map[string]map[string]AlgoRefInfo, len(br.order))
+	for _, b := range br.Buckets() {
+		m := make(map[string]AlgoRefInfo, len(b.ProducedBy))
+		for _, aid := range b.ProducedBy {
+			a, ok := r.algos[aid]
+			if !ok {
+				continue // 未注册算法由 LoadBucketRegistry 的引用完整性闸门负责报错
+			}
+			traced, _, _ := rawTraceValue(a)
+			m[FieldNameOf(aid)] = AlgoRefInfo{
+				AlgoID: aid,
+				Slots:  append([]string(nil), a.DependsOnSlots...),
+				Trace:  traced,
+			}
+		}
+		out[b.ID] = m
+	}
+	return out
+}
+
+// FieldNameOf 算法 ID → 桶列名：`algo.gp` → `gp`（与 precomp.FieldName 同一约定）。
+//
+// ★ 约定只能有一份：本函数是 slot 侧的权威，`g4_trace_wiring_test.go` 断言它与
+// `precomp.FieldName` 对全部真实算法逐字一致（防两处各自演进而静默分叉）。
+func FieldNameOf(algoID string) string {
+	const p = "algo."
+	if strings.HasPrefix(algoID, p) {
+		return algoID[len(p):]
+	}
+	return algoID
+}
+
 // Validate 用 **gate 的多条 G4 判定函数**校验注册表本身。//
 // ★ 这是 G4 闸门第一次被生产代码调用：判定的对象是**磁盘上的真 YAML**，
 // 而不是测试里手搓的假数据。违规即返回 error（fail-closed）。
@@ -449,6 +550,21 @@ func (r *Registry) Validate() error {
 	// ★ 还兜住一个 YAML 保留字陷阱：`missing_policy: null`（裸写）会被 YAML 解析成
 	// 空值 ⇒ 被缺省填充静默改成 "skip"，语义被反转。本断言对此单列报错。
 	violations = append(violations, gate.CheckMissingPolicyDeclared(r.MissingPolicyDocs())...)
+
+	// 算法的**可回溯声明**必须可判定，且物化算法必须为 true（G4 第十四侧 / docs/02 验收）。
+	//
+	// ★ 此前 `trace` 是**被读进来、写进 DB（registry_algorithm.trace）、
+	// 但没有任何判定消费其声明值**的一个字段：全链路只有解析/赋值/写库三类用法，
+	// 没有第四类（比较、判定、阈值）。`precomp.AlgoDef` 根本没有 Trace 字段
+	// （BuildRow 从不读它），`query.go` 组装 AlgoTrace 时也从不看它 ⇒
+	// `trace: true` 与 `trace: false` 与「随便写」**行为完全等价**
+	// （DB 侧 0002 的 `DEFAULT true` 只是入库兜底，不等于 Go 侧有闸门）。
+	//
+	// 后果是**可回溯性失去判据**：docs/02 验收「所有输出可沿 AlgoTrace 回溯」
+	// 在实现侧无从保证 —— 一个物化算法声明 trace: false 也能照常产出、照常出站，
+	// 而它的值再也追不回是哪条算法算的、用了哪些数据。
+	violations = append(violations, gate.CheckTraceDeclared(r.TraceDocs())...)
+
 	// 算法 → 算法 的引用完整性（depends_on_algos 必须指向已注册算法）。
 	// 与 CheckSlotsRegistered 对称；缺了它，`depends_on_algos: [algo.ghost]`
 	// 会被当作「已声明依赖」从而让绑定校验放行一个根本不存在的来源。

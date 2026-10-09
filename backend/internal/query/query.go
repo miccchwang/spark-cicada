@@ -105,6 +105,28 @@ type Policy struct {
 	CacheTTL time.Duration
 	// 桶字段 → 算法 ID 的映射（用于 AlgoTrace）
 	BucketAlgoMap map[string]map[string]string
+	// BucketAlgoRefs 桶 → 字段 → 算法引用（含依赖槽与 trace 声明）。
+	//
+	// ★ 2026-10-09（G4 第十四侧）：`AlgoTrace` 此前只填 Field/AlgoID，
+	// `dataSlots` 永远为空 ⇒ docs/01 §5.5 / docs/02 验收「可回溯算法与数据槽」
+	// 在实现侧做不到。本字段提供组装可回溯条目所需的「算法 → 依赖槽 / trace」，
+	// 来源是 **算法注册表**（单一事实源），而不是在装配层手抄。
+	//
+	// ★ 未提供（nil）时退回 BucketAlgoMap：AlgoTrace 仍产出，但 dataSlots 为空 ——
+	// 出站契约守卫（slot.ContractGuard）会因「派生列缺 dataSlots」而拒绝出站，
+	// 故生产装配（main.go）**必须**提供本字段。
+	BucketAlgoRefs map[string]map[string]AlgoRef
+}
+
+// AlgoRef 是桶里一条派生列对应的算法引用（用于组装可回溯的 AlgoTrace）。
+type AlgoRef struct {
+	// ID 算法 ID（如 algo.gp）。
+	ID string
+	// Slots 该算法的依赖数据槽（写入 AlgoTrace.dataSlots）。
+	Slots []string
+	// Trace 该算法的 trace 声明：false ⇒ 不产出可回溯条目
+	// （声明层 gate.CheckTraceDeclared 已禁止物化算法为 false，此处为运行时兜底）。
+	Trace bool
 }
 
 // Run 执行一次查询。
@@ -223,9 +245,31 @@ func (o *Orchestrator) run(ctx context.Context, q contracts.QueryState, tenantID
 		rs.Rows = append(rs.Rows, row)
 	}
 
-	// 6) AlgoTrace + Columns：为每个派生列记录来源算法与所用槽。
+	// 6) AlgoTrace + Columns：为每个派生列记录来源算法、所用数据槽与是否被跳过。
 	//    列定义决定渲染层能看到哪些字段——**必须由查询层显式声明**，
 	//    未声明的列下游（Gate）一律视为不可见（fail-closed）。
+	//
+	// ★ 2026-10-09（G4 第十四侧）：此前这里只填 Field/AlgoID，`dataSlots` 永远为空、
+	//   `skipped` 永远 false ⇒ docs/01 §5.5 与 docs/02 验收「可回溯算法与数据槽」
+	//   在实现侧**做不到**，且没有任何东西会变红。现：
+	//     · dataSlots 取自算法注册表（BucketAlgoRefs，单一事实源）；
+	//     · skipped 取自桶的 skipped_fields（该字段是否被整列跳过）；
+	//     · reason 取自 gaps（为何缺）；
+	//     · **真正消费 trace 声明**：未声明可回溯（trace=false）的算法不产出条目
+	//       （声明层已禁止物化算法为 false，此处为运行时兜底 + 让 flag 有真实消费点）。
+	refs := o.Policy.BucketAlgoRefs[bucket]
+	skippedInBucket := map[string]bool{}
+	for _, br := range rows {
+		for _, f := range br.SkippedFields {
+			skippedInBucket[f] = true
+		}
+	}
+	gapReason := map[string]string{}
+	for _, g := range rs.Gaps {
+		if _, seen := gapReason[g.Field]; !seen {
+			gapReason[g.Field] = g.Reason
+		}
+	}
 	algoKeys := make([]string, 0, len(algoMap))
 	for field := range algoMap {
 		algoKeys = append(algoKeys, field)
@@ -233,16 +277,30 @@ func (o *Orchestrator) run(ctx context.Context, q contracts.QueryState, tenantID
 	sort.Strings(algoKeys)
 	for _, field := range algoKeys {
 		algoID := algoMap[field]
-		rs.AlgoTrace = append(rs.AlgoTrace, contracts.AlgoTrace{
-			Field:  field,
+		var slots []string
+		traced := true
+		if r, ok := refs[field]; ok {
+			algoID = r.ID
+			slots = r.Slots
+			traced = r.Trace
+		}
+		// 列定义始终声明（渲染层需要知道有哪些列）。
+		rs.Columns = append(rs.Columns, contracts.ColumnDef{
+			Key:    field,
+			Label:  field,
+			Perm:   defaultPermFor(field),
+			Kind:   defaultKindFor(field),
 			AlgoID: algoID,
 		})
-		rs.Columns = append(rs.Columns, contracts.ColumnDef{
-			Key:     field,
-			Label:   field,
-			Perm:    defaultPermFor(field),
-			Kind:    defaultKindFor(field),
-			AlgoID:  algoID,
+		if !traced {
+			continue // 声明 trace=false ⇒ 不产出可回溯条目（运行时兜底）
+		}
+		rs.AlgoTrace = append(rs.AlgoTrace, contracts.AlgoTrace{
+			Field:     field,
+			AlgoID:    algoID,
+			DataSlots: slots,
+			Skipped:   skippedInBucket[field],
+			Reason:    gapReason[field],
 		})
 	}
 

@@ -293,6 +293,23 @@ jobs:
         working-directory: backend
         run: go test ./internal/gate/ ./internal/slot/ ./internal/precomp/ -count=1 -run "MissingPolicy" -v
 
+      # ★ 可回溯声明闸门（G4 第十四侧：trace 可解析 + 与 0002 DEFAULT 同源 + 出站可回溯性）。
+      #   此前 `algorithms/*.yaml` 的 `trace: true` 被读进来、写进 DB，却没有任何判定
+      #   消费其声明值（第二十二个变种）：precomp.AlgoDef 根本没有 Trace 字段、
+      #   query.go 组装 AlgoTrace 时也从不看它 ⇒ `trace: true` 与 `false` 与乱写
+      #   **行为完全等价**（0002 的 DEFAULT true 只是入库兜底，不等于 Go 侧有闸门）。
+      #   更严重的是**输出侧也没被消费**：AlgoTrace 只填了 Field/AlgoID，`dataSlots`
+      #   永远为空、`skipped` 永远 false ⇒ docs/01 §5.5 与 docs/02 验收
+      #   「可回溯算法与数据槽」在实现侧做不到，且没有任何东西会变红。
+      #   现：① 声明层 —— 物化算法（writes_bucket 非空且非 PENDING）必须 trace: true；
+      #   ② 出站层 —— 每条派生列必须有 AlgoTrace 条目且携带 dataSlots（ContractGuard）；
+      #   ③ 运行时 —— query 从算法注册表补齐 dataSlots/skipped/reason 并真消费 trace。
+      #   本步同时钉住接线：判定函数必须在 slot.Validate 与 slot.ContractGuard 里
+      #   都有**真实生产调用点**。
+      - name: ★ 可回溯闸门（G4 第十四侧：trace 可解析 + 与 DB 同源 + 出站可回溯性）
+        working-directory: backend
+        run: go test ./internal/gate/ ./internal/slot/ ./internal/query/ -count=1 -run "Trace" -v
+
       - name: 控制面闸门
         working-directory: backend
         run: go test ./internal/admin/ -count=1 -v

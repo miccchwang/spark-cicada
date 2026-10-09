@@ -84,6 +84,12 @@ type dataPlane struct {
 	rules *rule.Registry
 	// buckets 预计算桶注册表（G4 反向 + G6 映射来源）。
 	buckets *slot.BucketRegistry
+	// slotReg 数据槽/算法注册表（G4 各侧闸门 + AlgoTrace 可回溯来源）。
+	//
+	// ★ 必要性（G4 第十四侧）：query 组装 AlgoTrace 时需要「算法 → 依赖槽 / trace」，
+	//   其唯一事实源是**算法注册表**。此前它只是 loadSpecs 的局部变量 ⇒ 装配层
+	//   只能手抄一份映射（必然与 YAML 分叉）。存下来供 main.go 派生 BucketAlgoRefs。
+	slotReg *slot.Registry
 	// specIssues 记录「仓库定义文件」层面的问题（不阻断启动，但进 healthz 暴露）。
 	// 与 dbDegradeReason 同源纪律：静默失败必须变成可观测的失败。
 	specIssues []string
@@ -328,6 +334,7 @@ func (p *dataPlane) loadSpecs(specDir string) {
 	}
 	log.Printf("[spec] 数据槽 %d 个、算法 %d 个（G4 分离与引用完整性已过闸门）",
 		len(reg.Slots()), len(reg.Algorithms()))
+	p.slotReg = reg
 
 	buckets, err := slot.LoadBucketRegistry(bucketsDir, reg)
 	if err != nil {
