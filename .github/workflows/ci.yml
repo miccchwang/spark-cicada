@@ -310,6 +310,20 @@ jobs:
         working-directory: backend
         run: go test ./internal/gate/ ./internal/slot/ ./internal/query/ -count=1 -run "Trace" -v
 
+      # G9 · 插槽模块清单（M-SLOT）。
+      #
+      # 缺口：contracts/slot-manifest.yaml 自称「新功能模块通过本清单自注册；主机
+      # 零改代码即可挂载」，但此前全仓**没有任何代码读过它**（grep 零命中），
+      # 而运行时插槽主机启动时**零模块挂载**（/api/admin/modules 恒为空列表）。
+      # 本步钉三件事：
+      #   ① 声明层 —— 格式/词表/幽灵槽位/幽灵数据槽/引用完整性；
+      #   ② 对平层 —— 清单声明 ↔ 运行时注册表**双向**一致（缺一侧即「声明等于装饰」）；
+      #   ③ 接线 —— sparkd 真的「能力集同源 + 装载清单 + 挂载模块」，
+      #      且挂载失败进 specIssues（/healthz 可观测）。
+      - name: ★ 插槽模块清单闸门（G9：SlotManifest 真读 + 声明层校验 + 挂载接线）
+        working-directory: backend
+        run: go test ./internal/gate/ ./internal/slothost/ -count=1 -run "TestG9Manifest" -v
+
       - name: 控制面闸门
         working-directory: backend
         run: go test ./internal/admin/ -count=1 -v

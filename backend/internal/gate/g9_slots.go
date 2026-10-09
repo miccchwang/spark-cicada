@@ -151,3 +151,61 @@ func indexOf(xs []string, v string) int {
 	}
 	return -1
 }
+
+// SetAvailable 重设「已就绪能力集」（能力协商的依据）。
+//
+// ★ 为什么需要它（2026-10-09 实测的真实缺口）：
+//
+//	能力集原先只在 NewRegistry 时**手抄 5 项**（`cap.core` / `slot.revenue` /
+//	`slot.cogs` / `slot.platform_fee` / `slot.inventory_snap`），与真实数据槽注册表
+//	（`slots/*.yaml`）**毫无关系**。而模块的 `Requires` 是**数据槽 ID** ⇒
+//	清单里声明的 `data_slots`（slot.qty 等）永远不在能力集里，
+//	能力协商**必然失败**、模块一个都挂不上 —— 且失败是静默的（只体现为
+//	/api/admin/modules 返回空列表）。
+//
+//	现在由 sparkd 用 `slot.Registry.RegisteredSlotIDs()` 重设它，
+//	让「主机能力」与「数据槽事实源」同源。
+//
+// 入参用「注册集合」（`map[string]bool`）而非切片：与
+// RegisteredSlotIDs / RegisteredBucketIDs / RegisteredRuleIDs 同形态。
+func (r *Registry) SetAvailable(caps map[string]bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	set := make(map[string]bool, len(caps))
+	for c, ok := range caps {
+		if ok && c != "" {
+			set[c] = true
+		}
+	}
+	r.available = set
+}
+
+// Available 返回当前「已就绪能力集」的副本。
+//
+// 用途：`slothost.Manifest.MountAll` 要在**一次性注册表**上先试挂一遍
+// （见其注释：避免半挂载状态），试挂必须用与真挂**同一份能力集**，
+// 故需要一个读取口。返回副本，防调用方改动内部状态。
+func (r *Registry) Available() map[string]bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]bool, len(r.available))
+	for k, v := range r.available {
+		out[k] = v
+	}
+	return out
+}
+
+// MountedIDs 返回已挂载模块的 ID（按挂载顺序）。
+//
+// 用途：`gate.CheckModuleManifestMatchesRegistry` 需要它做
+// 「清单声明 ↔ 运行时注册表」的双向对平 —— 缺了它，
+// 「清单声明了 6 个模块、运行时一个都没挂载」这种缺口无法被检出。
+func (r *Registry) MountedIDs() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, 0, len(r.order))
+	for _, id := range r.order {
+		out = append(out, id)
+	}
+	return out
+}

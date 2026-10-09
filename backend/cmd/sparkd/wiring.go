@@ -30,6 +30,7 @@ import (
 	"github.com/miccchwang/spark-cicada/backend/internal/groupstore"
 	"github.com/miccchwang/spark-cicada/backend/internal/rule"
 	"github.com/miccchwang/spark-cicada/backend/internal/slot"
+	"github.com/miccchwang/spark-cicada/backend/internal/slothost"
 	"github.com/miccchwang/spark-cicada/backend/internal/store"
 	"github.com/miccchwang/spark-cicada/backend/internal/templatestore"
 	"github.com/miccchwang/spark-cicada/backend/internal/tenant"
@@ -335,6 +336,29 @@ func (p *dataPlane) loadSpecs(specDir string) {
 	log.Printf("[spec] 数据槽 %d 个、算法 %d 个（G4 分离与引用完整性已过闸门）",
 		len(reg.Slots()), len(reg.Algorithms()))
 	p.slotReg = reg
+
+	// ── M-SLOT：插槽模块清单（契约真读 + 能力协商 + 真挂载）──
+	//
+	// ★ 两个必须同源的事实源，此前**都断了**：
+	//   ① 主机**能力集** = 真实数据槽注册表。此前是 NewRegistry 里手抄的 5 项
+	//      （cap.core / slot.revenue / …），与 slots/*.yaml 毫无关系 ⇒
+	//      清单声明的 data_slots（slot.qty 等）永远不在能力集里，协商必然失败；
+	//   ② **模块清单** contracts/slot-manifest.yaml。此前全仓无人读（grep 零命中）⇒
+	//      启动时零模块挂载，/api/admin/modules 恒为空列表，而清单声明了 6 个模块。
+	//   缺任一条，「零改主机即可挂载」（docs/02 M-SLOT 验收）在实现侧都不成立。
+	p.registry.SetAvailable(reg.RegisteredSlotIDs())
+	manifestPath := filepath.Join(specDir, "contracts", "slot-manifest.yaml")
+	man, err := slothost.LoadManifest(manifestPath, reg.RegisteredSlotIDs())
+	if err != nil {
+		p.specIssues = append(p.specIssues, "slot manifest: "+err.Error())
+		log.Printf("[warn] 插槽模块清单装载失败（%s）：%v", manifestPath, err)
+	} else if err := man.MountAll(p.registry); err != nil {
+		p.specIssues = append(p.specIssues, "slot manifest mount: "+err.Error())
+		log.Printf("[warn] 插槽模块挂载失败：%v", err)
+	} else {
+		log.Printf("[spec] 插槽模块 %d 个已挂载（manifest v%s：真读 + 能力协商 + 双向对平）",
+			len(man.Modules), man.Version)
+	}
 
 	buckets, err := slot.LoadBucketRegistry(bucketsDir, reg)
 	if err != nil {
