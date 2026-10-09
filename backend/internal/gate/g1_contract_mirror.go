@@ -20,6 +20,22 @@
 // 它没有运行时调用点 —— contracts/*.ts 不随二进制发布，运行时无从读取。
 // 「有没有真的接上 CI」由 g1_contract_mirror_test.go 的接线断言钉住，
 // 而不是靠一句注释里的承诺。
+//
+// ★ 第二轮补齐（2026-10-09）：对平范围从 16 对扩到 27 对，并补两件事 ——
+//
+//  1. **「声明即须对平」的覆盖闸门**：首轮只覆盖了「已经进表」的 16 对，
+//     而**没进表**的契约照旧无人对平。实测发现 `template` / `pnl` / `strategy`
+//     三个包各自在 `_test.go` 里用**硬编码字面量**断言「字段与 contracts/X.ts 一致」
+//     （例：`template_test.go` 的 `required := []string{"id","name",...}`）——
+//     测试的注释声称读契约，实际**从不打开那个文件** ⇒ 真源加一个字段，
+//     它照样绿。这正是本仓反复踩的「假闸门」。现 `UncoveredContractFiles`
+//     要求 `contracts/` 下**每个 `.ts`** 要么有字段级镜像对，要么在
+//     `UnmirroredContracts()` 里显式声明理由（且声明不得腐烂）。
+//  2. **有意的差异必须显式声明**：对平是双向的，Go 多一个字段同样算漂移，
+//     但有些扩展是有意的（`template.Template` 的 `v` / `shares`、
+//     `strategy.Choice` 把契约的 `current` 对象收成 `currentKey`）。
+//     故 `ExtraGoFields` / `FieldAliases` 必须逐条登记，且**登记了就必须真的存在**
+//     （防白名单腐烂）；未登记的多余字段照旧报漂移。
 package gate
 
 import (
@@ -34,6 +50,11 @@ import (
 	"github.com/miccchwang/spark-cicada/backend/internal/authz"
 	"github.com/miccchwang/spark-cicada/backend/internal/chain"
 	"github.com/miccchwang/spark-cicada/backend/internal/contracts"
+	"github.com/miccchwang/spark-cicada/backend/internal/pnl"
+	"github.com/miccchwang/spark-cicada/backend/internal/req"
+	"github.com/miccchwang/spark-cicada/backend/internal/strategy"
+	"github.com/miccchwang/spark-cicada/backend/internal/template"
+	"github.com/miccchwang/spark-cicada/backend/internal/tenant"
 )
 
 // ContractMirrorPair 一对「TS 真源接口 ↔ Go 镜像结构体」。
@@ -44,34 +65,146 @@ type ContractMirrorPair struct {
 	File      string       // 真源文件名，相对 contracts/（如 "query-state.ts"）
 	Interface string       // TS 接口名
 	GoType    reflect.Type // Go 镜像结构体类型
+
+	// ExtraGoFields 是**有意**比真源多的 Go 字段（json 名）。
+	//
+	// 为什么必须显式声明：对平是**双向**的，Go 多一个字段同样算漂移；
+	// 而有些扩展是有意的（`template.Template` 比契约多 `v`（版本位）与
+	// `shares`（团队档可见对象），两者都有明确生产者/消费者）。
+	// 声明后仍会被校验「真的存在」，故它是一份**不得腐烂**的白名单。
+	ExtraGoFields []string
+
+	// FieldAliases 是**有意**改名的字段映射：真源字段名 → Go json 字段名。
+	//
+	// 例：契约 `StrategyChoice.current` 是整个选项对象，Go 侧只存
+	// `currentKey`（选项 key）—— 存两份必然漂移。改名是有意的，但必须登记，
+	// 且映射**两侧都要真实存在**（否则是死映射，同样报错）。
+	FieldAliases map[string]string
+}
+
+// mirrorPair 构造一对「字段应完全一致」的镜像。
+func mirrorPair(file, iface string, t reflect.Type) ContractMirrorPair {
+	return ContractMirrorPair{File: file, Interface: iface, GoType: t}
+}
+
+// mirrorPairExt 构造一对**有已声明差异**的镜像（见 ExtraGoFields / FieldAliases）。
+func mirrorPairExt(file, iface string, t reflect.Type, extra []string, aliases map[string]string) ContractMirrorPair {
+	return ContractMirrorPair{
+		File: file, Interface: iface, GoType: t,
+		ExtraGoFields: extra, FieldAliases: aliases,
+	}
 }
 
 // ContractMirrorPairs 返回参与对平的镜像对（唯一权威表）。
 func ContractMirrorPairs() []ContractMirrorPair {
 	return []ContractMirrorPair{
 		// ── query-state.ts：M-FILTER 的唯一产出（Go 镜像：backend/internal/contracts）
-		{"query-state.ts", "QueryState", reflect.TypeOf(contracts.QueryState{})},
-		{"query-state.ts", "TimeRange", reflect.TypeOf(contracts.TimeRange{})},
-		{"query-state.ts", "FilterClause", reflect.TypeOf(contracts.FilterClause{})},
-		{"query-state.ts", "DimSelection", reflect.TypeOf(contracts.DimSelection{})},
-		{"query-state.ts", "OrderClause", reflect.TypeOf(contracts.OrderClause{})},
-		{"query-state.ts", "PageClause", reflect.TypeOf(contracts.PageClause{})},
-		{"query-state.ts", "PrecomputeHint", reflect.TypeOf(contracts.PrecomputeHint{})},
+		mirrorPair("query-state.ts", "QueryState", reflect.TypeOf(contracts.QueryState{})),
+		mirrorPair("query-state.ts", "TimeRange", reflect.TypeOf(contracts.TimeRange{})),
+		mirrorPair("query-state.ts", "FilterClause", reflect.TypeOf(contracts.FilterClause{})),
+		mirrorPair("query-state.ts", "DimSelection", reflect.TypeOf(contracts.DimSelection{})),
+		mirrorPair("query-state.ts", "OrderClause", reflect.TypeOf(contracts.OrderClause{})),
+		mirrorPair("query-state.ts", "PageClause", reflect.TypeOf(contracts.PageClause{})),
+		mirrorPair("query-state.ts", "PrecomputeHint", reflect.TypeOf(contracts.PrecomputeHint{})),
 
 		// ── data-contract.ts：M-RENDER 的唯一入参
-		{"data-contract.ts", "DataContract", reflect.TypeOf(contracts.DataContract{})},
-		{"data-contract.ts", "ColumnDef", reflect.TypeOf(contracts.ColumnDef{})},
-		{"data-contract.ts", "LevelSummary", reflect.TypeOf(contracts.LevelSummary{})},
-		{"data-contract.ts", "AlgoTrace", reflect.TypeOf(contracts.AlgoTrace{})},
-		{"data-contract.ts", "DataGap", reflect.TypeOf(contracts.DataGap{})},
+		mirrorPair("data-contract.ts", "DataContract", reflect.TypeOf(contracts.DataContract{})),
+		mirrorPair("data-contract.ts", "ColumnDef", reflect.TypeOf(contracts.ColumnDef{})),
+		mirrorPair("data-contract.ts", "LevelSummary", reflect.TypeOf(contracts.LevelSummary{})),
+		mirrorPair("data-contract.ts", "AlgoTrace", reflect.TypeOf(contracts.AlgoTrace{})),
+		mirrorPair("data-contract.ts", "DataGap", reflect.TypeOf(contracts.DataGap{})),
 
 		// ── entitlement.ts：授权求值结果（Go 镜像：backend/internal/authz）
-		{"entitlement.ts", "Entitlement", reflect.TypeOf(authz.Entitlement{})},
-		{"entitlement.ts", "GrantRecord", reflect.TypeOf(authz.GrantRecord{})},
-		{"entitlement.ts", "EntitlementView", reflect.TypeOf(authz.EntitlementView{})},
+		mirrorPair("entitlement.ts", "Entitlement", reflect.TypeOf(authz.Entitlement{})),
+		mirrorPair("entitlement.ts", "GrantRecord", reflect.TypeOf(authz.GrantRecord{})),
+		mirrorPair("entitlement.ts", "EntitlementView", reflect.TypeOf(authz.EntitlementView{})),
 
-		// ── permission-request.ts：抄送记录（Go 镜像：backend/internal/chain）
-		{"permission-request.ts", "CcRecord", reflect.TypeOf(chain.CcRecord{})},
+		// ── permission-request.ts：抄送记录与审批步骤
+		//    （Go 镜像：backend/internal/chain 与 backend/internal/req）
+		mirrorPair("permission-request.ts", "CcRecord", reflect.TypeOf(chain.CcRecord{})),
+		// ApprovalStep 会被序列化进 fact_permission_request.approvals 这个 jsonb 列，
+		// 前端按契约 camelCase 读取；req.go 的注释已明写「JSON tag 必须逐字一致」，
+		// 但此前**没有任何东西真的去读契约**（只有一句注释）。
+		mirrorPair("permission-request.ts", "ApprovalStep", reflect.TypeOf(req.ApprovalStep{})),
+
+		// ── view-template.ts：M-TEMPLATE（Go 镜像：backend/internal/template）
+		//
+		// ★ 本契约此前由 template_test.go 用**硬编码字段名列表**断言「与契约一致」
+		//   （测试从不打开契约文件）⇒ 真源加字段不会变红。现由本表真读真对平。
+		mirrorPairExt("view-template.ts", "ViewTemplate", reflect.TypeOf(template.Template{}),
+			// Go 侧有意多出的两个字段（均有明确生产者/消费者，非死字段）：
+			//   * `v`      —— 契约版本位（template.Version），随模板一并下发；
+			//   * `shares` —— 团队档的显式可见对象（契约里未建模，属本仓扩展）。
+			[]string{"v", "shares"}, nil),
+		mirrorPair("view-template.ts", "ColumnPref", reflect.TypeOf(template.ColumnPref{})),
+		mirrorPair("view-template.ts", "LayoutPref", reflect.TypeOf(template.LayoutPref{})),
+
+		// ── strategy-choice.ts：M-STRATEGY 选型卡（Go 镜像：backend/internal/strategy）
+		mirrorPairExt("strategy-choice.ts", "StrategyChoice", reflect.TypeOf(strategy.Choice{}),
+			nil,
+			// 契约的 `current` 是**整个选项对象**；Go 侧只存 `currentKey`（选项 key），
+			// 由 key 推出对象 —— 存两份必然漂移（改了 options 忘了改 current）。
+			map[string]string{"current": "currentKey"}),
+		mirrorPair("strategy-choice.ts", "ChoiceOption", reflect.TypeOf(strategy.Option{})),
+		mirrorPair("strategy-choice.ts", "ImpactPreview", reflect.TypeOf(strategy.ImpactPreview{})),
+
+		// ── pnl.ts：口径元数据（Go 镜像：backend/internal/pnl）
+		//    此前 pnl_test.go 用字面量比对 `sellerDiscountRole` 等值，同样不读真源。
+		mirrorPair("pnl.ts", "CaliberMeta", reflect.TypeOf(pnl.CaliberMeta{})),
+
+		// ── tenant.ts：多租户（Go 镜像：backend/internal/tenant）
+		//    此前只有版本号对齐（tenant_test.go 比的是字面量 "1.0"），字段从未对平。
+		mirrorPair("tenant.ts", "Tenant", reflect.TypeOf(tenant.Tenant{})),
+		mirrorPair("tenant.ts", "TenantQuota", reflect.TypeOf(tenant.TenantQuota{})),
+		mirrorPair("tenant.ts", "TenantContext", reflect.TypeOf(tenant.TenantContext{})),
+	}
+}
+
+// UnmirroredContract 声明「本契约文件**有意**没有字段级 Go 镜像」及其理由。
+//
+// 为什么需要它：`contracts/` 下的每个 `.ts` 都是「唯一真源」，但并非每个
+// 真源都能做**字段级 JSON 对平** —— 有的 Go 对应物是内部领域类型（无 json 标签、
+// 不经 HTTP 出线），有的所在包**反向依赖 gate**（import 环使 gate 无法反射它），
+// 有的对应物是未导出类型。若不显式声明，「无人对平」与「有意不对平」就分不开，
+// 于是「新加一个契约文件却没人管」会再次静默发生。
+//
+// 纪律：声明必须给理由；且**声明不得腐烂** —— 一旦该文件真的进了镜像表
+// （或文件被删除），`UncoveredContractFiles` 会反向报错。
+type UnmirroredContract struct {
+	File   string
+	Reason string
+}
+
+// UnmirroredContracts 返回「有意无字段级镜像」的契约文件（唯一权威表）。
+func UnmirroredContracts() []UnmirroredContract {
+	return []UnmirroredContract{
+		{
+			File: "backup-quota.ts",
+			Reason: "Go 对应物是**内部领域类型且无 json 标签**：`dr.Region` / `dr.Archive` / " +
+				"`dr.RollbackPolicy` 都只在进程内流转（出线形态是 `api` 包未导出的 " +
+				"`downloadView`，且它把 BackupArchive 与 DownloadCheckResult **压平合并**、" +
+				"字段名也不同）。更硬的约束是**包依赖方向**：`internal/dr` 反向 import `gate`" +
+				"（它要调 `gate.QuotaKey` / 各判定函数）⇒ gate 无法 import dr，反射对平在" +
+				"结构上不可能。故本文件只做**常量级**对平（见 dr.go 的 Reason* 常量与 " +
+				"DEFAULT_ROLLBACK_POLICY 注释），字段级对平待「出线视图导出 / 抽独立契约包」后再接。" +
+				"（待拍板项见 docs/06 F19）",
+		},
+		{
+			File: "data-chain.ts",
+			Reason: "Go 对应物 `chain.OrgNode` / `DataChain` / `DataChainNode` / `ApprovalChain` / " +
+				"`CrossDeptPolicy` 是**内部领域类型**：全仓除 `chain.CcRecord` 外，chain 包" +
+				"**没有任何 json 标签**（它不经 HTTP 出线，出线形态由 api 层组装）。" +
+				"字段级 JSON 对平对它们不适用；且字段口径本身仍受 F9/F10 决策约束。" +
+				"（待拍板项见 docs/06 F19）",
+		},
+		{
+			File: "user-group.ts",
+			Reason: "Go 对应物 `group.Group` / `group.Grant` **无 json 标签**（内部领域类型）；" +
+				"真正的落库形态 `groupstore.groupGrantsJSON` 是**未导出**类型且**有意多一个 " +
+				"`isIT` 字段**（0006 的 D7 约束要用它判身份，刻意不用组名猜）。" +
+				"未导出类型无法被 gate 反射，故只保留「落库形状 ↔ 契约」的注释级对齐。" +
+				"（待拍板项见 docs/06 F19）",
+		},
 	}
 }
 
@@ -340,9 +473,16 @@ func GoJSONFieldNames(t reflect.Type) []string {
 // ───────────────────────────── 对平 ─────────────────────────────
 
 // DiffContractMirrorPair 计算一对镜像的字段差异（双向）。
+//
+// 已声明的**有意差异**（ExtraGoFields / FieldAliases）在比较前先归一化，
+// 故「有意的扩展」不会被误报为漂移；但**未声明**的多余字段照旧报漂移。
 func DiffContractMirrorPair(pair ContractMirrorPair, tsFields []string) ContractMirrorDiff {
 	goFields := GoJSONFieldNames(pair.GoType)
-	onlyTS, onlyGo := diffFieldSets(tsFields, goFields)
+	// 改名：真源名 → Go 名（映射本身是否「死」由 ContractMirrorPairIssues 单独报）。
+	effTS := aliasTSFields(tsFields, pair.FieldAliases)
+	onlyTS, onlyGo := diffFieldSets(effTS, goFields)
+	// 剔除已声明的 Go-only 扩展（声明了却不存在的情形同样单独报，不在此静默吞掉）。
+	onlyGo = removeDeclaredExtras(onlyGo, pair.ExtraGoFields)
 	name := pair.GoType.Name()
 	return ContractMirrorDiff{
 		File:        pair.File,
@@ -353,10 +493,160 @@ func DiffContractMirrorPair(pair ContractMirrorPair, tsFields []string) Contract
 	}
 }
 
+// aliasTSFields 按映射把真源字段名替换为 Go 名（未命中的字段原样保留）。
+func aliasTSFields(tsFields []string, aliases map[string]string) []string {
+	if len(aliases) == 0 {
+		return tsFields
+	}
+	out := make([]string, 0, len(tsFields))
+	for _, f := range tsFields {
+		if to, ok := aliases[f]; ok {
+			out = append(out, to)
+			continue
+		}
+		out = append(out, f)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// removeDeclaredExtras 从「Go 有而真源缺」里剔除已声明的扩展字段。
+func removeDeclaredExtras(onlyGo, declared []string) []string {
+	if len(onlyGo) == 0 || len(declared) == 0 {
+		return onlyGo
+	}
+	set := map[string]bool{}
+	for _, d := range declared {
+		set[d] = true
+	}
+	out := make([]string, 0, len(onlyGo))
+	for _, f := range onlyGo {
+		if !set[f] {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// ContractMirrorPairIssues 校验一对镜像的**已声明差异**本身是否成立。
+//
+// 存在意义：`ExtraGoFields` / `FieldAliases` 是白名单，白名单最大的风险是**腐烂** ——
+//
+//	① 映射/扩展登记了，但字段早已改名或删除 ⇒ 白名单还在替一个不存在的差异背书；
+//	② 把「真源与 Go 都有的字段」误登记成「Go 独有扩展」⇒ 等于偷偷放宽了对平。
+//
+// 故：映射两侧都必须真实存在；扩展必须真的只在 Go 侧存在。
+func ContractMirrorPairIssues(pair ContractMirrorPair, tsFields []string) []string {
+	var out []string
+	tsSet := map[string]bool{}
+	for _, f := range tsFields {
+		tsSet[f] = true
+	}
+	goSet := map[string]bool{}
+	for _, f := range GoJSONFieldNames(pair.GoType) {
+		goSet[f] = true
+	}
+	label := fmt.Sprintf("%s:%s", pair.File, pair.Interface)
+
+	// 字段名排序，保证报错信息稳定（map 迭代无序）。
+	keys := make([]string, 0, len(pair.FieldAliases))
+	for k := range pair.FieldAliases {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, from := range keys {
+		to := pair.FieldAliases[from]
+		if !tsSet[from] {
+			out = append(out, fmt.Sprintf(
+				"%s 的字段改名映射源 %q 在真源里不存在（契约已改名/删除？）", label, from))
+		}
+		if !goSet[to] {
+			out = append(out, fmt.Sprintf(
+				"%s 的字段改名映射目标 %q 在 Go 镜像里不存在（Go 侧已改名/删除？）", label, to))
+		}
+	}
+
+	extras := append([]string(nil), pair.ExtraGoFields...)
+	sort.Strings(extras)
+	for _, e := range extras {
+		if !goSet[e] {
+			out = append(out, fmt.Sprintf(
+				"%s 声明 %q 为 Go 独有扩展，但 Go 镜像里没有该字段（白名单腐烂）", label, e))
+		}
+		if tsSet[e] {
+			out = append(out, fmt.Sprintf(
+				"%s 把 %q 登记为 Go 独有扩展，但真源里也有该字段 —— "+
+					"这等于偷偷放宽了对平（两侧共有字段不得登记为扩展）", label, e))
+		}
+	}
+	return out
+}
+
+// UncoveredContractFiles 检查 `contracts/` 下的 `.ts` 是否**每一个都有人管**。
+//
+// 返回：uncovered = 既无镜像对、也未声明的文件；stale = 已声明却（被覆盖 / 文件不存在）的声明。
+//
+// 动机（★ 真实缺口）：首轮 G1 只对平「已经进表」的 16 对，而**没进表**的契约
+// 照旧无人对平 —— 实测 `template` / `pnl` / `strategy` 三处都在 `_test.go` 里用
+// **硬编码字面量**冒充「与契约一致」。闸门若只覆盖已知范围，「新加一个契约文件
+// 却没人管」这件事会永远静默。故把「每个真源都要有归宿」本身变成一条断言。
+func UncoveredContractFiles(dir string, pairs []ContractMirrorPair, unmirrored []UnmirroredContract) (uncovered, stale []string, err error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("读取 contracts 目录 %s: %w", dir, err)
+	}
+	covered := map[string]bool{}
+	for _, p := range pairs {
+		covered[p.File] = true
+	}
+	declared := map[string]bool{}
+	for _, u := range unmirrored {
+		declared[u.File] = true
+	}
+
+	var files []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".ts") {
+			continue
+		}
+		files = append(files, e.Name())
+	}
+	sort.Strings(files)
+
+	for _, f := range files {
+		if covered[f] || declared[f] {
+			continue
+		}
+		uncovered = append(uncovered, fmt.Sprintf(
+			"%s 既没有字段级镜像对、也没有在 UnmirroredContracts() 里声明 —— "+
+				"该契约的真源与实现之间**无人对平**", f))
+	}
+
+	for _, u := range unmirrored {
+		if _, statErr := os.Stat(filepath.Join(dir, u.File)); statErr != nil {
+			stale = append(stale, fmt.Sprintf(
+				"%s 被声明为「无字段级镜像」，但该文件在 contracts/ 下不存在（声明腐烂）", u.File))
+			continue
+		}
+		if covered[u.File] {
+			stale = append(stale, fmt.Sprintf(
+				"%s 被声明为「无字段级镜像」，但它已有镜像对 —— "+
+					"请从 UnmirroredContracts() 删掉该声明", u.File))
+		}
+		if strings.TrimSpace(u.Reason) == "" {
+			stale = append(stale, fmt.Sprintf(
+				"%s 的「无镜像」声明缺少理由 —— 无理由的声明等于把缺口藏起来", u.File))
+		}
+	}
+	sort.Strings(uncovered)
+	sort.Strings(stale)
+	return uncovered, stale, nil
+}
+
 // CheckContractMirrorDir 读取 dir 下的真源文件，逐对计算差异。
 //
 // 返回值：diffs = 每对镜像的差异（含「一致」的）；errs = 结构性错误
-// （文件读不到 / interface 改名或删除）；err = 文件读取失败。
+// （文件读不到 / interface 改名或删除 / 已声明差异本身不成立）；err = 文件读取失败。
 func CheckContractMirrorDir(dir string, pairs []ContractMirrorPair) ([]ContractMirrorDiff, []string, error) {
 	srcs := map[string]string{}
 	for _, p := range pairs {
@@ -381,6 +671,7 @@ func CheckContractMirrorDir(dir string, pairs []ContractMirrorPair) ([]ContractM
 				p.File, p.Interface))
 			continue
 		}
+		errs = append(errs, ContractMirrorPairIssues(p, fields)...)
 		diffs = append(diffs, DiffContractMirrorPair(p, fields))
 	}
 	return diffs, errs, nil
