@@ -324,6 +324,22 @@ jobs:
         working-directory: backend
         run: go test ./internal/gate/ ./internal/slothost/ -count=1 -run "TestG9Manifest" -v
 
+      # ★ 契约镜像闸门（G1 新增一侧：Go 镜像 ↔ contracts/*.ts 真源逐字段对平）。
+      #
+      # 缺口：contracts/*.ts 是「唯一真源」，Go 侧有若干包注释里明写「与 contracts/X.ts
+      # 对齐」的镜像结构体，但此前**没有任何东西把两侧字段逐一对平** ——
+      #   * Go 侧只在 3 处硬编码版本号，且 tenant_test.go 的「版本一致性」比的是
+      #     **字面量 "1.0"**（不是真源文件）⇒ 真源升版本它照样绿；
+      #   * web/test/contracts.test.mjs 只比「TS 真源 ↔ TS 镜像」，与 Go 侧无关。
+      # ⇒ 真源加字段、Go 镜像没跟（或反之），两侧静默错位、全程零报错。
+      # 本步钉三件事：
+      #   ① 逐字段对平（双向：真源有而 Go 缺 / Go 有而真源缺）；
+      #   ② 已知漂移必须已登记在 docs/06（且「登记了但不复现」也要报错，防白名单腐烂）；
+      #   ③ 本闸门必须仍在 CI 里被执行（静态闸门没有运行时调用点，见文件头注释）。
+      - name: ★ 契约镜像闸门（G1：Go ↔ contracts/*.ts 逐字段对平 + 已知漂移已登记）
+        working-directory: backend
+        run: go test ./internal/gate/ -count=1 -run "ContractMirror" -v
+
       - name: 控制面闸门
         working-directory: backend
         run: go test ./internal/admin/ -count=1 -v
