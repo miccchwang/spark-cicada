@@ -312,6 +312,51 @@ func rawVersionText(a Algorithm) string {
 	return ""
 }
 
+// MissingPolicyDocs 返回全部算法的**缺失策略**声明，供 gate.CheckMissingPolicyDeclared
+// 判定（G4 第十三侧 / docs/03 §3.1）。
+//
+// ★ 这是「缺失策略必须可解析且已知」这条断言第一次拿到**磁盘上的真值**。
+//
+// ★ 为什么必须回报「键是否存在」而不是只看结构体字符串：
+//
+//	YAML 会把裸 `missing_policy: null`（及 `~`、空值）解析成 nil，落到 string
+//	字段就是 ""，与「漏写该键」在结构体上**完全一样**，但两者修法不同
+//	（漏写 ⇒ 补策略；裸 null ⇒ 加引号写 "null"）。故这里回看 Raw 原始键。
+func (r *Registry) MissingPolicyDocs() []gate.MissingPolicyDoc {
+	var algoIDs []string
+	for id := range r.algos {
+		algoIDs = append(algoIDs, id)
+	}
+	sort.Strings(algoIDs)
+	out := make([]gate.MissingPolicyDoc, 0, len(algoIDs))
+	for _, id := range algoIDs {
+		a := r.algos[id]
+		raw, declared := rawMissingPolicyText(a)
+		out = append(out, gate.MissingPolicyDoc{AlgoID: a.ID, Raw: raw, Declared: declared})
+	}
+	return out
+}
+
+// rawMissingPolicyText 取缺失策略的**原始文本**，并回报该键是否真的存在。
+//
+// 区分三种情形（这正是裸 null 陷阱的判据）：
+//   - 键不存在            ⇒ ("", false) 漏写；
+//   - 键存在、值是 YAML 空值 ⇒ ("", true)  裸 null / ~ / 空（作者意图被 YAML 吞掉）；
+//   - 键存在、值非空       ⇒ (原文, true) 正常；
+//   - 未经 YAML（Raw 缺键但结构体有值，如程序内构造）⇒ (结构体值, true)，避免把「有值」误报成「为空」。
+func rawMissingPolicyText(a Algorithm) (string, bool) {
+	if v, ok := a.Raw["missing_policy"]; ok {
+		if v == nil {
+			return "", true
+		}
+		return fmt.Sprintf("%v", v), true
+	}
+	if s := strings.TrimSpace(a.MissingPolicy); s != "" {
+		return s, true
+	}
+	return "", false
+}
+
 // Validate 用 **gate 的多条 G4 判定函数**校验注册表本身。//
 // ★ 这是 G4 闸门第一次被生产代码调用：判定的对象是**磁盘上的真 YAML**，
 // 而不是测试里手搓的假数据。违规即返回 error（fail-closed）。
@@ -389,6 +434,21 @@ func (r *Registry) Validate() error {
 	// 版本号是「改了公式要重算哪些桶」的唯一判据，若它不可信，
 	// AffectedBuckets 可能返回空 ⇒ 改了公式却不重算，报表长期显示错误口径。
 	violations = append(violations, gate.CheckAlgorithmVersionDeclared(r.AlgorithmVersionDocs())...)
+
+	// 算法的**缺失策略**必须可解析且已知（G4 第十三侧 / docs/03 §3.1）。
+	//
+	// ★ 此前 `missing_policy` 是**被读进来、写进 DB（registry_algorithm.missing_policy）、
+	// 但没有任何判定消费其声明值**的一个字段：Go 侧没有词表校验，而运行时
+	// （precomp.BuildRow）只判 `== "skip"`，其余一切取值（null/error/拼错）统统落到
+	// 同一个默认分支写 NULL ⇒ `missing_policy: error` 与 `null` 与乱写**行为完全等价**
+	// （DB 侧 0002 的 CHECK 只是入库兜底，不等于 Go 侧有闸门）。
+	//
+	// 后果是**静默的错误口径**：本该报错的算法静默产出空值；本该置空的算法被当成
+	// 跳过（记入 skipped_fields，影响下游覆盖率判定）。
+	//
+	// ★ 还兜住一个 YAML 保留字陷阱：`missing_policy: null`（裸写）会被 YAML 解析成
+	// 空值 ⇒ 被缺省填充静默改成 "skip"，语义被反转。本断言对此单列报错。
+	violations = append(violations, gate.CheckMissingPolicyDeclared(r.MissingPolicyDocs())...)
 	// 算法 → 算法 的引用完整性（depends_on_algos 必须指向已注册算法）。
 	// 与 CheckSlotsRegistered 对称；缺了它，`depends_on_algos: [algo.ghost]`
 	// 会被当作「已声明依赖」从而让绑定校验放行一个根本不存在的来源。

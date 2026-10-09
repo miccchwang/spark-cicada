@@ -185,6 +185,18 @@ func (p *Plane) ValidateAlgorithm(ctx context.Context, a Algorithm) error {
 			return fmt.Errorf("admin: %s", strings.Join(v, "；"))
 		}
 	}
+	// 6. 缺失策略必须可解析（G4 第十三侧 / docs/03 §3.1）。
+	//
+	// 空 ⇒ 保持既有缺省填充 skip（与 DB 列的 DEFAULT 'skip' 一致，见 RegisterAlgorithm）；
+	// 非空但不可解析 ⇒ 拒绝 —— 防止 API 侧写入 skip/null/error 之外的值。
+	// （运行时 precomp 也会 fail-closed 拒绝构建，但早拒比晚拒可诊断。）
+	if s := strings.TrimSpace(a.MissingPolicy); s != "" {
+		if _, ok := gate.ParseMissingPolicy(s); !ok {
+			return fmt.Errorf(
+				"admin: 算法 %s 的 missingPolicy=%q 不是已知策略（允许：%s）",
+				a.ID, s, strings.Join(gate.MissingPolicies(), "/"))
+		}
+	}
 	return nil
 }
 

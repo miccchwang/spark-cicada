@@ -26,7 +26,7 @@ func TestUnit_Wiring_LoadRegistryRejectsMissing(t *testing.T) {
 	dir := t.TempDir()
 	writeYAML(t, filepath.Join(dir, "slots"), "slot.a.yaml", validSlotForUnit)
 	writeYAML(t, filepath.Join(dir, "algorithms"), "algo.a.yaml",
-		"id: algo.a\nname: A\nversion: 1\nformula: a\npermission: L3\ndepends_on_slots: [slot.a]\n")
+		"id: algo.a\nname: A\nversion: 1\nformula: a\npermission: L3\nmissing_policy: skip\ndepends_on_slots: [slot.a]\n")
 
 	_, err := slot.LoadRegistry(filepath.Join(dir, "slots"), filepath.Join(dir, "algorithms"))
 	if err == nil {
@@ -43,7 +43,7 @@ func TestUnit_Wiring_LoadRegistryRejectsFreeText(t *testing.T) {
 	dir := t.TempDir()
 	writeYAML(t, filepath.Join(dir, "slots"), "slot.a.yaml", validSlotForUnit)
 	writeYAML(t, filepath.Join(dir, "algorithms"), "algo.a.yaml",
-		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: 货币\npermission: L3\ndepends_on_slots: [slot.a]\n")
+		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: 货币\npermission: L3\nmissing_policy: skip\ndepends_on_slots: [slot.a]\n")
 
 	_, err := slot.LoadRegistry(filepath.Join(dir, "slots"), filepath.Join(dir, "algorithms"))
 	if err == nil {
@@ -61,7 +61,7 @@ func TestUnit_Wiring_LoadRegistryRejectsRatioAsAmount(t *testing.T) {
 	writeYAML(t, filepath.Join(dir, "slots"), "slot.a.yaml", validSlotForUnit)
 	writeYAML(t, filepath.Join(dir, "algorithms"), "algo.a.yaml",
 		"id: algo.a\nname: A\nversion: 1\nformula: \"gp / revenue\"\nunit: THB\n"+
-			"permission: L3\ndepends_on_slots: [slot.a]\n")
+			"permission: L3\nmissing_policy: skip\ndepends_on_slots: [slot.a]\n")
 
 	_, err := slot.LoadRegistry(filepath.Join(dir, "slots"), filepath.Join(dir, "algorithms"))
 	if err == nil {
@@ -83,7 +83,7 @@ func TestUnit_Wiring_AcceptsKnownForms(t *testing.T) {
 		writeYAML(t, filepath.Join(dir, "slots"), "slot.a.yaml", validSlotForUnit)
 		writeYAML(t, filepath.Join(dir, "algorithms"), "algo.a.yaml",
 			"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: \""+u+"\"\n"+
-				"permission: L3\ndepends_on_slots: [slot.a]\n")
+				"permission: L3\nmissing_policy: skip\ndepends_on_slots: [slot.a]\n")
 		if _, err := slot.LoadRegistry(filepath.Join(dir, "slots"), filepath.Join(dir, "algorithms")); err != nil {
 			t.Fatalf("unit=%q 是已知单位，不应被拒：%v", u, err)
 		}

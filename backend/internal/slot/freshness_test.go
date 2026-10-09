@@ -77,6 +77,7 @@ status: AVAILABLE
 id: algo.a
 version: 1
 permission: L3
+missing_policy: skip
 unit: THB
 formula: "1"
 depends_on_slots: [slot.a]
@@ -122,6 +123,7 @@ status: AVAILABLE
 id: algo.a
 version: 1
 permission: L3
+missing_policy: skip
 unit: THB
 formula: "1"
 depends_on_slots: [slot.nofresh]
@@ -163,6 +165,7 @@ status: AVAILABLE
 id: algo.a
 version: 1
 permission: L3
+missing_policy: skip
 unit: THB
 formula: "1"
 depends_on_slots: [slot.fresh]
@@ -255,6 +258,7 @@ status: AVAILABLE
 id: algo.a
 version: 1
 permission: L3
+missing_policy: skip
 unit: THB
 formula: "1"
 depends_on_slots: [slot.a]
@@ -306,6 +310,7 @@ status: AVAILABLE
 id: algo.a
 version: 1
 permission: L3
+missing_policy: skip
 unit: THB
 formula: "1"
 depends_on_slots: [slot.a]
@@ -348,6 +353,7 @@ status: MISSING
 id: algo.a
 version: 1
 permission: L3
+missing_policy: skip
 unit: THB
 formula: "1"
 depends_on_slots: [slot.m]

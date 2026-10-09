@@ -25,7 +25,7 @@ func TestPermission_Wiring_LoadRegistryRejectsFreeText(t *testing.T) {
 		"id: slot.a\nname: A\nsource_kind: api\nsource_ref: x.api\n"+
 			"key_strategy: sku\ncoverage_gate: 0.9\nfreshness: 1d\npermission: 高密\nstatus: AVAILABLE\n")
 	writeYAML(t, filepath.Join(dir, "algorithms"), "algo.a.yaml",
-		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\ndepends_on_slots: [slot.a]\n")
+		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\nmissing_policy: skip\ndepends_on_slots: [slot.a]\n")
 
 	_, err := slot.LoadRegistry(filepath.Join(dir, "slots"), filepath.Join(dir, "algorithms"))
 	if err == nil {
@@ -44,7 +44,7 @@ func TestPermission_Wiring_LoadRegistryRejectsAlgorithmFreeText(t *testing.T) {
 		"id: slot.a\nname: A\nsource_kind: api\nsource_ref: x.api\n"+
 			"key_strategy: sku\ncoverage_gate: 0.9\nfreshness: 1d\npermission: L1\nstatus: AVAILABLE\n")
 	writeYAML(t, filepath.Join(dir, "algorithms"), "algo.a.yaml",
-		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: 核心\n"+
+		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: 核心\nmissing_policy: skip\n"+
 			"depends_on_slots: [slot.a]\n")
 
 	_, err := slot.LoadRegistry(filepath.Join(dir, "slots"), filepath.Join(dir, "algorithms"))
@@ -63,7 +63,7 @@ func TestPermission_Wiring_LoadRegistryRejectsMissing(t *testing.T) {
 		"id: slot.a\nname: A\nsource_kind: api\nsource_ref: x.api\n"+
 			"key_strategy: sku\ncoverage_gate: 0.9\nfreshness: 1d\nstatus: AVAILABLE\n")
 	writeYAML(t, filepath.Join(dir, "algorithms"), "algo.a.yaml",
-		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\ndepends_on_slots: [slot.a]\n")
+		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\nmissing_policy: skip\ndepends_on_slots: [slot.a]\n")
 
 	_, err := slot.LoadRegistry(filepath.Join(dir, "slots"), filepath.Join(dir, "algorithms"))
 	if err == nil {

@@ -24,7 +24,7 @@ func TestKeyStrategy_Wiring_LoadRegistryRejectsFreeText(t *testing.T) {
 		"id: slot.a\nname: A\nsource_kind: api\nsource_ref: x.api\n"+
 			"key_strategy: 智能匹配\ncoverage_gate: 0.9\nfreshness: 1d\npermission: L1\nstatus: AVAILABLE\n")
 	writeYAML(t, filepath.Join(dir, "algorithms"), "algo.a.yaml",
-		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\ndepends_on_slots: [slot.a]\n")
+		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\nmissing_policy: skip\ndepends_on_slots: [slot.a]\n")
 
 	_, err := slot.LoadRegistry(filepath.Join(dir, "slots"), filepath.Join(dir, "algorithms"))
 	if err == nil {
@@ -42,7 +42,7 @@ func TestKeyStrategy_Wiring_LoadRegistryRejectsMissing(t *testing.T) {
 		"id: slot.a\nname: A\nsource_kind: api\nsource_ref: x.api\n"+
 			"coverage_gate: 0.9\nfreshness: 1d\npermission: L1\nstatus: AVAILABLE\n")
 	writeYAML(t, filepath.Join(dir, "algorithms"), "algo.a.yaml",
-		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\ndepends_on_slots: [slot.a]\n")
+		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\nmissing_policy: skip\ndepends_on_slots: [slot.a]\n")
 
 	_, err := slot.LoadRegistry(filepath.Join(dir, "slots"), filepath.Join(dir, "algorithms"))
 	if err == nil {
@@ -64,7 +64,7 @@ func TestKeyStrategy_Wiring_LoadRegistryRejectsCohesionConflict(t *testing.T) {
 		"id: slot.b\nname: B\nsource_kind: derived\nsource_ref: channel_sales\n"+
 			"key_strategy: sku\ncoverage_gate: 0.9\nfreshness: 1d\npermission: L1\nstatus: AVAILABLE\n")
 	writeYAML(t, filepath.Join(dir, "algorithms"), "algo.a.yaml",
-		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\ndepends_on_slots: [slot.a, slot.b]\n")
+		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\nmissing_policy: skip\ndepends_on_slots: [slot.a, slot.b]\n")
 
 	_, err := slot.LoadRegistry(filepath.Join(dir, "slots"), filepath.Join(dir, "algorithms"))
 	if err == nil {

@@ -129,6 +129,7 @@ status: AVAILABLE
 id: algo.bad
 version: 1
 permission: L3
+missing_policy: skip
 unit: THB
 name: 坏算法
 formula: "rev"
@@ -167,6 +168,7 @@ status: AVAILABLE
 id: algo.bad
 version: 1
 permission: L3
+missing_policy: skip
 unit: THB
 name: 坏算法
 formula: "rev"
@@ -218,6 +220,7 @@ permission: L3
 id: algo.x
 version: 1
 permission: L3
+missing_policy: skip
 unit: THB
 formula: "1"
 depends_on_slots: [slot.nogate]
@@ -250,6 +253,7 @@ status: AVAILABLE
 id: algo.gp
 version: 1
 permission: L3
+missing_policy: skip
 unit: THB
 formula: "rev - cogs"
 depends_on_slots: [slot.cost]
@@ -324,6 +328,7 @@ status: AVAILABLE
 id: algo.a
 version: 1
 permission: L3
+missing_policy: skip
 unit: THB
 formula: "1"
 depends_on_slots: [slot.s]
@@ -369,6 +374,7 @@ status: PARTIAL
 id: algo.a
 version: 1
 permission: L3
+missing_policy: skip
 unit: THB
 formula: "1"
 depends_on_slots: [slot.p]
@@ -422,6 +428,7 @@ status: AVAILABLE
 id: algo.a
 version: 1
 permission: L3
+missing_policy: skip
 unit: THB
 formula: "1"
 depends_on_slots: [slot.dup]
@@ -452,6 +459,7 @@ status: AVAILABLE
 id: algo.a
 version: 1
 permission: L3
+missing_policy: skip
 unit: THB
 formula: "1"
 `)
@@ -480,6 +488,7 @@ status: ACTIVE
 id: algo.a
 version: 1
 permission: L3
+missing_policy: skip
 unit: THB
 formula: "1"
 depends_on_slots: [slot.s]

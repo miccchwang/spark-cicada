@@ -276,6 +276,23 @@ jobs:
         working-directory: backend
         run: go test ./internal/gate/ ./internal/slot/ -count=1 -run "Grain|G4Wiring" -v
 
+      # ★ 缺失策略闸门（G4 第十三侧：missing_policy 可解析 + 与 DB CHECK 同源 + 运行时真分路）。
+      #   此前 `algorithms/*.yaml` 的 `missing_policy` 被读进来、写进 DB，却没有
+      #   任何判定消费其声明值（第二十一个变种）：Go 侧无词表校验（`ignore` /
+      #   自由文本一律放行），而运行时 precomp 只判 `== "skip"` —— `null` /
+      #   `error` / 任何拼错的值统统落到同一分支写 NULL ⇒ `error`（声明「缺失即
+      #   报错」）与 `null` 与乱写**行为完全等价**（声明等于装饰）。
+      #   ★ 还抓出一个 YAML 保留字陷阱：裸写 `missing_policy: null` 会被 YAML 解析
+      #   成空值 ⇒ 被缺省填充静默改成 "skip"（作者想要的「置空」变成「跳过」，
+      #   语义反转、零报错）。现：三值可解析 + 与 0002 的 CHECK 词表双向同源 +
+      #   precomp 按声明**真分路**执行（skip 跳过 / null 显式置空 / error fail-closed
+      #   拒绝构建）+ 裸 null 单列报错（提示写带引号的 "null"）。
+      #   本步同时钉住接线：判定函数必须在 slot.Validate 与 precomp.BuildRow 里
+      #   都有**真实生产调用点**。
+      - name: ★ 缺失策略闸门（G4 第十三侧：missing_policy 可解析 + 与 DB 同源 + 运行时真分路）
+        working-directory: backend
+        run: go test ./internal/gate/ ./internal/slot/ ./internal/precomp/ -count=1 -run "MissingPolicy" -v
+
       - name: 控制面闸门
         working-directory: backend
         run: go test ./internal/admin/ -count=1 -v

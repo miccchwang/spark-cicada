@@ -98,7 +98,7 @@ func TestSlotSource_RejectsUnknownKindInLoad(t *testing.T) {
 				"id: slot.a\nname: A\nsource_kind: "+kind+"\nsource_ref: some.ref\n"+
 					"key_strategy: sku\ncoverage_gate: 0.9\nfreshness: 1d\npermission: L1\nstatus: AVAILABLE\n")
 			writeYAML(t, filepath.Join(dir, "algorithms"), "algo.a.yaml",
-				"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\ndepends_on_slots: [slot.a]\n")
+				"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\nmissing_policy: skip\ndepends_on_slots: [slot.a]\n")
 
 			_, err := slot.LoadRegistry(filepath.Join(dir, "slots"), filepath.Join(dir, "algorithms"))
 			if err == nil {
@@ -120,7 +120,7 @@ func TestSlotSource_RejectsPlaceholderRefInLoad(t *testing.T) {
 				"id: slot.a\nname: A\nsource_kind: api\nsource_ref: \""+ref+"\"\n"+
 					"key_strategy: sku\ncoverage_gate: 0.9\nfreshness: 1d\npermission: L1\nstatus: AVAILABLE\n")
 			writeYAML(t, filepath.Join(dir, "algorithms"), "algo.a.yaml",
-				"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\ndepends_on_slots: [slot.a]\n")
+				"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\nmissing_policy: skip\ndepends_on_slots: [slot.a]\n")
 
 			_, err := slot.LoadRegistry(filepath.Join(dir, "slots"), filepath.Join(dir, "algorithms"))
 			if err == nil {
@@ -137,7 +137,7 @@ func TestSlotSource_RejectsMissingRefInLoad(t *testing.T) {
 		"id: slot.a\nname: A\nsource_kind: api\n"+
 			"key_strategy: sku\ncoverage_gate: 0.9\nfreshness: 1d\npermission: L1\nstatus: AVAILABLE\n")
 	writeYAML(t, filepath.Join(dir, "algorithms"), "algo.a.yaml",
-		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\ndepends_on_slots: [slot.a]\n")
+		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\nmissing_policy: skip\ndepends_on_slots: [slot.a]\n")
 
 	_, err := slot.LoadRegistry(filepath.Join(dir, "slots"), filepath.Join(dir, "algorithms"))
 	if err == nil {
@@ -157,7 +157,7 @@ func TestSlotSource_RejectsGhostDerivedRefAfterBuckets(t *testing.T) {
 		"id: slot.a\nname: A\nsource_kind: derived\nsource_ref: bucket.ghost\n"+
 			"key_strategy: sku\ncoverage_gate: 0.9\nfreshness: 1d\npermission: L1\nstatus: AVAILABLE\n")
 	writeYAML(t, filepath.Join(dir, "algorithms"), "algo.a.yaml",
-		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\ndepends_on_slots: [slot.a]\nwrites_bucket: bucket.real\n")
+		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\nmissing_policy: skip\ndepends_on_slots: [slot.a]\nwrites_bucket: bucket.real\n")
 	writeYAML(t, filepath.Join(dir, "buckets"), "bucket.real.yaml",
 		"id: bucket.real\nname: 真桶\ngrain: [month]\nrefresh: monthly\n"+
 			"produced_by: [algo.a]\nalgo_versions: {algo.a: 1}\nrule_versions: {}\nindexes: [[month]]\n")
@@ -188,7 +188,7 @@ func TestSlotSource_AcceptsResolvableDerivedRef(t *testing.T) {
 		"id: slot.a\nname: A\nsource_kind: derived\nsource_ref: bucket.real\n"+
 			"key_strategy: sku\ncoverage_gate: 0.9\nfreshness: 1d\npermission: L1\nstatus: AVAILABLE\n")
 	writeYAML(t, filepath.Join(dir, "algorithms"), "algo.a.yaml",
-		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\ndepends_on_slots: [slot.a]\nwrites_bucket: bucket.real\n")
+		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\nmissing_policy: skip\ndepends_on_slots: [slot.a]\nwrites_bucket: bucket.real\n")
 	writeYAML(t, filepath.Join(dir, "buckets"), "bucket.real.yaml",
 		"id: bucket.real\nname: 真桶\ngrain: [month]\nrefresh: monthly\n"+
 			"produced_by: [algo.a]\nalgo_versions: {algo.a: 1}\nrule_versions: {}\nindexes: [[month]]\n")
@@ -228,7 +228,7 @@ func TestSlotSource_LoadFixtureCanDistinguish(t *testing.T) {
 			"id: slot.a\nname: A\nsource_kind: "+kind+"\nsource_ref: "+ref+"\n"+
 				"key_strategy: sku\ncoverage_gate: 0.9\nfreshness: 1d\npermission: L1\nstatus: AVAILABLE\n")
 		writeYAML(t, filepath.Join(dir, "algorithms"), "algo.a.yaml",
-			"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\ndepends_on_slots: [slot.a]\n")
+			"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\nmissing_policy: skip\ndepends_on_slots: [slot.a]\n")
 		_, err := slot.LoadRegistry(filepath.Join(dir, "slots"), filepath.Join(dir, "algorithms"))
 		return filepath.Join(dir, "slots"), filepath.Join(dir, "algorithms"), err
 	}
@@ -309,7 +309,7 @@ func TestWiring_SlotSourceValidatorIsBoundInLoadRegistry(t *testing.T) {
 		"id: slot.a\nname: A\nsource_kind: nonsense\nsource_ref: master.x\n"+
 			"key_strategy: sku\ncoverage_gate: 0.9\nfreshness: 1d\npermission: L1\nstatus: AVAILABLE\n")
 	writeYAML(t, filepath.Join(dir, "algorithms"), "algo.a.yaml",
-		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\ndepends_on_slots: [slot.a]\n")
+		"id: algo.a\nname: A\nversion: 1\nformula: a\nunit: THB\npermission: L3\nmissing_policy: skip\ndepends_on_slots: [slot.a]\n")
 	if _, err := slot.LoadRegistry(filepath.Join(dir, "slots"), filepath.Join(dir, "algorithms")); err == nil {
 		t.Fatal("★ LoadRegistry 未把槽来源校验接进校验链 ⇒ 闸门在真实入口失效")
 	}

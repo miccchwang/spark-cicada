@@ -203,16 +203,48 @@ func (b *Builder) BuildRow(ctx context.Context, def BucketDef, inputs map[string
 		if err != nil {
 			return nil, fmt.Errorf("precomp: eval %s: %w", a.ID, err)
 		}
-		// missing_policy=skip 且结果为缺失 ⇒ 记录跳过（不写 0）
-		if val == nil && a.MissingPolicy == "skip" {
-			out.Cells = append(out.Cells, CellResult{
-				Field: fieldName(a.ID), Skipped: true,
-				Reason: "依赖值缺失（fail-closed）", Slots: a.DependsOnSlots,
-				Unit: normalizedUnit(a.Unit),
-			})
-			out.SkippedFields = append(out.SkippedFields, fieldName(a.ID))
-			vars[fieldName(a.ID)] = nil
-			continue
+		// ── missing_policy 三值语义（G4 第十三侧 / docs/03 §3.1）─────────────
+		//
+		// ★ 此前这里唯一的判定是 `val == nil && a.MissingPolicy == "skip"`：
+		//   其余一切取值（null / error / 任何拼错的值）统统落到下面的默认分支 ——
+		//   写 NULL、不报错。于是 `missing_policy: error`（声明「缺失即报错」）
+		//   与 `null` 与「随便写」**行为完全等价** ⇒ 声明等于装饰。
+		//
+		//   现在按声明**真的分三路**执行；策略不可解析则 fail-closed 拒绝构建
+		//   （绝不猜一个默认值 —— 猜错方向会让「该报错」静默变「写空」）。
+		policy, ok := gate.ParseMissingPolicy(a.MissingPolicy)
+		if !ok {
+			return nil, fmt.Errorf(
+				"precomp: 算法 %s 的 missing_policy=%q 不是已知策略（允许：%s）—— fail-closed 拒绝构建",
+				a.ID, a.MissingPolicy, strings.Join(gate.MissingPolicies(), "/"))
+		}
+		if val == nil {
+			switch policy {
+			case gate.MissingPolicySkip:
+				// 跳过该字段（不写、记 skipped_fields，绝不写 0 冒充）。
+				out.Cells = append(out.Cells, CellResult{
+					Field: fieldName(a.ID), Skipped: true,
+					Reason: "依赖值缺失（missing_policy=skip，fail-closed）",
+					Slots:  a.DependsOnSlots, Unit: normalizedUnit(a.Unit),
+				})
+				out.SkippedFields = append(out.SkippedFields, fieldName(a.ID))
+				vars[fieldName(a.ID)] = nil
+				continue
+			case gate.MissingPolicyError:
+				// 缺失即报错：让构建失败，而不是静默产出空值。
+				return nil, fmt.Errorf(
+					"precomp: 算法 %s 依赖值缺失且 missing_policy=error ⇒ 拒绝构建（fail-closed）", a.ID)
+			case gate.MissingPolicyNull:
+				// 显式置空：写 NULL（Value=nil），**不**计入 skipped_fields
+				// （下游据此区分「跳过」与「确实为空」）。
+				out.Cells = append(out.Cells, CellResult{
+					Field: fieldName(a.ID), Value: nil,
+					Reason: "依赖值缺失（missing_policy=null，显式置空）",
+					Slots:  a.DependsOnSlots, Unit: normalizedUnit(a.Unit),
+				})
+				vars[fieldName(a.ID)] = nil
+				continue
+			}
 		}
 		out.Cells = append(out.Cells, CellResult{
 			Field: fieldName(a.ID), Value: val, Slots: a.DependsOnSlots,
