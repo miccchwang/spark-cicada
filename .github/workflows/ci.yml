@@ -358,6 +358,17 @@ jobs:
         working-directory: backend
         run: go test ./internal/gate/ ./internal/rule/ -count=1 -run "Effectivity|RuleItem" -v
 
+      # ★ 规则 ⇄ 桶 双向声明对平（G4 第十六侧 / 第二十四个变种）。
+      #   同一个关系被两侧各自声明，此前**从无对平**：
+      #     规则 → 桶：rules/*.yaml 的 applies_to_buckets（供 rule.AffectedBuckets）
+      #     桶 → 规则：buckets/*.yaml 的 rule_versions（供 gate.VersionDrift）
+      #   两侧可各自成立而彼此矛盾 ⇒ G6 的两条重算触发路径分叉、零报错。
+      #   本步同时钉住接线：sparkd 必须用**完整语句**调用
+      #   rules.ValidateBucketLinks(buckets.BucketDocs()) 且失败进 specIssues。
+      - name: ★ 规则⇄桶双向对平闸门（G4 第十六侧：applies_to_buckets ↔ rule_versions）
+        working-directory: backend
+        run: go test ./internal/gate/ ./internal/rule/ ./internal/slot/ -count=1 -run "RuleBucket|Wiring_BucketDocs" -v
+
       - name: 控制面闸门
         working-directory: backend
         run: go test ./internal/admin/ -count=1 -v

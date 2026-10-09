@@ -188,6 +188,45 @@ func (r *Registry) AffectedBuckets(changedRuleIDs ...string) []string {
 	return out
 }
 
+// RuleBucketLinks 返回「规则 ID → 声明的受影响桶」，供 G4 第十六侧的**双向对平**使用。
+//
+// ★ 与 ApplyToBuckets 的区别（两者都从同一份 `applies_to_buckets` 读出，
+// 但用途不同，故不合并）：`ApplyToBuckets` 是**生产映射**（G6 据此找要重算的桶）；
+// 本方法返回的是 gate 侧判定的**声明快照**，用于和桶侧的 `rule_versions` 对平。
+func (r *Registry) RuleBucketLinks() []gate.RuleBucketLink {
+	out := make([]gate.RuleBucketLink, 0, len(r.order))
+	for _, id := range r.order {
+		x := r.rules[id]
+		out = append(out, gate.RuleBucketLink{
+			RuleID:           x.ID,
+			AppliesToBuckets: append([]string(nil), x.AppliesToBuckets...),
+		})
+	}
+	return out
+}
+
+// ValidateBucketLinks 断言「规则 → 桶」与「桶 → 规则」两侧声明双向一致（G4 第十六侧）。
+//
+// ★ 为什么必须**在规则注册表到位之后**、由 sparkd 回填调用：
+//
+//	装载顺序是「桶先于规则」（规则要按桶 ID 校验 `applies_to_buckets`），
+//	所以 `LoadBucketRegistry` 阶段桶侧无法看到规则。而本侧的判定需要**两侧同时在场**：
+//
+//	  规则 → 桶：`rules/*.yaml` 的 applies_to_buckets
+//	  桶 → 规则：`buckets/*.yaml` 的 rule_versions
+//
+//	两条声明由两个目录各自维护、此前**从无对平** ⇒ 任一侧漏改都不会让别的闸门变红，
+//	后果是 G6 的两条重算触发路径（rule.AffectedBuckets / gate.VersionDrift）分叉。
+//
+// bucketDocs 为空 ⇒ 视为违规（空集合会让对平恒真 —— 假闸门形态）。
+func (r *Registry) ValidateBucketLinks(bucketDocs []gate.BucketDoc) error {
+	if bad := gate.CheckRuleBucketBidirectional(r.RuleBucketLinks(), bucketDocs); len(bad) > 0 {
+		return fmt.Errorf(
+			"规则⇄桶 双向声明不一致（G4 第十六侧）：\n  - %s", strings.Join(bad, "\n  - "))
+	}
+	return nil
+}
+
 // Validate 用 **gate 的三条规则判定函数**校验注册表本身。
 //
 // ★ 这是这些判定函数第一次被生产代码调用：判定的对象是**磁盘上的真 YAML**，

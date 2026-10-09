@@ -392,6 +392,21 @@ func (p *dataPlane) loadSpecs(specDir string) {
 	}
 	log.Printf("[spec] 桶的 rule_versions 引用完整性已过闸门")
 
+	// ★ 规则 ⇄ 桶 的**双向声明对平**（G4 第十六侧）。
+	//
+	// 为什么必须在这里、且必须**双向**：两条声明由两个目录各自维护 ——
+	//   * 规则 → 桶：`rules/*.yaml` 的 applies_to_buckets（供 rule.AffectedBuckets）；
+	//   * 桶 → 规则：`buckets/*.yaml` 的 rule_versions（供 gate.VersionDrift）。
+	// 此前两侧各自只校验「引用存在」，**从不对平** ⇒ 任一侧漏改都不会变红，
+	// 后果是 G6 的两条重算触发路径分叉（改了费率、桶该不该重算两边说法不一）。
+	// 这是本仓「双向声明、零对平」病的第三处（前两处：G1 契约镜像 / G9 模块清单）。
+	if err := rules.ValidateBucketLinks(buckets.BucketDocs()); err != nil {
+		p.specIssues = append(p.specIssues, "rule↔bucket links: "+err.Error())
+		log.Printf("[warn] 规则⇄桶 双向声明对平失败：%v", err)
+		return
+	}
+	log.Printf("[spec] 规则⇄桶 双向声明已对平（applies_to_buckets ↔ rule_versions）")
+
 	// ★ 规则 ⇒ 桶 的映射必须有内容：否则「规则升版本后要重算哪些桶」（G6）
 	//   会永远返回空，桶永远不重算 —— 不报错，只是报表口径慢慢失真。
 	if len(rules.ApplyToBuckets()) == 0 {

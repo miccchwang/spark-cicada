@@ -113,6 +113,30 @@ func (r *BucketRegistry) RegisteredBucketIDs() map[string]bool {
 	return out
 }
 
+// BucketDocs 把全部桶翻成 gate.BucketDoc（升序，与 IDs 同序）。
+//
+// ★ 这是 G4 第十六侧「规则 ⇄ 桶 双向声明对平」的**入参来源**：
+// `rule.Registry.ValidateBucketLinks` 需要桶侧的 `rule_versions` 键集，
+// 而 `validate()` 内部构造的 docs 是私有的、且只在加载期存在一次。
+// 抽成导出方法后，sparkd 在**规则注册表到位之后**能拿到同一份口径，
+// 不必再抄一遍字段映射（手抄必然漂移 —— 参本仓 G1/G9 的教训）。
+func (r *BucketRegistry) BucketDocs() []gate.BucketDoc {
+	out := make([]gate.BucketDoc, 0, len(r.order))
+	for _, id := range r.order {
+		b := r.buckets[id]
+		out = append(out, gate.BucketDoc{
+			ID:           b.ID,
+			ProducedBy:   b.ProducedBy,
+			AlgoVersions: b.AlgoVersions,
+			RuleVersions: b.RuleVersions,
+			Grain:        b.Grain,
+			Refresh:      b.Refresh,
+			Indexes:      b.Indexes,
+		})
+	}
+	return out
+}
+
 // RefreshIntervalMinutes 返回该桶声明的刷新上限分钟数（0 = 无固定节律）。
 //
 // 这是 `Bucket.Refresh` 的**生产消费点**：把裸字符串变成可比较的时长，
@@ -181,19 +205,10 @@ func (r *BucketRegistry) validate(reg *Registry, registeredRules map[string]bool
 	}
 
 	// ① 先过 gate 的判定函数（G4 反向引用完整性）—— 这是闸门的真实调用点。
-	docs := make([]gate.BucketDoc, 0, len(r.order))
-	for _, id := range r.order {
-		b := r.buckets[id]
-		docs = append(docs, gate.BucketDoc{
-			ID:           b.ID,
-			ProducedBy:   b.ProducedBy,
-			AlgoVersions: b.AlgoVersions,
-			RuleVersions: b.RuleVersions,
-			Grain:        b.Grain,
-			Refresh:      b.Refresh,
-			Indexes:      b.Indexes,
-		})
-	}
+	//
+	// ★ 复用 BucketDocs()：桶→gate.BucketDoc 的字段映射只允许有一处（此处曾内联一份，
+	//   与 sparkd 侧的新调用点若各写一份必然漂移 —— 参 G1/G9 的教训）。
+	docs := r.BucketDocs()
 	var bad []string
 	bad = append(bad, gate.CheckBucketProducersRegistered(docs, reg.RegisteredAlgorithmIDs())...)
 	if registeredRules != nil {
