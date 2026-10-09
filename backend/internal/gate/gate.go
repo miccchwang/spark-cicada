@@ -825,7 +825,7 @@ func CheckNoCredentialsInURL(raw string) []string {
 
 // SecretHit 一条密钥扫描命中。
 type SecretHit struct {
-	Rule string
+	Rule  string
 	Where string
 }
 
@@ -940,10 +940,18 @@ type RuleDoc struct {
 
 	// Raw 保留原始键（供「未知键/拼写错误」探测 —— 拼错的键 YAML 不报错，
 	// 只会静默丢失，这正是本仓反复出现的静默失效形态）。
+	//
+	// ★ 该探测**真的存在**：见 g4_effectivity.go 的 `CheckRuleItemUnknownKeys`
+	// （生产调用点：rule.Registry.Validate）。此前这里只写着一句承诺，
+	// 没有任何函数消费 Raw —— 那句注释本身就是同一个病。
 	Raw map[string]any
 }
 
 // RuleItem 是一条费率/阈值明细（docs/03 §4.1）。
+//
+// 字段集必须与 `contracts/compute.proto: RuleItem` 对齐；合法 YAML 键的
+// 唯一来源是 `RuleItemKnownKeys()`（`CheckRuleItemUnknownKeys` 据此拦截
+// 「契约外的键被静默丢弃」）。
 type RuleItem struct {
 	ID            string
 	Name          string
@@ -951,6 +959,15 @@ type RuleItem struct {
 	FlatPerOrder  float64
 	VATIncluded   bool
 	EffectiveFrom string
+
+	// EffectiveTo 生效期**上界**（`YYYY-MM-DD`，空 = 无上界）。
+	//
+	// ★ 此前缺失：`contracts/compute.proto` 的 `RuleItem.effective_to`（field 7）、
+	// `docs/02`「effective_from / effective_to，同一规则可多版本共存」、
+	// `compute/src/gate.rs` 的 `RuleItem.effective_to` 三处都有它，
+	// 唯独 Go 侧没有 ⇒ 按文档写进 YAML 的 `effective_to` 被静默丢弃。
+	// 区间语义 `[EffectiveFrom, EffectiveTo)`，见 `RuleItemEffective`。
+	EffectiveTo string
 }
 
 // CheckRuleIDsRegistered 断言规则集引用的槽与桶均已注册（G4 引用完整性的**第三侧**）。

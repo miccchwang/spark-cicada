@@ -208,6 +208,54 @@ func UnmirroredContracts() []UnmirroredContract {
 	}
 }
 
+// DeclaredContractFile 声明「`contracts/` 下**非 `.ts`** 的真源由**另一套机制**管」。
+//
+// 为什么需要它（★ 覆盖闸门自己的盲区，同一个病再上一层）：第二轮把「每个 `.ts`
+// 都要有归宿」变成了断言，但实现里是一个**硬编码的 `.ts` 过滤**
+// （`strings.HasSuffix(name, ".ts")`）—— 于是 `contracts/compute.proto` 与
+// `contracts/slot-manifest.yaml` 这两个**真实契约**从来没被任何覆盖断言看过：
+//
+//	grep -rn "compute.proto" 全仓（除自身）**只命中一句注释**
+//	（`internal/compute/kernel.go` 的「（后续）GRPCKernel —— 走 contracts/compute.proto」），
+//	而 proto 的注释恰恰写着「破坏性变更必须升 version，并**同步** backend/internal/compute
+//	与 compute/src」—— 一句承诺，没有任何东西核对。
+//
+// 这正是「对平范围本身没人管」的**上一层复发**：上一轮修的是「哪些契约没人对平」，
+// 这一轮修的是「**闸门连哪些文件算契约都写死了**」。声明必须给出
+// `Covered`（谁在管）与 `Reason`（为什么走另一套机制），且**声明不得腐烂**
+// （文件不存在 / 无理由 / 其实是 `.ts` ⇒ 反向报错）。
+type DeclaredContractFile struct {
+	File    string // 相对 contracts/ 的文件名（如 "compute.proto"）
+	Covered string // 谁在管它（必须指向真实存在的闸门/机制）
+	Reason  string // 为什么它走的是另一套机制，而不是字段级镜像
+}
+
+// DeclaredContractFiles 返回「非 .ts 真源」的托管声明（唯一权威表）。
+func DeclaredContractFiles() []DeclaredContractFile {
+	return []DeclaredContractFile{
+		{
+			File: "compute.proto",
+			Covered: "G4 第十五侧（`gate.RuleItemKnownKeys` / `RuleItemEffective`，" +
+				"由 `rule.Registry.Validate` 在生产路径调用）",
+			Reason: "它是 Go（编排）↔ Rust（计算）的 **gRPC 边界契约**，不是 JSON 出线契约：" +
+				"本仓 gRPC 尚未接入（Go 侧只有 `SubprocessKernel` 走 `spark-compute --eval` 子进程），" +
+				"故 proto 的 message 没有 Go 侧 json 镜像可反射对平。" +
+				"其中**唯一被 Go 真实消费的字段集**是 `RuleItem`（规则项）—— 已由 G4 第十五侧钉住" +
+				"（`effective_to` 此前在 Go 侧缺失、按文档写进 YAML 会被静默丢弃）。" +
+				"proto ↔ Rust / proto ↔ Go 的**完整字段级对平**涉及「哪一侧是真相」的裁定，" +
+				"登记为待拍板项 docs/06 **F20**，未擅自建模。",
+		},
+		{
+			File: "slot-manifest.yaml",
+			Covered: "G9 插槽模块清单闸门（`SlotManifest` 真读 + 声明层校验 + 真挂载，" +
+				"见 docs/05 G9 与 `gate/g9_manifest.go`）",
+			Reason: "它是 YAML **清单**而非 TS 接口，字段级「Go 镜像」形态对它不适用；" +
+				"其完整性由 G9 独立闸门承担（清单 ↔ 运行时注册表**双向**对平 + 真装载真挂载）。" +
+				"G1 只负责保证「它有人管」，不重复 G9 的断言。",
+		},
+	}
+}
+
 // KnownContractDrift 已知、且**已登记**的字段漂移。
 //
 // 只允许放「已确认存在、但修法需业务拍板」的项；每条必须引用 docs/06 的待办编号。
@@ -582,15 +630,23 @@ func ContractMirrorPairIssues(pair ContractMirrorPair, tsFields []string) []stri
 	return out
 }
 
-// UncoveredContractFiles 检查 `contracts/` 下的 `.ts` 是否**每一个都有人管**。
+// UncoveredContractFiles 检查 `contracts/` 下的**每个文件**是否都有人管。
 //
-// 返回：uncovered = 既无镜像对、也未声明的文件；stale = 已声明却（被覆盖 / 文件不存在）的声明。
+// 返回：uncovered = 既无人管、也未声明的文件；stale = 已声明却（文件不存在 / 无理由 /
+// 形态不对）的声明。
 //
 // 动机（★ 真实缺口）：首轮 G1 只对平「已经进表」的 16 对，而**没进表**的契约
 // 照旧无人对平 —— 实测 `template` / `pnl` / `strategy` 三处都在 `_test.go` 里用
 // **硬编码字面量**冒充「与契约一致」。闸门若只覆盖已知范围，「新加一个契约文件
 // 却没人管」这件事会永远静默。故把「每个真源都要有归宿」本身变成一条断言。
-func UncoveredContractFiles(dir string, pairs []ContractMirrorPair, unmirrored []UnmirroredContract) (uncovered, stale []string, err error) {
+//
+// ★ 第二轮补漏：上面的断言实现里是**硬编码的 `.ts` 过滤**，于是
+// `contracts/compute.proto` / `contracts/slot-manifest.yaml` 这两个真实契约
+// **从来没被任何覆盖断言看过**（同一个病再上一层：「闸门连哪些文件算契约都写死了」）。
+// 现要求：`.ts` 走镜像对 / `UnmirroredContracts()`；**非 `.ts`** 必须在
+// `DeclaredContractFiles()` 里声明由哪套机制管（且声明不得腐烂）。
+func UncoveredContractFiles(dir string, pairs []ContractMirrorPair,
+	unmirrored []UnmirroredContract, declared []DeclaredContractFile) (uncovered, stale []string, err error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("读取 contracts 目录 %s: %w", dir, err)
@@ -599,27 +655,44 @@ func UncoveredContractFiles(dir string, pairs []ContractMirrorPair, unmirrored [
 	for _, p := range pairs {
 		covered[p.File] = true
 	}
-	declared := map[string]bool{}
+	declaredNoMirror := map[string]bool{}
 	for _, u := range unmirrored {
-		declared[u.File] = true
+		declaredNoMirror[u.File] = true
+	}
+	declaredOther := map[string]bool{}
+	for _, d := range declared {
+		declaredOther[d.File] = true
 	}
 
-	var files []string
+	var tsFiles, otherFiles []string
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".ts") {
+		if e.IsDir() {
 			continue
 		}
-		files = append(files, e.Name())
+		if strings.HasSuffix(e.Name(), ".ts") {
+			tsFiles = append(tsFiles, e.Name())
+		} else {
+			otherFiles = append(otherFiles, e.Name())
+		}
 	}
-	sort.Strings(files)
+	sort.Strings(tsFiles)
+	sort.Strings(otherFiles)
 
-	for _, f := range files {
-		if covered[f] || declared[f] {
+	for _, f := range tsFiles {
+		if covered[f] || declaredNoMirror[f] {
 			continue
 		}
 		uncovered = append(uncovered, fmt.Sprintf(
 			"%s 既没有字段级镜像对、也没有在 UnmirroredContracts() 里声明 —— "+
 				"该契约的真源与实现之间**无人对平**", f))
+	}
+	for _, f := range otherFiles {
+		if declaredOther[f] {
+			continue
+		}
+		uncovered = append(uncovered, fmt.Sprintf(
+			"%s 不是 .ts（走不了字段级镜像对），也没有在 DeclaredContractFiles() 里声明"+
+				"由哪套机制管 —— 该真源**无人对平**（覆盖闸门此前只扫 .ts，非 .ts 是盲区）", f))
 	}
 
 	for _, u := range unmirrored {
@@ -638,6 +711,28 @@ func UncoveredContractFiles(dir string, pairs []ContractMirrorPair, unmirrored [
 				"%s 的「无镜像」声明缺少理由 —— 无理由的声明等于把缺口藏起来", u.File))
 		}
 	}
+
+	for _, d := range declared {
+		if _, statErr := os.Stat(filepath.Join(dir, d.File)); statErr != nil {
+			stale = append(stale, fmt.Sprintf(
+				"%s 被声明为「非 .ts 真源、由其他机制管」，但该文件在 contracts/ 下不存在（声明腐烂）", d.File))
+			continue
+		}
+		if strings.HasSuffix(d.File, ".ts") {
+			stale = append(stale, fmt.Sprintf(
+				"%s 是 .ts，应走镜像对 / UnmirroredContracts()，不该登记在 DeclaredContractFiles()", d.File))
+		}
+		if strings.TrimSpace(d.Covered) == "" {
+			stale = append(stale, fmt.Sprintf(
+				"%s 的「其他机制」声明未写明**谁在管**（Covered 为空）—— "+
+					"指不出机制就等于没有机制", d.File))
+		}
+		if strings.TrimSpace(d.Reason) == "" {
+			stale = append(stale, fmt.Sprintf(
+				"%s 的「其他机制」声明缺少理由 —— 无理由的声明等于把缺口藏起来", d.File))
+		}
+	}
+
 	sort.Strings(uncovered)
 	sort.Strings(stale)
 	return uncovered, stale, nil

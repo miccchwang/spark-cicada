@@ -413,6 +413,10 @@ func TestWiring_RuleGatesHaveProductionCallSite(t *testing.T) {
 		"CheckRuleIDsRegistered",
 		"CheckRuleIDMatchesFilename",
 		"CheckPlatformFeeRule",
+		// G4 第十五侧（第二十三个变种）：规则项「契约外键 + 生效期」聚合入口。
+		// 它必须在 rule.Registry.Validate 里被调用 —— 否则「写进 YAML 却被
+		// yaml 静默丢弃的键」照旧无人发现。
+		"CheckRuleItems",
 	}
 	for _, fn := range fns {
 		sites := nonTestCallSites(t, backend, fn)
@@ -708,4 +712,187 @@ func contains(xs []string, v string) bool {
 		}
 	}
 	return false
+}
+
+// ───────── G4 第十五侧（第二十三个变种）：规则项「契约外键 + 生效期」 ─────────
+//
+// 链路级（从 `LoadRuleRegistry` 入口进、以「加载成功/失败」出），而不是直接调
+// gate 的判定函数看返回值 —— 只有这样才能证明「闸门真的接在生产入口上」。
+
+// TestRuleItem_EffectiveToIsParsedNotDropped ★ 本侧的核心：`effective_to` 必须
+// 真的被解析进结构体，而不是被 yaml **静默丢弃**。
+//
+// 修复前 `rule.Item` 没有 `EffectiveTo` 字段，yaml.v3 对未声明的键不报错 ⇒
+// 作者按 docs/02 写的到期声明被悄悄丢掉、费率永不到期、全程零报错。
+func TestRuleItem_EffectiveToIsParsedNotDropped(t *testing.T) {
+	reg, buckets, _ := loadAll(t)
+	body := `
+id: rule.window.tk
+version: 1
+scope: {platform: TK}
+applies_to_slots: [slot.platform_fee]
+items:
+  - id: promo_rate
+    name: 促销费率
+    rate: 0.02
+    effective_from: 2026-07-01
+    effective_to: 2026-12-31
+`
+	rules, err := writeTempRules(t, reg, buckets, map[string]string{"window.tk.yaml": body})
+	if err != nil {
+		t.Fatalf("合法的生效期不应被拒: %v", err)
+	}
+	x, ok := rules.Rule("rule.window.tk")
+	if !ok {
+		t.Fatal("规则 rule.window.tk 应已注册")
+	}
+	if len(x.Items) != 1 {
+		t.Fatalf("应有 1 个明细项，实际 %d", len(x.Items))
+	}
+	it := x.Items[0]
+	if it.EffectiveFrom != "2026-07-01" {
+		t.Errorf("effective_from 未解析进结构体：%q", it.EffectiveFrom)
+	}
+	if it.EffectiveTo != "2026-12-31" {
+		t.Errorf("★ effective_to 被静默丢弃了（结构体里是 %q）—— "+
+			"该键会被 yaml 忽略，费率永不到期", it.EffectiveTo)
+	}
+
+	// ★ 第二段（实测注入 B 首轮 MISSED 后补）：必须同时钉住
+	// `rule.Item → gate.RuleItem` 这一跳。若只钉结构体而漏了 Doc()，
+	// 把 EffectiveTo 从 `doc()` 里删掉时测试照绿 —— 而闸门读的正是
+	// `gate.RuleDoc.Items`，于是「上界」在闸门侧永远为空、空窗检查静默失效。
+	doc, ok := rules.Doc("rule.window.tk")
+	if !ok {
+		t.Fatal("Doc(rule.window.tk) 应存在")
+	}
+	if len(doc.Items) != 1 {
+		t.Fatalf("gate.RuleDoc 应有 1 个明细项，实际 %d", len(doc.Items))
+	}
+	if doc.Items[0].EffectiveTo != "2026-12-31" {
+		t.Errorf("★ rule.Item → gate.RuleItem 的 effective_to 映射断了（闸门侧拿到 %q）—— "+
+			"窗口校验读的是 gate.RuleDoc.Items，该跳丢失会让上界永远为空",
+			doc.Items[0].EffectiveTo)
+	}
+	if doc.Items[0].EffectiveFrom != "2026-07-01" {
+		t.Errorf("rule.Item → gate.RuleItem 的 effective_from 映射断了（闸门侧拿到 %q）",
+			doc.Items[0].EffectiveFrom)
+	}
+}
+
+// TestRuleItem_UnknownKeyRejectsLoad 契约外的键 ⇒ 加载即失败（不是静默丢弃）。
+func TestRuleItem_UnknownKeyRejectsLoad(t *testing.T) {
+	reg, buckets, _ := loadAll(t)
+	cases := []struct{ name, key, want string }{
+		{"拼写错误", "effective_form", "effective_form"},
+		{"未建模字段", "unit", "unit"},
+		{"多余字段", "vat_include", "vat_include"},
+	}
+	for _, c := range cases {
+		body := fmt.Sprintf(`
+id: rule.typo.tk
+version: 1
+scope: {platform: TK}
+applies_to_slots: [slot.platform_fee]
+items:
+  - id: fee
+    name: 费
+    rate: 0.01
+    %s: 2026-07-01
+`, c.key)
+		_, err := writeTempRules(t, reg, buckets, map[string]string{"typo.tk.yaml": body})
+		if err == nil {
+			t.Errorf("%s：含契约外的键 %q 必须被拒（否则该键会被 yaml 静默丢弃）", c.name, c.key)
+			continue
+		}
+		if !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s：错误信息应点名键 %q，实际: %v", c.name, c.want, err)
+		}
+	}
+}
+
+// TestRuleItem_WindowViolationsRejectLoad 生效期的形态与次序违规必须被拒。
+func TestRuleItem_WindowViolationsRejectLoad(t *testing.T) {
+	reg, buckets, _ := loadAll(t)
+	cases := []struct{ name, from, to, want string }{
+		{"非零填充", "2026-7-1", "", "YYYY-MM-DD"},
+		{"空窗（from==to）", "2026-06-01", "2026-06-01", "空窗"},
+		{"空窗（from>to）", "2026-07-01", "2026-06-01", "空窗"},
+	}
+	for _, c := range cases {
+		body := fmt.Sprintf(`
+id: rule.badwin.tk
+version: 1
+scope: {platform: TK}
+applies_to_slots: [slot.platform_fee]
+items:
+  - id: fee
+    name: 费
+    rate: 0.01
+    effective_from: %q
+    effective_to: %q
+`, c.from, c.to)
+		_, err := writeTempRules(t, reg, buckets, map[string]string{"badwin.tk.yaml": body})
+		if err == nil {
+			t.Errorf("%s：应被拒，实际加载成功", c.name)
+			continue
+		}
+		if !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s：错误信息应含 %q，实际: %v", c.name, c.want, err)
+		}
+	}
+}
+
+// TestRuleItem_RealYamlWindowsFlowIntoStruct 真实 `rules/*.yaml` 的生效期
+// 必须真的流进结构体（证明该字段在**真数据**上不是死的）。
+//
+// `rules/platform_fee.tk.yaml` 的 platform_commission / commerce_growth_fee
+// 都带 `effective_from`；若解析链路断了，这里会变红。
+func TestRuleItem_RealYamlWindowsFlowIntoStruct(t *testing.T) {
+	_, _, rules := loadAll(t)
+	x, ok := rules.Rule("rule.tk.fee")
+	if !ok {
+		t.Fatal("rule.tk.fee 应存在")
+	}
+	var withFrom, withTo int
+	for _, it := range x.Items {
+		if it.EffectiveFrom != "" {
+			withFrom++
+		}
+		if it.EffectiveTo != "" {
+			withTo++
+		}
+	}
+	if withFrom == 0 {
+		t.Error("★ rule.tk.fee 的 items 里应至少有一项带 effective_from（真数据），" +
+			"实际一个都没解析出来 —— 解析链路断了")
+	}
+	_ = withTo // 当前真数据没有上界，不强制；本断言只钉「下界真的流进来了」
+}
+
+// TestRuleItem_UnknownKeyGateHasProductionCallSite ★ 接线：契约外键闸门必须
+// 在**非测试**代码里被调用（`rule.Registry.Validate`）。
+//
+// 这是本仓「判定函数没有生产调用点 ⇒ 闸门恒真」这个病的**回归闸门**。
+func TestRuleItem_UnknownKeyGateHasProductionCallSite(t *testing.T) {
+	root := repoRoot(t)
+	backend := filepath.Join(root, "backend")
+	for _, fn := range []string{"CheckRuleItemUnknownKeys", "CheckRuleItemWindowFields", "RuleItemEffective"} {
+		sites := nonTestCallSites(t, backend, fn)
+		if len(sites) == 0 {
+			t.Errorf("★ gate.%s 没有任何**非测试**调用点 ⇒ 该闸门恒真", fn)
+			continue
+		}
+		found := false
+		for _, s := range sites {
+			// RuleItemEffective 由同包（gate）的窗口校验调用；其余两个由 rule 包调用。
+			if strings.Contains(s, "internal/rule/rule.go") ||
+				strings.Contains(s, "internal/gate/g4_effectivity.go") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("★ 期望 gate.%s 的生产调用点在 rule.go / g4_effectivity.go，实际 %v", fn, sites)
+		}
+	}
 }

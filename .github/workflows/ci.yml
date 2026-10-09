@@ -340,6 +340,24 @@ jobs:
         working-directory: backend
         run: go test ./internal/gate/ -count=1 -run "ContractMirror" -v
 
+      # ★ 规则项契约外键 + 生效期闸门（G4 第十五侧，第二十三个变种）。
+      #
+      # 缺口：规则项的生效期（effective_from/effective_to）被三处同时声明 ——
+      #   contracts/compute.proto: RuleItem.effective_to + EvalRuleRequest.as_of、
+      #   docs/02「时间生效：effective_from / effective_to」、
+      #   compute/src/gate.rs: is_effective()（真实现 [from,to)）——
+      # 而 Go 侧只有 EffectiveFrom、没有 EffectiveTo，且 EffectiveFrom 解析进
+      # 结构体后**无任何判定消费**（死字段）；rules/*.yaml 里 effective_from
+      # 已是真数据却零效果。更隐蔽的是**静默丢弃**：yaml.v3 对未声明的键不报错，
+      # 按 docs/02 写 effective_to: 2026-06-01 会被悄悄丢掉、费率永不到期、零报错。
+      # 现：① 键集单点定义 RuleItemKnownKeys()；② 契约外的键 ⇒ 加载即报错；
+      # ③ 生效期形态（YYYY-MM-DD）与次序（from>=to ⇒ 空窗）校验，并用
+      #    RuleItemEffective 自证语义是 [from,to)（含起不含止，与 Rust 同源）。
+      # 本步同时钉住接线：判定函数必须在 rule.Registry.Validate 里有**真实生产调用点**。
+      - name: ★ 规则项契约外键闸门（G4 第十五侧：items 键集 + 生效期形态/次序/语义）
+        working-directory: backend
+        run: go test ./internal/gate/ ./internal/rule/ -count=1 -run "Effectivity|RuleItem" -v
+
       - name: 控制面闸门
         working-directory: backend
         run: go test ./internal/admin/ -count=1 -v

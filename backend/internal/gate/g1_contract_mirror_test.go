@@ -260,27 +260,122 @@ func TestG1ContractMirror_KnownDriftsRegisteredInDocs(t *testing.T) {
 
 // ───────────── 2d. 「声明即须对平」：每个真源都要有归宿（2026-10-09 第二轮） ─────────────
 
-// TestG1ContractMirror_AllContractFilesAccountedFor 断言 contracts/ 下**每个** .ts
-// 要么有字段级镜像对、要么被显式声明为「有意无镜像」。
+// TestG1ContractMirror_AllContractFilesAccountedFor 断言 contracts/ 下**每个文件**
+// 要么有字段级镜像对、要么被显式声明为「有意无镜像 / 由其他机制管」。
 //
 // ★ 为什么这条断言才是真守卫：首轮只对平「已经进表」的 16 对，
 // 而**没进表**的契约照旧无人对平 —— 实测 template / pnl / strategy 三处
 // 都在 `_test.go` 里用**硬编码字面量**冒充「与契约一致」（测试从不打开契约文件）。
 // 只把已知的补进表，下次新加一个契约文件仍然会静默无人管。
+//
+// ★ 第二轮补漏：该断言此前的实现是**硬编码的 `.ts` 过滤** ⇒
+// `compute.proto` / `slot-manifest.yaml` 两个真实契约从未被覆盖过。
 func TestG1ContractMirror_AllContractFilesAccountedFor(t *testing.T) {
 	uncovered, stale, err := gate.UncoveredContractFiles(
-		contractDir(), gate.ContractMirrorPairs(), gate.UnmirroredContracts())
+		contractDir(), gate.ContractMirrorPairs(), gate.UnmirroredContracts(),
+		gate.DeclaredContractFiles())
 	if err != nil {
 		t.Fatalf("枚举 contracts/ 失败: %v", err)
 	}
 	if len(uncovered) > 0 {
 		t.Fatalf("以下契约文件无人对平（既无镜像对、也未声明）：\n  %s\n\n"+
 			"修法：① 加进 gate.ContractMirrorPairs()（推荐，真读真对平）；"+
-			"② 确无字段级镜像可做时，加进 gate.UnmirroredContracts() 并写明理由。",
+			"② 确无字段级镜像可做时，加进 gate.UnmirroredContracts() 并写明理由；"+
+			"③ 非 .ts 真源加进 gate.DeclaredContractFiles() 并写明「谁在管」。",
 			strings.Join(uncovered, "\n  "))
 	}
 	if len(stale) > 0 {
-		t.Fatalf("「无镜像」声明已过期：\n  %s", strings.Join(stale, "\n  "))
+		t.Fatalf("「无镜像 / 其他机制」声明已过期：\n  %s", strings.Join(stale, "\n  "))
+	}
+}
+
+// TestG1ContractMirror_NonTSContractFilesAccountedFor ★ 第二轮补漏的**判别性**自测。
+//
+// 证明覆盖闸门对「非 .ts 真源」真的会响：喂进故意残缺的目录夹具
+// （一个未声明的 `x.proto`），必须报「无人管」；补上声明后必须转绿；
+// 而「声明了却不给 Covered/Reason」必须报腐烂。
+func TestG1ContractMirror_NonTSContractFilesAccountedFor(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatalf("写夹具 %s: %v", name, err)
+		}
+	}
+	write("a.ts", "export interface A {\n  a: string;\n}\n")
+	write("orphan.proto", "message M {}\n")
+	write("declared.proto", "message N {}\n")
+
+	pairs := []gate.ContractMirrorPair{
+		{File: "a.ts", Interface: "A", GoType: reflect.TypeOf(contracts.OrderClause{})},
+	}
+	// 1) 未声明的 .proto ⇒ 必须被报「无人管」。
+	uncovered, _, err := gate.UncoveredContractFiles(dir, pairs, nil, nil)
+	if err != nil {
+		t.Fatalf("枚举失败: %v", err)
+	}
+	if len(uncovered) != 2 {
+		t.Fatalf("两个非 .ts 文件都应被报「无人管」，得到 %v", uncovered)
+	}
+	joined := strings.Join(uncovered, "|")
+	if !strings.Contains(joined, "orphan.proto") || !strings.Contains(joined, "declared.proto") {
+		t.Fatalf("报错应点名两个 .proto，得到 %v", uncovered)
+	}
+
+	// 2) 给 declared.proto 补声明 ⇒ 只剩 orphan.proto。
+	uncovered, stale, err := gate.UncoveredContractFiles(dir, pairs, nil,
+		[]gate.DeclaredContractFile{
+			{File: "declared.proto", Covered: "G9 之类", Reason: "夹具：由其他机制管"},
+		})
+	if err != nil {
+		t.Fatalf("枚举失败: %v", err)
+	}
+	if len(uncovered) != 1 || !strings.Contains(uncovered[0], "orphan.proto") {
+		t.Fatalf("应只报 orphan.proto，得到 %v", uncovered)
+	}
+	if len(stale) != 0 {
+		t.Fatalf("不该报过期声明，得到 %v", stale)
+	}
+
+	// 3) 声明腐烂：文件不存在 / 无 Covered / 无 Reason / 其实是 .ts ⇒ 全部要报。
+	_, stale, err = gate.UncoveredContractFiles(dir, pairs, nil,
+		[]gate.DeclaredContractFile{
+			{File: "ghost.proto", Covered: "x", Reason: "y"},
+			{File: "declared.proto", Covered: "", Reason: "y"},
+			{File: "declared.proto", Covered: "x", Reason: "  "},
+			{File: "a.ts", Covered: "x", Reason: "y"},
+		})
+	if err != nil {
+		t.Fatalf("枚举失败: %v", err)
+	}
+	if len(stale) != 4 {
+		t.Fatalf("应报 4 条腐烂声明，得到 %d 条：%v", len(stale), stale)
+	}
+}
+
+// TestG1ContractMirror_RealNonTSContractsAreDeclared 真实仓库的 `compute.proto`
+// 与 `slot-manifest.yaml` 必须已在 DeclaredContractFiles() 里声明 ——
+// 且声明的 `Covered` 必须指向**真实存在的**代码/机制（不是一句空话）。
+func TestG1ContractMirror_RealNonTSContractsAreDeclared(t *testing.T) {
+	declared := map[string]gate.DeclaredContractFile{}
+	for _, d := range gate.DeclaredContractFiles() {
+		declared[d.File] = d
+	}
+	for _, want := range []string{"compute.proto", "slot-manifest.yaml"} {
+		d, ok := declared[want]
+		if !ok {
+			t.Errorf("★ contracts/%s 未在 DeclaredContractFiles() 里声明 ⇒ 它是覆盖盲区", want)
+			continue
+		}
+		if strings.TrimSpace(d.Covered) == "" || strings.TrimSpace(d.Reason) == "" {
+			t.Errorf("contracts/%s 的声明缺 Covered/Reason", want)
+		}
+	}
+	// `Covered` 里点名的机制必须真的存在（防「指了个不存在的闸门」）。
+	if d, ok := declared["slot-manifest.yaml"]; ok {
+		if !strings.Contains(d.Covered, "G9") {
+			t.Errorf("slot-manifest.yaml 应由 G9 闸门托管，实际声明 %q", d.Covered)
+		}
 	}
 }
 
@@ -306,7 +401,7 @@ func TestG1ContractMirror_AllContractFiles_NegativeSelfCheck(t *testing.T) {
 	// 1) 有镜像对 + 已声明 ⇒ 只有 orphan.ts 该被报出来。
 	uncovered, stale, err := gate.UncoveredContractFiles(dir, pairs, []gate.UnmirroredContract{
 		{File: "declared.ts", Reason: "夹具：有意无镜像"},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("枚举失败: %v", err)
 	}
@@ -321,7 +416,7 @@ func TestG1ContractMirror_AllContractFiles_NegativeSelfCheck(t *testing.T) {
 	_, stale, err = gate.UncoveredContractFiles(dir, pairs, []gate.UnmirroredContract{
 		{File: "declared.ts", Reason: "r"},
 		{File: "covered.ts", Reason: "r"},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("枚举失败: %v", err)
 	}
@@ -333,7 +428,7 @@ func TestG1ContractMirror_AllContractFiles_NegativeSelfCheck(t *testing.T) {
 	_, stale, err = gate.UncoveredContractFiles(dir, pairs, []gate.UnmirroredContract{
 		{File: "ghost.ts", Reason: "r"},
 		{File: "declared.ts", Reason: "   "},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("枚举失败: %v", err)
 	}

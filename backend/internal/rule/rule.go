@@ -63,6 +63,11 @@ type Rule struct {
 }
 
 // Item 是一条费率/阈值明细（docs/03 §4.1）。
+//
+// 字段集必须与 `contracts/compute.proto: RuleItem` 一致；合法 YAML 键的
+// 唯一来源是 `gate.RuleItemKnownKeys()`。★ 此前缺 `EffectiveTo`：契约
+// （proto field 7）、docs/02、Rust 内核三处都有它，唯独 Go 侧没有 ⇒
+// 按文档写进 YAML 的 `effective_to` 被 yaml 解析**静默丢弃**、费率永不到期。
 type Item struct {
 	ID            string  `yaml:"id"`
 	Name          string  `yaml:"name"`
@@ -71,6 +76,9 @@ type Item struct {
 	FlatPerOrder  float64 `yaml:"flat_per_order"`
 	VATIncluded   bool    `yaml:"vat_included"`
 	EffectiveFrom string  `yaml:"effective_from"`
+	// EffectiveTo 生效期上界（YYYY-MM-DD，空 = 无上界）。
+	// 区间语义 [EffectiveFrom, EffectiveTo)，见 gate.RuleItemEffective。
+	EffectiveTo string `yaml:"effective_to"`
 }
 
 // Registry 规则注册表（加载即校验，fail-closed）。
@@ -137,6 +145,7 @@ func (x Rule) doc() gate.RuleDoc {
 			FlatPerOrder:  it.FlatPerOrder,
 			VATIncluded:   it.VATIncluded,
 			EffectiveFrom: it.EffectiveFrom,
+			EffectiveTo:   it.EffectiveTo,
 		})
 	}
 	return gate.RuleDoc{ID: x.ID, Version: x.Version, Scope: x.Scope, Items: items, Raw: x.Raw}
@@ -197,11 +206,12 @@ func (r *Registry) Validate(registeredSlots, registeredBuckets map[string]bool) 
 	docs := make([]gate.RuleDoc, 0, len(r.order))
 	for _, id := range r.order {
 		x := r.rules[id]
-		docs = append(docs, x.doc())
+		doc := x.doc()
+		docs = append(docs, doc)
 		// ① 文件名 ↔ id 一致性（人类按文件名找、程序按 id 找，两侧必须对得上）
-		violations = append(violations, gate.CheckRuleIDMatchesFilename(x.doc(), x.File)...)
+		violations = append(violations, gate.CheckRuleIDMatchesFilename(doc, x.File)...)
 		// ② 逐项计提的费率自洽（非法费率不会报错，只会把整张损益表算错一个系数）
-		violations = append(violations, gate.CheckPlatformFeeRule(x.doc())...)
+		violations = append(violations, gate.CheckPlatformFeeRule(doc)...)
 		// ③ 结构性：scope 非空、applies_to_* 至少一侧非空（否则规则改完没人知道要重算什么）
 		if len(x.Scope) == 0 {
 			violations = append(violations, fmt.Sprintf("规则 %s 未声明 scope", x.ID))
@@ -211,8 +221,16 @@ func (r *Registry) Validate(registeredSlots, registeredBuckets map[string]bool) 
 				fmt.Sprintf("规则 %s 既未声明 applies_to_slots 也未声明 applies_to_buckets"+
 					"（规则变更后无法定位受影响对象）", x.ID))
 		}
+		// ④ 明细项：契约外的键（会被 yaml 静默丢弃）+ 生效期字段形态/次序
+		//    （G4 第十五侧，第二十三个变种）。
+		//
+		//    ★ 为什么单列一条：`yaml.v3` 对结构体未声明的键**不报错**，只静默丢弃。
+		//    于是按 docs/02 的写法加 `effective_to: 2026-06-01`（期望费率到期）
+		//    会被悄悄丢掉、费率永不到期、全程零报错。这里把「静默丢弃」变成
+		//    「加载即报错」。
+		violations = append(violations, gate.CheckRuleItems(doc)...)
 	}
-	// ④ 引用完整性（规则 → 槽 / 桶）
+	// ⑤ 引用完整性（规则 → 槽 / 桶）
 	violations = append(violations, gate.CheckRuleIDsRegistered(docs, registeredSlots, registeredBuckets)...)
 
 	if len(violations) > 0 {
